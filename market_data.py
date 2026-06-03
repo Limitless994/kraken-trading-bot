@@ -204,9 +204,10 @@ def get_market_context() -> dict:
 
 def fear_greed_blocks_trading(fg_value: Optional[int]) -> bool:
     """Returns True if Fear & Greed suggests avoiding new longs."""
+    import config
     if fg_value is None:
         return False
-    return fg_value <= 20 or fg_value >= 80
+    return fg_value < config.FEAR_GREED_MIN or fg_value > config.FEAR_GREED_MAX
 
 
 def funding_rate_warning(btc_rate: Optional[float]) -> bool:

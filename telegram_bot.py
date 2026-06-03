@@ -51,6 +51,7 @@ GROQ_LOG_FILE       = _DIR / "groq_log.json"
 DISCOVERY_FILE      = _DIR / "discovery_log.json"
 PENDING_ORDERS_FILE = _DIR / "pending_orders.json"
 BOT_COMMANDS_FILE   = _DIR / "bot_commands.json"
+DYNAMIC_PAIRS_FILE  = _DIR / "dynamic_pairs.json"
 
 
 # ── Persistence helpers ───────────────────────────────────────────────────────
@@ -160,13 +161,18 @@ class TradingBot:
             kraken_line = f"Kraken: impossibile verificare ({exc})"
 
         mode = "PAPER TRADING" if config.PAPER_TRADING else "LIVE"
+        dynamic = _load_json(DYNAMIC_PAIRS_FILE, [])
+        extra = [p for p in dynamic if p not in config.PAIRS]
+        pairs_line = f"Coppie: {', '.join(config.PAIRS)}"
+        if extra:
+            pairs_line += f"\nDiscovery: {', '.join(extra)}"
         await update.message.reply_text(
             f"Sistema: ATTIVO ({mode})\n"
             f"{kraken_line}\n"
             f"Profilo: {config.ACTIVE_PROFILE.upper()}\n"
             f"Decisioni: Groq AI ({config.GROQ_MODEL})\n"
             f"Posizioni aperte: {len(self.positions)} / {config.MAX_OPEN_TRADES}\n"
-            f"Coppie monitorate: {', '.join(config.PAIRS)}\n"
+            f"{pairs_line}\n"
             f"Intervallo scansione: {config.SCAN_INTERVAL_MINUTES} min\n"
             f"TP: +{config.TAKE_PROFIT_PCT*100:.0f}%  "
             f"SL: -{config.STOP_LOSS_PCT*100:.0f}%  "
@@ -492,7 +498,10 @@ class TradingBot:
                     " → bloccherà long non-BTC" if _btc_blocks else " → OK",
                 )
 
-        for pair in config.PAIRS:
+        dynamic = _load_json(DYNAMIC_PAIRS_FILE, [])
+        scan_pairs = list(dict.fromkeys(config.PAIRS + dynamic))
+
+        for pair in scan_pairs:
             if pair in already_open:
                 continue
             if len(self.positions) >= config.MAX_OPEN_TRADES:
@@ -860,6 +869,12 @@ class TradingBot:
 
         DISCOVERY_FILE.write_text(
             __import__("json").dumps(result, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        top_pairs = [c["pair"] for c in result.get("candidates", [])[:5]]
+        DYNAMIC_PAIRS_FILE.write_text(
+            __import__("json").dumps(top_pairs, ensure_ascii=False),
             encoding="utf-8",
         )
 
