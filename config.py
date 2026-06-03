@@ -27,6 +27,9 @@ TAKE_PROFIT_PCT  = 0.10
 STOP_LOSS_PCT    = 0.04
 KRAKEN_TAKER_FEE = 0.004
 KRAKEN_MAKER_FEE = 0.0025   # 0.25% — limit orders (maker)
+MARGIN_LEVERAGE          = 2
+MARGIN_OPEN_FEE          = 0.0002   # 0.02% — Kraken margin opening fee
+MARGIN_ROLLOVER_FEE_PER_4H = 0.0002 # 0.02% ogni 4h — rollover fee
 
 # ── Limit orders ──────────────────────────────────────────────────────────────
 LIMIT_ORDERS_ENABLED = os.getenv("LIMIT_ORDERS_ENABLED", "true").lower() == "true"
@@ -55,6 +58,7 @@ VOLUME_SPIKE_MULT = 1.15
 RSI_1H_BUY_MAX    = 65
 RSI_15M_BUY_MAX   = 62
 RSI_4H_BUY_MAX    = 70    # multi-timeframe: RSI 4h deve essere < 70
+RSI_SHORT_MIN     = 35    # non shortare se RSI sotto questa soglia (già oversold)
 
 # ── ADX ───────────────────────────────────────────────────────────────────────
 ADX_PERIOD = 14
@@ -67,6 +71,7 @@ DAILY_EMA_FILTER = os.getenv("DAILY_EMA_FILTER", "true").lower() == "true"
 BTC_FILTER_ENABLED = True
 BTC_PAIR           = "XBTEUR"
 BTC_RSI_MAX        = 65
+BTC_RSI_SHORT_MIN  = 28      # non shortare alt se BTC RSI già così basso (rimbalzo imminente)
 BTC_EMA_FILTER     = True
 
 # ── Correlazione ─────────────────────────────────────────────────────────────
@@ -154,6 +159,8 @@ PROFILE_CONSERVATIVE: dict = {
     "RSI_4H_BUY_MAX":         70,
     "KELLY_FRACTION":         0.25,
     "KELLY_MAX_SIZE_PCT":     0.25,
+    "RSI_SHORT_MIN":          42,
+    "BTC_RSI_SHORT_MIN":      32,
 }
 
 PROFILE_MODERATE: dict = {
@@ -182,6 +189,8 @@ PROFILE_MODERATE: dict = {
     "TRAILING_STOP_PCT":      0.04,
     "KELLY_FRACTION":         0.35,
     "KELLY_MAX_SIZE_PCT":     0.35,
+    "RSI_SHORT_MIN":          36,
+    "BTC_RSI_SHORT_MIN":      28,
 }
 
 PROFILE_AGGRESSIVE: dict = {
@@ -210,6 +219,8 @@ PROFILE_AGGRESSIVE: dict = {
     "TRAILING_STOP_PCT":      0.05,
     "KELLY_FRACTION":         0.50,
     "KELLY_MAX_SIZE_PCT":     0.45,
+    "RSI_SHORT_MIN":          30,
+    "BTC_RSI_SHORT_MIN":      25,
 }
 
 PROFILES: dict = {

@@ -40,7 +40,7 @@ import groq_evaluator
 import kraken_client
 import market_data
 from analyzer import analyze
-from strategy import Signal, generate_signal, kelly_size_pct
+from strategy import Signal, generate_signal, generate_short_signal, kelly_size_pct
 
 logger = logging.getLogger(__name__)
 
@@ -189,10 +189,16 @@ class TradingBot:
             try:
                 ticker = await asyncio.to_thread(kraken_client.get_ticker, pair)
                 current = ticker["last"]
-                pnl_pct = (current - pos["entry"]) / pos["entry"] * 100
-                pnl_eur = (current - pos["entry"]) * pos["size_crypto"]
+                side = pos.get("side", "long")
+                if side == "short":
+                    pnl_pct = (pos["entry"] - current) / pos["entry"] * 100
+                    pnl_eur = (pos["entry"] - current) * pos["size_crypto"]
+                else:
+                    pnl_pct = (current - pos["entry"]) / pos["entry"] * 100
+                    pnl_eur = (current - pos["entry"]) * pos["size_crypto"]
+                label = "SHORT" if side == "short" else "LONG"
                 lines.append(
-                    f"{pair}  {pnl_pct:+.2f}%  ({pnl_eur:+.2f}€)\n"
+                    f"{pair} [{label}]  {pnl_pct:+.2f}%  ({pnl_eur:+.2f}€)\n"
                     f"  Entry: {pos['entry']:.6f}  |  Now: {current:.6f}\n"
                     f"  TP: {pos['take_profit']:.6f}  |  SL: {pos['stop_loss']:.6f}"
                 )
@@ -237,18 +243,29 @@ class TradingBot:
         pos = self.positions[pair]
         ticker  = await asyncio.to_thread(kraken_client.get_ticker, pair)
         current = ticker["last"]
+        side    = pos.get("side", "long")
 
         if config.PAPER_TRADING:
             txid = "PAPER"
         else:
             vol_str = kraken_client.format_volume(pair, pos["size_crypto"])
-            order   = await asyncio.to_thread(
-                kraken_client.add_order, pair, "sell", "market", vol_str
-            )
+            if side == "short":
+                # chiudi short: compra per riacquistare il crypto venduto a margine
+                order = await asyncio.to_thread(
+                    kraken_client.add_order, pair, "buy", "market", vol_str,
+                    leverage=config.MARGIN_LEVERAGE,
+                )
+            else:
+                order = await asyncio.to_thread(
+                    kraken_client.add_order, pair, "sell", "market", vol_str
+                )
             txids = order.get("txid", [])
             txid  = txids[0] if txids else "unknown"
 
-        gross_pnl_eur = (current - pos["entry"]) * pos["size_crypto"]
+        if side == "short":
+            gross_pnl_eur = (pos["entry"] - current) * pos["size_crypto"]
+        else:
+            gross_pnl_eur = (current - pos["entry"]) * pos["size_crypto"]
         fee_exit      = round(current * pos["size_crypto"] * config.KRAKEN_TAKER_FEE, 4)
         fee_entry     = pos.get("fee_entry_eur", 0.0)
         slip_eur      = round(pos["size_eur"] * config.SLIPPAGE_PCT * 2, 4)
@@ -292,10 +309,14 @@ class TradingBot:
     # ── Signal execution ──────────────────────────────────────────────────────
 
     async def _execute_signal(self, signal: Signal, groq_reason: str) -> None:
+        is_short = signal.direction == "SELL"
         try:
-            use_limit   = config.LIMIT_ORDERS_ENABLED and not config.PAPER_TRADING
+            # Short usa sempre market (nessun limit per margin)
+            use_limit   = config.LIMIT_ORDERS_ENABLED and not config.PAPER_TRADING and not is_short
             fee_rate    = config.KRAKEN_MAKER_FEE if use_limit else config.KRAKEN_TAKER_FEE
-            fee_entry   = round(signal.size_eur * fee_rate, 4)
+            # Short ha anche fee apertura margine
+            extra_fee   = config.MARGIN_OPEN_FEE if is_short else 0.0
+            fee_entry   = round(signal.size_eur * (fee_rate + extra_fee), 4)
             size_crypto_net = signal.size_eur * (1 - fee_rate) / signal.price
 
             if config.PAPER_TRADING:
@@ -309,8 +330,20 @@ class TradingBot:
                 txid  = "PAPER"
                 descr = ""
 
+            elif is_short:
+                # Live SHORT: market sell con leverage
+                vol_str = kraken_client.format_volume(signal.pair, signal.size_crypto)
+                result  = await asyncio.to_thread(
+                    kraken_client.add_order,
+                    signal.pair, "sell", "market", vol_str,
+                    leverage=config.MARGIN_LEVERAGE,
+                )
+                txids = result.get("txid", [])
+                txid  = txids[0] if txids else "unknown"
+                actual_price = signal.price
+
             elif use_limit:
-                # Live: ordine limit reale
+                # Live LONG: ordine limit reale
                 limit_price = round(signal.price * (1 - config.LIMIT_OFFSET_PCT), 8)
                 vol_str     = kraken_client.format_volume(signal.pair, signal.size_crypto)
                 result      = await asyncio.to_thread(
@@ -359,6 +392,7 @@ class TradingBot:
                 size_crypto_net = signal.size_crypto  # real exchange handles net internally
 
             self.positions[signal.pair] = {
+                "side":          "short" if is_short else "long",
                 "entry":         actual_price if config.PAPER_TRADING else signal.price,
                 "size_crypto":   size_crypto_net,
                 "size_eur":      signal.size_eur,
@@ -369,15 +403,16 @@ class TradingBot:
                 "atr":           signal.atr,
                 "txid":          txid,
                 "opened_at":     time.time(),
-                "order_type":    "limit" if config.LIMIT_ORDERS_ENABLED else "market",
+                "order_type":    "limit" if (use_limit and not is_short) else "market",
             }
             _save_positions(self.positions)
 
-            mode = "[PAPER] " if config.PAPER_TRADING else ""
+            mode  = "[PAPER] " if config.PAPER_TRADING else ""
+            label = "SHORT" if is_short else "BUY"
             await self.app.bot.send_message(
                 chat_id=config.TELEGRAM_CHAT_ID,
                 text=(
-                    f"{mode}BUY {signal.pair}  {signal.size_eur:.2f}€  @{signal.price:.6f}\n"
+                    f"{mode}{label} {signal.pair}  {signal.size_eur:.2f}€  @{signal.price:.6f}\n"
                     f"TP {signal.take_profit:.6f}  SL {signal.stop_loss:.6f}\n"
                     f"Groq {groq_reason}\n"
                     f"Score {signal.score}/6  ADX {signal.adx:.1f}  TX {txid}"
@@ -578,6 +613,90 @@ class TradingBot:
             signal_found = True
             await asyncio.sleep(1)
 
+        # ── Short scan ────────────────────────────────────────────────────────
+        for pair in scan_pairs:
+            if pair in already_open:
+                continue
+            if len(self.positions) >= config.MAX_OPEN_TRADES:
+                break
+
+            available_eur_now = min(
+                available_eur,
+                config.BUDGET_EUR * config.MAX_CAPITAL_DEPLOYED - sum(p["size_eur"] for p in self.positions.values()),
+            )
+            if available_eur_now < 10.0:
+                break
+
+            logger.info("Short-scanning %s ...", pair)
+            analysis = await asyncio.to_thread(analyze, pair)
+            if analysis is None:
+                continue
+
+            signal = generate_short_signal(
+                analysis,
+                available_eur_now,
+                already_open,
+                btc_analysis=btc_analysis,
+                open_pairs=already_open,
+            )
+            if not signal:
+                continue
+
+            logger.info(
+                "SHORT Signal: %s  score=%d  ADX=%.1f  price=%.6f — asking Groq",
+                signal.pair, signal.score, signal.adx, signal.price,
+            )
+
+            execute, confidence, reason, size_pct = await asyncio.to_thread(
+                groq_evaluator.evaluate, signal, mkt_ctx
+            )
+
+            effective_size_pct = kelly_pct if kelly_pct else size_pct
+
+            if execute and effective_size_pct > 0:
+                ai_size = round(available_eur_now * effective_size_pct, 2)
+                ai_size = max(ai_size, 10.0)
+                if ai_size <= available_eur_now:
+                    signal.size_eur    = ai_size
+                    signal.size_crypto = ai_size / signal.price
+
+            _append_groq_log({
+                "ts":           time.time(),
+                "pair":         signal.pair,
+                "direction":    "SHORT",
+                "decision":     "ESEGUI" if execute else "RIFIUTA",
+                "confidence":   confidence,
+                "size_pct":     round(size_pct * 100, 0),
+                "size_eur":     signal.size_eur,
+                "reason":       reason,
+                "score":        signal.score,
+                "adx":          signal.adx,
+                "rsi_1h":       signal.rsi_1h,
+                "rsi_15m":      signal.rsi_15m,
+                "macd_hist":    signal.macd_hist,
+                "volume_ratio": signal.volume_ratio,
+                "price":        signal.price,
+            })
+
+            if execute:
+                await self._execute_signal(signal, f"{reason} [{confidence}/10, {size_pct*100:.0f}% capitale]")
+                already_open.add(signal.pair)
+            else:
+                reasons_text = "\n".join(f"  • {r}" for r in signal.reasons)
+                await self.app.bot.send_message(
+                    chat_id=config.TELEGRAM_CHAT_ID,
+                    text=(
+                        f"SHORT RIFIUTATO — {signal.pair}\n\n"
+                        f"Groq ({confidence}/10): {reason}\n\n"
+                        f"Score: {signal.score}/6  |  ADX: {signal.adx:.1f}\n"
+                        f"Indicatori:\n{reasons_text}"
+                    ),
+                )
+                logger.info("Groq rejected SHORT %s [%d/10]: %s", signal.pair, confidence, reason)
+
+            signal_found = True
+            await asyncio.sleep(1)
+
         return signal_found
 
     async def _job_monitor_positions(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -592,29 +711,50 @@ class TradingBot:
                 ticker  = await asyncio.to_thread(kraken_client.get_ticker, pair)
                 current = ticker["last"]
 
-                # ── Trailing stop update (ATR-based se disponibile) ──────
+                side = pos.get("side", "long")
+
+                # ── Trailing stop update ──────────────────────────────────
                 if config.TRAILING_STOP_ENABLED:
                     atr_pos = pos.get("atr", 0)
-                    if atr_pos > 0:
-                        new_trailing = round(current - config.ATR_SL_MULT * atr_pos, 8)
-                    else:
-                        new_trailing = round(current * (1 - config.TRAILING_STOP_PCT), 8)
                     old_trailing = pos.get("trailing_stop", pos["stop_loss"])
-                    if new_trailing > old_trailing:
-                        pos["trailing_stop"] = new_trailing
-                        self.positions[pair] = pos
-                        _save_positions(self.positions)
-                        logger.info("Trailing stop aggiornato %s: %.6f → %.6f", pair, old_trailing, new_trailing)
+                    if side == "short":
+                        # per short: trailing scende col prezzo
+                        if atr_pos > 0:
+                            new_trailing = round(current + config.ATR_SL_MULT * atr_pos, 8)
+                        else:
+                            new_trailing = round(current * (1 + config.TRAILING_STOP_PCT), 8)
+                        if new_trailing < old_trailing:
+                            pos["trailing_stop"] = new_trailing
+                            self.positions[pair] = pos
+                            _save_positions(self.positions)
+                            logger.info("Trailing stop SHORT %s: %.6f → %.6f", pair, old_trailing, new_trailing)
+                    else:
+                        if atr_pos > 0:
+                            new_trailing = round(current - config.ATR_SL_MULT * atr_pos, 8)
+                        else:
+                            new_trailing = round(current * (1 - config.TRAILING_STOP_PCT), 8)
+                        if new_trailing > old_trailing:
+                            pos["trailing_stop"] = new_trailing
+                            self.positions[pair] = pos
+                            _save_positions(self.positions)
+                            logger.info("Trailing stop LONG %s: %.6f → %.6f", pair, old_trailing, new_trailing)
 
                 effective_sl = pos.get("trailing_stop", pos["stop_loss"])
-                hit_tp = current >= pos["take_profit"]
-                hit_sl = current <= effective_sl
+                if side == "short":
+                    hit_tp = current <= pos["take_profit"]   # prezzo sceso al target
+                    hit_sl = current >= effective_sl          # prezzo salito oltre lo stop
+                else:
+                    hit_tp = current >= pos["take_profit"]
+                    hit_sl = current <= effective_sl
 
                 if not (hit_tp or hit_sl):
                     continue
 
                 label         = "TAKE PROFIT" if hit_tp else "STOP LOSS"
-                gross_pnl_eur = (current - pos["entry"]) * pos["size_crypto"]
+                if side == "short":
+                    gross_pnl_eur = (pos["entry"] - current) * pos["size_crypto"]
+                else:
+                    gross_pnl_eur = (current - pos["entry"]) * pos["size_crypto"]
                 fee_exit      = round(current * pos["size_crypto"] * config.KRAKEN_TAKER_FEE, 4)
                 fee_entry     = pos.get("fee_entry_eur", 0.0)
                 slip_eur      = round(pos["size_eur"] * config.SLIPPAGE_PCT * 2, 4)
@@ -626,14 +766,20 @@ class TradingBot:
                         suffix = "TX: PAPER"
                     else:
                         vol_str = kraken_client.format_volume(pair, pos["size_crypto"])
-                        order   = await asyncio.to_thread(
-                            kraken_client.add_order, pair, "sell", "market", vol_str
-                        )
+                        if side == "short":
+                            order = await asyncio.to_thread(
+                                kraken_client.add_order, pair, "buy", "market", vol_str,
+                                leverage=config.MARGIN_LEVERAGE,
+                            )
+                        else:
+                            order = await asyncio.to_thread(
+                                kraken_client.add_order, pair, "sell", "market", vol_str
+                            )
                         txids  = order.get("txid", [])
                         txid   = txids[0] if txids else "unknown"
                         suffix = f"TX: {txid}"
                 except Exception as exc:
-                    suffix = f"ERRORE vendita automatica — chiudi manualmente!\n{exc}"
+                    suffix = f"ERRORE chiusura automatica — chiudi manualmente!\n{exc}"
 
                 icon = "✅" if hit_tp else "🛑"
                 await ctx.bot.send_message(

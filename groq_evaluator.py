@@ -25,22 +25,34 @@ def _get_client() -> Groq:
     return _client
 
 
-_SYSTEM = (
-    "Sei un analista quantitativo crypto esperto. Ricevi i dati tecnici di un segnale BUY "
+_SYSTEM_LONG = (
+    "Sei un analista quantitativo crypto esperto. Ricevi i dati tecnici di un segnale BUY (LONG) "
     "su una coppia crypto/EUR su Kraken con TP +{tp:.0f}% e SL -{sl:.0f}% (R:R {rr:.1f}:1).\n\n"
     "I gate tecnici (ADX, BTC filter, correlazione) sono già stati superati — valuta solo "
     "la qualità del segnale specifico.\n\n"
-    "IMPORTANTE: il tuo score di confidenza determina QUANTI SOLDI vengono investiti:\n"
-    "  score 9-10 → {size_high:.0f}% del capitale disponibile\n"
-    "  score 8    → {size_med:.0f}% del capitale disponibile\n"
-    "  score 7    → {size_min:.0f}% del capitale disponibile (minimo)\n"
-    "  score < 7  → nessun investimento\n\n"
-    "Sii preciso: usa 9-10 solo per segnali eccezionali, non per default.\n\n"
-    "Rispondi SOLO con questo formato:\n"
-    "ESEGUI:<score>: <motivo in italiano max 20 parole>\n"
-    "RIFIUTA:<score>: <motivo in italiano max 20 parole>\n\n"
-    "Considera: RSI < 35 ottimo, 35-48 buono; MACD crossover > solo salita; "
-    "volume > 2× eccellente; ADX > 30 trend forte."
+    "IMPORTANTE: il tuo score determina QUANTI SOLDI vengono investiti:\n"
+    "  score 9-10 → {size_high:.0f}%  |  score 8 → {size_med:.0f}%  |  "
+    "score 7 → {size_min:.0f}%  |  score < 7 → nessun investimento\n\n"
+    "Sii preciso: usa 9-10 solo per segnali eccezionali.\n\n"
+    "Rispondi SOLO con: ESEGUI:<score>: <motivo italiano max 20 parole>\n"
+    "oppure:           RIFIUTA:<score>: <motivo italiano max 20 parole>\n\n"
+    "LONG: RSI < 35 ottimo, 35-50 buono; MACD crossover rialzista = forte; "
+    "volume > 2× eccellente; ADX > 30 trend confermato."
+)
+
+_SYSTEM_SHORT = (
+    "Sei un analista quantitativo crypto esperto. Ricevi i dati tecnici di un segnale SELL (SHORT MARGIN) "
+    "su una coppia crypto/EUR su Kraken con TP -{tp:.0f}% e SL +{sl:.0f}% (R:R {rr:.1f}:1).\n\n"
+    "I gate tecnici (ADX, BTC downtrend, correlazione) sono già stati superati — valuta solo "
+    "la qualità del segnale short specifico.\n\n"
+    "IMPORTANTE: il tuo score determina QUANTI SOLDI vengono investiti:\n"
+    "  score 9-10 → {size_high:.0f}%  |  score 8 → {size_med:.0f}%  |  "
+    "score 7 → {size_min:.0f}%  |  score < 7 → nessun investimento\n\n"
+    "Sii preciso: usa 9-10 solo per segnali eccezionali.\n\n"
+    "Rispondi SOLO con: ESEGUI:<score>: <motivo italiano max 20 parole>\n"
+    "oppure:           RIFIUTA:<score>: <motivo italiano max 20 parole>\n\n"
+    "SHORT: RSI 40-60 ottimale (non oversold); MACD negativo e in discesa = forte; "
+    "prezzo sotto EMA50 = conferma downtrend; volume spike = pressione vendita; ADX > 30 trend forte."
 )
 
 
@@ -55,10 +67,15 @@ def evaluate(signal: Signal, market_ctx: dict = None) -> tuple:
     Returns (execute: bool, confidence: int, reason: str, size_pct: float).
     Falls back to (True, 6, reason, AI_SIZE_MIN) if Groq is unavailable.
     """
-    tp_pct = (signal.take_profit / signal.price - 1) * 100 if signal.price > 0 else config.TAKE_PROFIT_PCT * 100
-    sl_pct = (1 - signal.stop_loss / signal.price) * 100  if signal.price > 0 else config.STOP_LOSS_PCT * 100
+    is_short = signal.direction == "SELL"
+    if is_short:
+        tp_pct = (1 - signal.take_profit / signal.price) * 100 if signal.price > 0 else config.TAKE_PROFIT_PCT * 100
+        sl_pct = (signal.stop_loss / signal.price - 1) * 100   if signal.price > 0 else config.STOP_LOSS_PCT * 100
+    else:
+        tp_pct = (signal.take_profit / signal.price - 1) * 100 if signal.price > 0 else config.TAKE_PROFIT_PCT * 100
+        sl_pct = (1 - signal.stop_loss / signal.price) * 100   if signal.price > 0 else config.STOP_LOSS_PCT * 100
     rr     = tp_pct / sl_pct if sl_pct > 0 else 2.5
-    system = _SYSTEM.format(
+    system = (_SYSTEM_SHORT if is_short else _SYSTEM_LONG).format(
         tp=tp_pct,
         sl=sl_pct,
         rr=rr,

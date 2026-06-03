@@ -174,6 +174,7 @@ def add_order(
     volume: str,        # string to preserve precision
     price: str | None = None,
     validate: bool = False,
+    leverage: int | None = None,   # per margin orders (short)
 ) -> dict:
     """
     Place a new order. Set validate=True to dry-run without executing.
@@ -189,6 +190,8 @@ def add_order(
         params["price"] = price
     if validate:
         params["validate"] = "true"
+    if leverage:
+        params["leverage"] = str(leverage)
     return _private("AddOrder", params)
 
 

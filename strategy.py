@@ -224,6 +224,130 @@ def generate_signal(
     )
 
 
+def generate_short_signal(
+    analysis: Analysis,
+    available_eur: float,
+    already_open: set = None,
+    btc_analysis: Analysis = None,
+    open_pairs: set = None,
+) -> Optional[Signal]:
+    """Segnale SHORT (SELL margin). Condizioni inverse rispetto a generate_signal."""
+    if already_open and analysis.pair in already_open:
+        return None
+
+    # Gate 0: Daily EMA50 — per short il prezzo deve essere SOTTO la EMA50
+    if config.DAILY_EMA_FILTER and analysis.daily_above_ema50:
+        logger.info("%s: SHORT SKIP gate=daily_EMA50_sopra", analysis.pair)
+        return None
+
+    # Gate 1: ADX — trend forte in qualsiasi direzione
+    if analysis.adx < config.ADX_MIN:
+        logger.info("%s: SHORT SKIP gate=ADX_basso (%.1f < %d)", analysis.pair, analysis.adx, config.ADX_MIN)
+        return None
+
+    # Gate 2: BTC filter invertito — BTC deve essere in downtrend per shortare alt
+    if config.BTC_FILTER_ENABLED and btc_analysis and analysis.pair != config.BTC_PAIR:
+        if btc_analysis.rsi_1h < config.BTC_RSI_SHORT_MIN:
+            logger.info("%s: SHORT SKIP gate=BTC_oversold (BTC_RSI=%.1f < %d)", analysis.pair, btc_analysis.rsi_1h, config.BTC_RSI_SHORT_MIN)
+            return None
+        if config.BTC_EMA_FILTER and btc_analysis.price_above_ema50:
+            logger.info("%s: SHORT SKIP gate=BTC_uptrend", analysis.pair)
+            return None
+
+    # Gate 3: correlazione
+    if open_pairs:
+        for grp in config.CORR_GROUPS:
+            if analysis.pair in grp:
+                for other in grp:
+                    if other != analysis.pair and other in open_pairs:
+                        logger.info("%s: SHORT SKIP gate=correlazione (%s già aperta)", analysis.pair, other)
+                        return None
+
+    # Gate 4: RSI non già oversold — non shortare in capitolazione
+    if analysis.rsi_1h < config.RSI_SHORT_MIN:
+        logger.info("%s: SHORT SKIP gate=RSI_oversold (%.1f < %d)", analysis.pair, analysis.rsi_1h, config.RSI_SHORT_MIN)
+        return None
+
+    # ── Scoring (simmetrico ai long, condizioni invertite) ────────────────────
+    score = 0
+    reasons: list = []
+
+    _rsi_ok       = analysis.rsi_1h > config.RSI_SHORT_MIN   # non oversold, trend bearish
+    crossed_below = analysis.macd_hist < 0 and analysis.macd_hist_prev >= 0
+    falling_below = analysis.macd_hist < 0 and analysis.macd_hist_slope < 0
+    _macd_ok      = crossed_below or falling_below
+    _vol_ok       = analysis.volume_ratio >= config.VOLUME_SPIKE_MULT
+    _ema_ok       = not analysis.price_above_ema50   # prezzo sotto EMA50
+    _ob_ok        = analysis.ob_bearish              # pressione di vendita
+    _adx30_ok     = analysis.adx >= 30
+
+    if _rsi_ok:
+        score += 1
+        reasons.append(
+            f"RSI bearish: 1h={analysis.rsi_1h:.1f}  "
+            f"15m={analysis.rsi_15m:.1f}  4h={analysis.rsi_4h:.1f}"
+        )
+    if crossed_below:
+        score += 1
+        reasons.append(f"MACD crossover ribassista ({analysis.macd_hist_prev:+.6f} → {analysis.macd_hist:+.6f})")
+    elif falling_below:
+        score += 1
+        reasons.append(f"MACD sotto zero e in discesa ({analysis.macd_hist_slope:.6f})")
+    if _vol_ok:
+        score += 1
+        reasons.append(f"Volume spike: {analysis.volume_ratio:.1f}× la media")
+    if _ema_ok:
+        score += 1
+        reasons.append(f"Prezzo ({analysis.price:.6f}) < EMA50 ({analysis.ema50:.6f})")
+    if _ob_ok:
+        score += 1
+        reasons.append(f"Order book bearish: {analysis.ob_imbalance:.2f} (<0.45)")
+    if _adx30_ok:
+        score += 1
+        reasons.append(f"ADX forte: {analysis.adx:.1f} (>30)")
+
+    if score < config.MIN_SIGNAL_SCORE:
+        logger.info("%s: SHORT score=%d/6 → SKIP (min=%d)", analysis.pair, score, config.MIN_SIGNAL_SCORE)
+        return None
+
+    size_eur = max(round(available_eur * config.AI_SIZE_HIGH, 2), 10.0)
+    if size_eur > available_eur:
+        return None
+
+    size_crypto = size_eur / analysis.price
+
+    atr = analysis.atr
+    if atr and atr > 0:
+        take_profit = round(analysis.price - config.ATR_TP_MULT * atr, 8)
+        stop_loss   = round(analysis.price + config.ATR_SL_MULT * atr, 8)
+    else:
+        take_profit = round(analysis.price * (1 - config.TAKE_PROFIT_PCT), 8)
+        stop_loss   = round(analysis.price * (1 + config.STOP_LOSS_PCT),   8)
+
+    take_profit = max(take_profit, analysis.price * 0.01)
+
+    return Signal(
+        id=str(uuid.uuid4())[:8],
+        pair=analysis.pair,
+        direction="SELL",
+        price=analysis.price,
+        size_eur=size_eur,
+        size_crypto=size_crypto,
+        take_profit=take_profit,
+        stop_loss=stop_loss,
+        trailing_stop=stop_loss,   # per short parte dallo SL, scende col prezzo
+        rsi_1h=analysis.rsi_1h,
+        rsi_15m=analysis.rsi_15m,
+        macd_hist=analysis.macd_hist,
+        volume_ratio=analysis.volume_ratio,
+        adx=analysis.adx,
+        atr=analysis.atr,
+        score=score,
+        reasons=reasons,
+        base_currency=_base_currency(analysis.pair),
+    )
+
+
 def kelly_size_pct(trades: list) -> Optional[float]:
     """Half-Kelly fraction in base allo storico trade. None se dati insufficienti."""
     if not config.KELLY_ENABLED or len(trades) < config.KELLY_MIN_TRADES:
