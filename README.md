@@ -23,6 +23,7 @@ main.py                      # Entry point, logging, crash handler
 dashboard.py                 # Dashboard web (Flask, porta 8501)
 core/
   config.py                  # Tutti i parametri + sistema profili
+  prompts.py                 # Prompt Groq (editabili senza toccare il codice)
   kraken_client.py           # Wrapper API Kraken (public + private)
   analyzer.py                # Calcolo indicatori (RSI, MACD, EMA, ADX, ATR)
   strategy.py                # Generazione segnali LONG e SHORT
@@ -235,7 +236,7 @@ Tutti i test usano mock — nessuna chiamata reale a Kraken, Groq o API esterne.
 | File | Contenuto |
 |---|---|
 | `positions.json` | Posizioni aperte |
-| `trades.json` | Storico trade chiusi |
+| `trades_log.json` | Storico trade chiusi |
 | `active_profile.json` | Profilo attivo |
 | `dynamic_pairs.json` | Coppie aggiornate dall'ultima discovery |
 | `logs/bot.log` | Log principale |
