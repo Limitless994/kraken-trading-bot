@@ -205,3 +205,7 @@ def get_open_orders() -> dict:
 
 def get_closed_orders() -> dict:
     return _private("ClosedOrders")
+
+
+def query_orders(txids: list[str]) -> dict:
+    return _private("QueryOrders", {"txid": ",".join(txids), "trades": False})

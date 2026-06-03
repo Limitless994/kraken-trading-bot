@@ -76,6 +76,9 @@ def _save_positions(positions: dict) -> None:
     )
 
 
+_GROQ_LOG_MAX = 500
+
+
 def _append_groq_log(entry: dict) -> None:
     log = []
     if GROQ_LOG_FILE.exists():
@@ -84,6 +87,8 @@ def _append_groq_log(entry: dict) -> None:
         except Exception:
             log = []
     log.append(entry)
+    if len(log) > _GROQ_LOG_MAX:
+        log = log[-_GROQ_LOG_MAX:]
     GROQ_LOG_FILE.write_text(
         json.dumps(log, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -247,7 +252,7 @@ class TradingBot:
         else:
             vol_str = kraken_client.format_volume(pair, pos["size_crypto"])
             if side == "short":
-                # chiudi short: compra per riacquistare il crypto venduto a margine
+                # close short: buy back the crypto sold on margin
                 order = await asyncio.to_thread(
                     kraken_client.add_order, pair, "buy", "market", vol_str,
                     leverage=config.MARGIN_LEVERAGE,
@@ -308,16 +313,16 @@ class TradingBot:
     async def _execute_signal(self, signal: Signal, groq_reason: str) -> None:
         is_short = signal.direction == "SELL"
         try:
-            # Short usa sempre market (nessun limit per margin)
+            # Short always uses market (no limit orders for margin)
             use_limit   = config.LIMIT_ORDERS_ENABLED and not config.PAPER_TRADING and not is_short
             fee_rate    = config.KRAKEN_MAKER_FEE if use_limit else config.KRAKEN_TAKER_FEE
-            # Short ha anche fee apertura margine
+            # Short also includes margin opening fee
             extra_fee   = config.MARGIN_OPEN_FEE if is_short else 0.0
             fee_entry   = round(signal.size_eur * (fee_rate + extra_fee), 4)
             size_crypto_net = signal.size_eur * (1 - fee_rate) / signal.price
 
             if config.PAPER_TRADING:
-                # Paper: simula limit a prezzo leggermente migliore
+                # Paper: simulate limit at a slightly better price
                 if config.LIMIT_ORDERS_ENABLED:
                     limit_price = round(signal.price * (1 - config.LIMIT_OFFSET_PCT), 8)
                     size_crypto_net = signal.size_eur * (1 - fee_rate) / limit_price
@@ -328,7 +333,7 @@ class TradingBot:
                 descr = ""
 
             elif is_short:
-                # Live SHORT: market sell con leverage
+                # Live SHORT: market sell with leverage
                 vol_str = kraken_client.format_volume(signal.pair, signal.size_crypto)
                 result  = await asyncio.to_thread(
                     kraken_client.add_order,
@@ -340,7 +345,7 @@ class TradingBot:
                 actual_price = signal.price
 
             elif use_limit:
-                # Live LONG: ordine limit reale
+                # Live LONG: real limit order
                 limit_price = round(signal.price * (1 - config.LIMIT_OFFSET_PCT), 8)
                 vol_str     = kraken_client.format_volume(signal.pair, signal.size_crypto)
                 result      = await asyncio.to_thread(
@@ -352,7 +357,7 @@ class TradingBot:
                 txid  = txids[0] if txids else "unknown"
                 descr = result.get("descr", {}).get("order", "")
                 actual_price = limit_price
-                # Salva in pending orders per monitoraggio fill
+                # Save to pending orders for fill monitoring
                 pending = _load_json(PENDING_ORDERS_FILE, {})
                 pending[signal.pair] = {
                     "txid": txid, "limit_price": limit_price,
@@ -373,7 +378,7 @@ class TradingBot:
                         f"Scade in {config.LIMIT_TIMEOUT_SEC//60} min se non eseguito"
                     ),
                 )
-                return   # posizione salvata quando il limit viene eseguito
+                return   # position recorded when the limit is filled
 
             else:
                 # Live: market order
@@ -468,7 +473,7 @@ class TradingBot:
                 logger.error("Cannot fetch balance: %s", exc)
                 return False
 
-        # Cap sul capitale deployato: non superare MAX_CAPITAL_DEPLOYED
+        # Cap on deployed capital: do not exceed MAX_CAPITAL_DEPLOYED
         spent       = sum(p["size_eur"] for p in self.positions.values())
         max_allowed = config.BUDGET_EUR * config.MAX_CAPITAL_DEPLOYED
         if spent >= max_allowed:
@@ -511,11 +516,11 @@ class TradingBot:
             label = mkt_ctx.get("fear_greed_label", "")
             logger.info("LONG BLOCKED: fear_greed=%d (%s)", fg_val, label)
 
-        # ── Kelly sizing da storico trade ─────────────────────────────────────
+        # ── Kelly sizing from trade history ───────────────────────────────────
         trades_history = _load_json(TRADES_LOG_FILE, [])
         kelly_pct = kelly_size_pct(trades_history)
 
-        # ── BTC market filter — una sola fetch per tutta la scansione ─────────
+        # ── BTC market filter — single fetch for the entire scan ──────────────
         btc_analysis = None
         if config.BTC_FILTER_ENABLED:
             btc_analysis = await asyncio.to_thread(analyze, config.BTC_PAIR)
@@ -535,6 +540,9 @@ class TradingBot:
         dynamic = _load_json(DYNAMIC_PAIRS_FILE, [])
         scan_pairs = list(dict.fromkeys(config.PAIRS + dynamic))
 
+        # Cache analysis results to avoid double API calls in the short scan
+        analysis_cache: dict = {}
+
         for pair in ([] if long_blocked_fg else scan_pairs):
             if pair in already_open:
                 continue
@@ -545,6 +553,7 @@ class TradingBot:
             analysis = await asyncio.to_thread(analyze, pair)
             if analysis is None:
                 continue
+            analysis_cache[pair] = analysis
 
             signal = generate_signal(
                 analysis,
@@ -566,7 +575,7 @@ class TradingBot:
             )
 
             # Kelly sovrascrive la size se disponibile
-            effective_size_pct = kelly_pct if kelly_pct else size_pct
+            effective_size_pct = min(kelly_pct, size_pct) if kelly_pct else size_pct
 
             # Ridimensiona la posizione
             if execute and effective_size_pct > 0:
@@ -631,7 +640,7 @@ class TradingBot:
                 break
 
             logger.info("Short-scanning %s ...", pair)
-            analysis = await asyncio.to_thread(analyze, pair)
+            analysis = analysis_cache.get(pair) or await asyncio.to_thread(analyze, pair)
             if analysis is None:
                 continue
 
@@ -654,7 +663,7 @@ class TradingBot:
                 groq_evaluator.evaluate, signal, mkt_ctx
             )
 
-            effective_size_pct = kelly_pct if kelly_pct else size_pct
+            effective_size_pct = min(kelly_pct, size_pct) if kelly_pct else size_pct
 
             if execute and effective_size_pct > 0:
                 ai_size = round(available_eur_now * effective_size_pct, 2)
@@ -721,7 +730,7 @@ class TradingBot:
                     atr_pos = pos.get("atr", 0)
                     old_trailing = pos.get("trailing_stop", pos["stop_loss"])
                     if side == "short":
-                        # per short: trailing scende col prezzo
+                        # for short: trailing moves down with price
                         if atr_pos > 0:
                             new_trailing = round(current + config.ATR_SL_MULT * atr_pos, 8)
                         else:
@@ -822,19 +831,24 @@ class TradingBot:
         today_ts  = time.time() - 86400
         today_trades = [t for t in trades if t.get("closed_at", 0) > today_ts]
 
-        # P&L totale
+        # Total P&L
         total_pnl = sum(t["pnl_eur"] for t in trades)
         today_pnl = sum(t["pnl_eur"] for t in today_trades)
 
-        # Posizioni aperte
+        # Open positions
         pos_lines = []
         for pair, pos in positions.items():
             try:
                 ticker  = await asyncio.to_thread(kraken_client.get_ticker, pair)
                 current = ticker["last"]
-                pnl_pct = (current - pos["entry"]) / pos["entry"] * 100
-                pnl_eur = (current - pos["entry"]) * pos["size_crypto"]
-                pos_lines.append(f"  {pair} {pnl_pct:+.2f}% ({pnl_eur:+.2f}€)")
+                side    = pos.get("side", "long")
+                if side == "short":
+                    pnl_pct = (pos["entry"] - current) / pos["entry"] * 100
+                    pnl_eur = (pos["entry"] - current) * pos["size_crypto"]
+                else:
+                    pnl_pct = (current - pos["entry"]) / pos["entry"] * 100
+                    pnl_eur = (current - pos["entry"]) * pos["size_crypto"]
+                pos_lines.append(f"  {pair} [{side.upper()}] {pnl_pct:+.2f}% ({pnl_eur:+.2f}€)")
             except Exception:
                 pos_lines.append(f"  {pair} —")
 
@@ -865,7 +879,7 @@ class TradingBot:
         )
 
     async def _job_check_pending_orders(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Controlla se i limit order live sono stati eseguiti o sono scaduti."""
+        """Check whether live limit orders have been filled or have timed out."""
         if config.PAPER_TRADING:
             return
         pending = _load_json(PENDING_ORDERS_FILE, {})
@@ -882,7 +896,21 @@ class TradingBot:
         for pair, po in list(pending.items()):
             txid = po["txid"]
             if txid not in open_txids:
-                # Ordine non più aperto = eseguito
+                # Verify fill status — order could be cancelled/expired, not filled
+                order_status = "unknown"
+                try:
+                    info = await asyncio.to_thread(kraken_client.query_orders, [txid])
+                    order_status = info.get(txid, {}).get("status", "unknown")
+                except Exception as exc:
+                    logger.warning("Cannot query order %s: %s — assuming filled", txid, exc)
+                if order_status in ("canceled", "expired"):
+                    logger.warning("Limit order %s was %s — no position created", txid, order_status)
+                    to_remove.append(pair)
+                    await self.app.bot.send_message(
+                        chat_id=config.TELEGRAM_CHAT_ID,
+                        text=f"LIMIT {order_status.upper()} {pair}  TX {txid} — nessuna posizione aperta",
+                    )
+                    continue
                 self.positions[pair] = {
                     "entry":         po["limit_price"],
                     "size_crypto":   po["size_crypto"],
@@ -902,7 +930,7 @@ class TradingBot:
                     text=f"LIMIT ESEGUITO {pair}  @{po['limit_price']:.6f}  TX {txid}",
                 )
             elif now > po["timeout_at"]:
-                # Timeout — cancella ordine e usa market
+                # Timeout — cancel order
                 try:
                     await asyncio.to_thread(kraken_client.cancel_order, txid)
                 except Exception:
@@ -920,7 +948,7 @@ class TradingBot:
             )
 
     async def _cmd_ai(self, update, ctx) -> None:
-        """Mostra le ultime N decisioni di Groq AI."""
+        """Show the last N Groq AI decisions."""
         groq_log = _load_json(GROQ_LOG_FILE, [])
         if not groq_log:
             await update.message.reply_text("Nessuna valutazione Groq ancora.")
@@ -940,7 +968,7 @@ class TradingBot:
         await update.message.reply_text("\n\n".join(lines))
 
     async def _cmd_profile(self, update, ctx) -> None:
-        """Mostra il profilo attivo o cambia profilo (/profile aggressive|conservative)."""
+        """Show active profile or switch (/profile aggressive|conservative)."""
         if ctx.args:
             name = ctx.args[0].lower()
             try:
@@ -1171,7 +1199,7 @@ class TradingBot:
             execute, confidence, reason, size_pct = await asyncio.to_thread(
                 groq_evaluator.evaluate, signal, mkt_ctx
             )
-            effective_size_pct = kelly_pct if kelly_pct else size_pct
+            effective_size_pct = min(kelly_pct, size_pct) if kelly_pct else size_pct
 
             if execute and effective_size_pct > 0:
                 ai_size = max(round(available_eur * effective_size_pct, 2), 10.0)

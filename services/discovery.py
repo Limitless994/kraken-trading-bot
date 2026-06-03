@@ -1,13 +1,13 @@
 """
-discovery.py — Daily scan di tutte le coppie EUR su Kraken per trovare nuove opportunità.
+discovery.py — Daily scan of all EUR pairs on Kraken to find new opportunities.
 
 Pipeline:
-  1. Fetch tutte le coppie EUR disponibili su Kraken
-  2. Filtra per volume minimo (liquidità)
-  3. Backtest meccanico su 90 giorni di candele 4h (puro Python, zero Groq)
-  4. Score meccanico per ogni coppia
-  5. Top 10 → UNA sola chiamata Groq per l'analisi finale
-  6. Risultati salvati + notifica Telegram
+  1. Fetch all available EUR pairs from Kraken
+  2. Filter by minimum volume (liquidity)
+  3. Mechanical backtest on 90 days of 4h candles (pure Python, no Groq)
+  4. Mechanical score for each pair
+  5. Top 10 → ONE single Groq call for the final analysis
+  6. Results saved + Telegram notification
 """
 from __future__ import annotations
 
@@ -22,18 +22,18 @@ from core.analyzer import _adx, _ema, _macd_histogram, _rsi, _volume_ratio
 
 logger = logging.getLogger(__name__)
 
-DISCOVERY_MIN_VOLUME_EUR  = 500_000    # volume minimo EUR 24h
-DISCOVERY_MAX_PAIRS       = 20         # scansiona max 20 coppie per velocità
-DISCOVERY_TOP_N           = 8          # candidate da mandare a Groq
+DISCOVERY_MIN_VOLUME_EUR  = 500_000    # minimum 24h EUR volume
+DISCOVERY_MAX_PAIRS       = 20         # scan at most 20 pairs for speed
+DISCOVERY_TOP_N           = 8          # candidates to send to Groq
 BACKTEST_INTERVAL         = 240        # candele 4h
 
-# Soglie discovery più permissive rispetto al bot live
-# (vogliamo trovare opportunità potenziali, non già-filtrate)
+# Discovery thresholds are more permissive than the live bot
+# (we want potential opportunities, not pre-filtered ones)
 _BT_RSI_MAX     = 55      # vs 48 live
 _BT_VOL_MULT    = 1.2     # vs 1.5 live
 _BT_ADX_MIN     = 15      # vs 20 live
 _BT_MIN_CANDLES = 100     # vs 150 live
-_BT_MIN_SIGNALS = 1       # almeno 1 segnale storico
+_BT_MIN_SIGNALS = 1       # at least 1 historical signal
 
 
 # ── Kraken pair list ──────────────────────────────────────────────────────────
@@ -69,7 +69,7 @@ def _filter_by_volume(pairs: list, min_eur: float) -> list:
 # ── Backtest ──────────────────────────────────────────────────────────────────
 
 def _sharpe(returns: list) -> float:
-    """Sharpe ratio annualizzato (assumendo risk-free rate = 0)."""
+    """Annualised Sharpe ratio (assuming risk-free rate = 0)."""
     if len(returns) < 2:
         return 0.0
     n    = len(returns)
@@ -78,12 +78,12 @@ def _sharpe(returns: list) -> float:
     std  = var ** 0.5
     if std == 0:
         return 0.0
-    # Annualizzato per trade (approssimazione: ~8 trade/mese × 12 mesi)
+    # Annualised per trade (approximation: ~8 trades/month × 12 months)
     return round((mean / std) * (96 ** 0.5), 2)
 
 
 def _run_backtest_slice(candles: list) -> dict:
-    """Esegue backtest su uno slice di candele e ritorna statistiche."""
+    """Run backtest on a candle slice and return statistics."""
     closes  = [c["close"]  for c in candles]
     highs   = [c["high"]   for c in candles]
     lows    = [c["low"]    for c in candles]
@@ -152,11 +152,11 @@ def _run_backtest_slice(candles: list) -> dict:
 
 def _backtest_pair(pair: str) -> Optional[dict]:
     """
-    Walk-forward backtest su candele 4h:
-    - Train: primi 70% delle candele
-    - Test:  ultimi 30% delle candele
-    Calcola Sharpe ratio, max drawdown, win rate su entrambi.
-    Flag di consistenza: test/train ratio < 0.7 = possibile overfitting.
+    Walk-forward backtest on 4h candles:
+    - Train: first 70% of candles
+    - Test:  last 30% of candles
+    Computes Sharpe ratio, max drawdown, and win rate for both slices.
+    Consistency flag: test/train ratio < 0.7 = possible overfitting.
     """
     try:
         candles = kraken_client.get_ohlc(pair, interval=BACKTEST_INTERVAL)
@@ -176,13 +176,13 @@ def _backtest_pair(pair: str) -> Optional[dict]:
         if train_stats["signals_tried"] < 3:
             return None
 
-        # Consistenza: quanto il test si avvicina al train
+        # Consistency: how closely test results match train results
         if train_stats["win_rate"] > 0:
             consistency = test_stats["win_rate"] / train_stats["win_rate"]
         else:
             consistency = 0.0
 
-        # Stato attuale
+        # Current state
         closes    = [c["close"]  for c in candles]
         highs     = [c["high"]   for c in candles]
         lows      = [c["low"]    for c in candles]
@@ -220,7 +220,7 @@ def _backtest_pair(pair: str) -> Optional[dict]:
                 max(train_stats["signals_tried"] + test_stats["signals_tried"], 1) * 100, 1
             ),
             "avg_pnl_pct":     round((train_stats["avg_pnl_pct"] + test_stats["avg_pnl_pct"]) / 2, 2),
-            # Stato attuale
+            # Current state
             "price_chg_90d":   round(price_chg, 2),
             "vol_trend_pct":   round(vol_trend, 1),
             "rsi_now":         round(rsi_now, 1),
@@ -246,7 +246,7 @@ def _mech_score(s: dict) -> float:
     cons = s.get("consistency", 1.0)
     if cons >= 0.9:   score += 15
     elif cons >= 0.7: score += 8
-    elif cons < 0.5:  score -= 10                         # penalità overfitting
+    elif cons < 0.5:  score -= 10                         # overfitting penalty
 
     # Sharpe ratio
     sharpe = s.get("test_sharpe", 0)
@@ -271,7 +271,7 @@ def _mech_score(s: dict) -> float:
     return round(max(score, 0), 1)
 
 
-# ── Groq evaluation (singola chiamata per tutte le candidate) ─────────────────
+# ── Groq evaluation (single call for all candidates) ─────────────────────────
 
 def _groq_rank(candidates: list) -> str:
     try:
@@ -328,7 +328,7 @@ def run_discovery() -> dict:
     logger.info("Coppie EUR: %d totali, %d da scansionare", len(all_pairs), len(to_scan))
 
     liquid = _filter_by_volume(to_scan, DISCOVERY_MIN_VOLUME_EUR)
-    liquid = liquid[:DISCOVERY_MAX_PAIRS]   # cap per velocità
+    liquid = liquid[:DISCOVERY_MAX_PAIRS]   # cap for speed
     logger.info("Con liquidità sufficiente (cap %d): %d", DISCOVERY_MAX_PAIRS, len(liquid))
 
     if not liquid:

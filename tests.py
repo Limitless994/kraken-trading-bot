@@ -1,12 +1,12 @@
 """
-tests.py — Test suite completa per il Kraken Trading Bot.
+tests.py — Full test suite for the Kraken Trading Bot.
 
-Esegui con:
+Run with:
     python tests.py
-oppure:
+or:
     python -m pytest tests.py -v
 
-Tutti i test usano mock — nessuna chiamata reale a Kraken, Groq o API esterne.
+All tests use mocks — no real calls to Kraken, Groq, or external APIs.
 """
 import json
 import os
@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-# ── Env minimale prima di importare ──────────────────────────────────────────
+# ── Minimal env before importing ─────────────────────────────────────────────
 os.environ.setdefault("TELEGRAM_TOKEN",    "fake:token")
 os.environ.setdefault("TELEGRAM_CHAT_ID",  "123456")
 os.environ.setdefault("GROQ_API_KEY",      "fake_groq_key")

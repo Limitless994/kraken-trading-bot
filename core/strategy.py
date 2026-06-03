@@ -3,19 +3,19 @@ strategy.py — Signal generation from an Analysis.
 
 Scoring system (6 points max, threshold = config.MIN_SIGNAL_SCORE = 3):
 
-  1. RSI multi-TF (1h AND 15m AND 4h sotto soglie)  → 1 pt  (collassati da 3 in 1)
-  2. MACD crossover rialzista (prev≤0→now>0)         → 1 pt  (ridotto da 2: è lagging)
-     MACD rising above zero                          → 1 pt
-  3. Volume spike ≥ VOLUME_SPIKE_MULT                → 1 pt
-  4. Price above EMA50                               → 1 pt
-  5. Order book bullish (bid/ask > 0.55)             → 1 pt
-  6. ADX forte (> 30, sopra il gate di 20)           → 1 pt
+  1. RSI multi-TF (1h AND 15m AND 4h below thresholds)  → 1 pt  (collapsed from 3 into 1)
+  2. MACD bullish crossover (prev≤0→now>0)               → 1 pt  (reduced from 2: lagging indicator)
+     MACD rising above zero                              → 1 pt
+  3. Volume spike ≥ VOLUME_SPIKE_MULT                    → 1 pt
+  4. Price above EMA50                                   → 1 pt
+  5. Order book bullish (bid/ask > 0.55)                 → 1 pt
+  6. Strong ADX (> 30, above gate of 20)                 → 1 pt
 
 Hard gates (return None regardless of score):
-  - ADX < ADX_MIN          → mercato laterale, falsi segnali
-  - Daily EMA50            → downtrend strutturale
-  - BTC filter             → BTC bearish, blocca tutti i long
-  - Correlazione           → coppia del gruppo già in posizione
+  - ADX < ADX_MIN          → ranging market, false signals
+  - Daily EMA50            → structural downtrend
+  - BTC filter             → BTC bearish, blocks all longs
+  - Correlation            → another pair from the same group already open
 
 Risk/Reward:
   Take Profit = entry + ATR_TP_MULT × ATR   (default 2.5×)
@@ -68,7 +68,7 @@ def _base_currency(pair: str) -> str:
 
 
 def _corr_group(pair: str) -> Optional[str]:
-    """Ritorna il nome del gruppo di correlazione a cui appartiene la coppia."""
+    """Returns the correlation group the pair belongs to, or None."""
     for group in config.CORR_GROUPS:
         if pair in group:
             return str(group)
@@ -83,32 +83,32 @@ def generate_signal(
     open_pairs: set = None,
 ) -> Optional[Signal]:
     """
-    Valuta l'analisi e restituisce un Signal se tutte le condizioni sono soddisfatte.
-    Ritorna None con blocked_reason loggabile se un gate hard blocca il segnale.
+    Evaluates the analysis and returns a Signal if all conditions are met.
+    Returns None if a hard gate blocks the signal.
     """
     if already_open and analysis.pair in already_open:
         return None
 
-    # ── Gate 0: Daily EMA50 — trend di lungo periodo ─────────────────────────
+    # ── Gate 0: Daily EMA50 — long-term trend filter ─────────────────────────
     if config.DAILY_EMA_FILTER and not analysis.daily_above_ema50:
         logger.info("%s: SKIP gate=daily_EMA50", analysis.pair)
-        return None   # prezzo sotto EMA50 daily = downtrend strutturale
+        return None   # price below daily EMA50 = structural downtrend
 
-    # ── Gate 1: ADX — forza del trend ────────────────────────────────────────
+    # ── Gate 1: ADX — trend strength ─────────────────────────────────────────
     if analysis.adx < config.ADX_MIN:
         logger.info("%s: SKIP gate=ADX_basso (ADX=%.1f < %d)", analysis.pair, analysis.adx, config.ADX_MIN)
-        return None   # mercato laterale
+        return None   # ranging market
 
     # ── Gate 2: BTC market filter ─────────────────────────────────────────────
     if config.BTC_FILTER_ENABLED and btc_analysis and analysis.pair != config.BTC_PAIR:
         if btc_analysis.rsi_1h > config.BTC_RSI_MAX:
             logger.info("%s: SKIP gate=BTC_RSI_alto (BTC_RSI=%.1f > %d)", analysis.pair, btc_analysis.rsi_1h, config.BTC_RSI_MAX)
-            return None   # mercato surriscaldato
+            return None   # overheated market
         if config.BTC_EMA_FILTER and not btc_analysis.price_above_ema50:
             logger.info("%s: SKIP gate=BTC_downtrend", analysis.pair)
             return None   # BTC in downtrend
 
-    # ── Gate 3: correlazione ──────────────────────────────────────────────────
+    # ── Gate 3: correlation ───────────────────────────────────────────────────
     if open_pairs:
         my_group = _corr_group(analysis.pair)
         if my_group:
@@ -117,13 +117,13 @@ def generate_signal(
                     for other in grp:
                         if other != analysis.pair and other in open_pairs:
                             logger.info("%s: SKIP gate=correlazione (%s già aperta)", analysis.pair, other)
-                            return None   # coppia correlata già aperta
+                            return None   # correlated pair already open
 
     # ── Scoring ───────────────────────────────────────────────────────────────
     score = 0
     reasons: list = []
 
-    # Booleani di contributo — calcolati una volta, usati sia nel punteggio sia nel log
+    # Scoring flags — computed once, used both in the score and in logging
     _rsi_ok   = (analysis.rsi_1h  < config.RSI_1H_BUY_MAX and
                  analysis.rsi_15m < config.RSI_15M_BUY_MAX and
                  analysis.rsi_4h  < config.RSI_4H_BUY_MAX)
@@ -135,7 +135,7 @@ def generate_signal(
     _ob_ok    = analysis.ob_bullish
     _adx30_ok = analysis.adx >= 30
 
-    # 1. RSI multi-timeframe: tutte e tre le soglie devono passare (1 punto totale)
+    # 1. RSI multi-timeframe: all three thresholds must pass (1 total point)
     if _rsi_ok:
         score += 1
         reasons.append(
@@ -143,7 +143,7 @@ def generate_signal(
             f"15m={analysis.rsi_15m:.1f}  4h={analysis.rsi_4h:.1f}"
         )
 
-    # 2. MACD histogram — crossover vale 1 pt (lagging indicator, peso ridotto da 2)
+    # 2. MACD histogram — crossover worth 1 pt (lagging indicator, weight reduced from 2)
     if crossed_above:
         score += 1
         reasons.append(
@@ -168,7 +168,7 @@ def generate_signal(
         score += 1
         reasons.append(f"Order book bullish: {analysis.ob_imbalance:.2f} (>0.55)")
 
-    # 6. ADX strength bonus (sopra il gate di ADX_MIN=20)
+    # 6. ADX strength bonus (above the ADX_MIN=20 gate)
     if _adx30_ok:
         score += 1
         reasons.append(f"ADX forte: {analysis.adx:.1f} (>30)")
@@ -186,7 +186,7 @@ def generate_signal(
         )
         return None
 
-    # ── Position sizing (Groq ridefinirà la size dopo la valutazione) ────────
+    # ── Position sizing (Groq will redefine size after evaluation) ──────────
     size_eur = max(round(available_eur * config.AI_SIZE_HIGH, 2), 10.0)
     if size_eur > available_eur:
         return None
@@ -211,7 +211,7 @@ def generate_signal(
         size_crypto=size_crypto,
         take_profit=take_profit,
         stop_loss=stop_loss,
-        trailing_stop=stop_loss,   # inizia uguale allo SL fisso
+        trailing_stop=stop_loss,   # initially matches the fixed SL
         rsi_1h=analysis.rsi_1h,
         rsi_15m=analysis.rsi_15m,
         macd_hist=analysis.macd_hist,
@@ -231,21 +231,21 @@ def generate_short_signal(
     btc_analysis: Analysis = None,
     open_pairs: set = None,
 ) -> Optional[Signal]:
-    """Segnale SHORT (SELL margin). Condizioni inverse rispetto a generate_signal."""
+    """SHORT signal (SELL margin). Inverse conditions relative to generate_signal."""
     if already_open and analysis.pair in already_open:
         return None
 
-    # Gate 0: Daily EMA50 — per short il prezzo deve essere SOTTO la EMA50
+    # Gate 0: Daily EMA50 — for short the price must be BELOW EMA50
     if config.DAILY_EMA_FILTER and analysis.daily_above_ema50:
         logger.info("%s: SHORT SKIP gate=daily_EMA50_sopra", analysis.pair)
         return None
 
-    # Gate 1: ADX — trend forte in qualsiasi direzione
+    # Gate 1: ADX — strong trend in any direction
     if analysis.adx < config.ADX_MIN:
         logger.info("%s: SHORT SKIP gate=ADX_basso (%.1f < %d)", analysis.pair, analysis.adx, config.ADX_MIN)
         return None
 
-    # Gate 2: BTC filter invertito — BTC deve essere in downtrend per shortare alt
+    # Gate 2: Inverted BTC filter — BTC must be in downtrend to short alts
     if config.BTC_FILTER_ENABLED and btc_analysis and analysis.pair != config.BTC_PAIR:
         if btc_analysis.rsi_1h < config.BTC_RSI_SHORT_MIN:
             logger.info("%s: SHORT SKIP gate=BTC_oversold (BTC_RSI=%.1f < %d)", analysis.pair, btc_analysis.rsi_1h, config.BTC_RSI_SHORT_MIN)
@@ -254,7 +254,7 @@ def generate_short_signal(
             logger.info("%s: SHORT SKIP gate=BTC_uptrend", analysis.pair)
             return None
 
-    # Gate 3: correlazione
+    # Gate 3: correlation
     if open_pairs:
         for grp in config.CORR_GROUPS:
             if analysis.pair in grp:
@@ -263,22 +263,22 @@ def generate_short_signal(
                         logger.info("%s: SHORT SKIP gate=correlazione (%s già aperta)", analysis.pair, other)
                         return None
 
-    # Gate 4: RSI non già oversold — non shortare in capitolazione
+    # Gate 4: RSI not yet oversold — avoid shorting into capitulation
     if analysis.rsi_1h < config.RSI_SHORT_MIN:
         logger.info("%s: SHORT SKIP gate=RSI_oversold (%.1f < %d)", analysis.pair, analysis.rsi_1h, config.RSI_SHORT_MIN)
         return None
 
-    # ── Scoring (simmetrico ai long, condizioni invertite) ────────────────────
+    # ── Scoring (symmetric to longs, conditions inverted) ────────────────────
     score = 0
     reasons: list = []
 
-    _rsi_ok       = analysis.rsi_1h > config.RSI_SHORT_MIN   # non oversold, trend bearish
+    _rsi_ok       = analysis.rsi_1h > config.RSI_SHORT_MIN   # not oversold, bearish trend
     crossed_below = analysis.macd_hist < 0 and analysis.macd_hist_prev >= 0
     falling_below = analysis.macd_hist < 0 and analysis.macd_hist_slope < 0
     _macd_ok      = crossed_below or falling_below
     _vol_ok       = analysis.volume_ratio >= config.VOLUME_SPIKE_MULT
-    _ema_ok       = not analysis.price_above_ema50   # prezzo sotto EMA50
-    _ob_ok        = analysis.ob_bearish              # pressione di vendita
+    _ema_ok       = not analysis.price_above_ema50   # price below EMA50
+    _ob_ok        = analysis.ob_bearish              # selling pressure
     _adx30_ok     = analysis.adx >= 30
 
     if _rsi_ok:
@@ -335,7 +335,7 @@ def generate_short_signal(
         size_crypto=size_crypto,
         take_profit=take_profit,
         stop_loss=stop_loss,
-        trailing_stop=stop_loss,   # per short parte dallo SL, scende col prezzo
+        trailing_stop=stop_loss,   # for short, starts at SL and moves down with price
         rsi_1h=analysis.rsi_1h,
         rsi_15m=analysis.rsi_15m,
         macd_hist=analysis.macd_hist,
@@ -349,7 +349,7 @@ def generate_short_signal(
 
 
 def kelly_size_pct(trades: list) -> Optional[float]:
-    """Half-Kelly fraction in base allo storico trade. None se dati insufficienti."""
+    """Half-Kelly fraction based on trade history. Returns None if data is insufficient."""
     if not config.KELLY_ENABLED or len(trades) < config.KELLY_MIN_TRADES:
         return None
     wins   = [t for t in trades if t.get("pnl_eur", 0) > 0]

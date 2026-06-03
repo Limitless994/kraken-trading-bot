@@ -1,7 +1,7 @@
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Carica .env se esiste (per BOT_DIR e BOT_PYTHON)
+# Load .env if present (sets BOT_DIR and BOT_PYTHON)
 if [ -f "$SCRIPT_DIR/.env" ]; then
     set -a
     # shellcheck disable=SC1091
@@ -16,7 +16,7 @@ DASH_PID_FILE="$DIR/logs/dashboard.pid"
 
 mkdir -p "$DIR/logs"
 
-# Uccidi loop precedente (kill -0 verifica se il processo esiste prima di killarlo)
+# Kill previous loop (kill -0 checks if the process is still running)
 if [ -f "$LOOP_PID_FILE" ]; then
     OLD_PID=$(cat "$LOOP_PID_FILE")
     if kill -0 "$OLD_PID" 2>/dev/null; then
@@ -33,11 +33,13 @@ if [ -f "$DASH_PID_FILE" ]; then
     rm -f "$DASH_PID_FILE"
 fi
 
-# Uccidi i processi Python del bot (esclude start.sh stesso)
+# Kill any previous start.sh loop (bash process, excludes current script)
+pkill -9 -f "bash.*start.sh" 2>/dev/null
+# Kill bot Python processes (excludes start.sh itself)
 pkill -9 -f "python.*kraken-trading-bot" 2>/dev/null
 sleep 2
 
-# Auto-restart loop con PID file
+# Auto-restart loop with PID file
 (
     while true; do
         "$PYTHON" "$DIR/main.py" >> "$DIR/logs/stdout_bot.log" 2>&1

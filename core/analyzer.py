@@ -15,7 +15,7 @@ from . import config, kraken_client, market_data
 
 logger = logging.getLogger(__name__)
 
-# Cache OHLC per intervalli lenti (4h e daily cambiano raramente)
+# Cache OHLC for slow intervals (4h and daily change infrequently)
 _ohlc_cache: dict = {}
 _OHLC_TTL = {240: 1800, 1440: 7200}   # 4h: 30 min  |  daily: 2 ore
 
@@ -179,9 +179,8 @@ def _adx(highs: list, lows: list, closes: list, period: int = 14) -> float:
 
 
 def _atr(highs: list, lows: list, closes: list, period: int = 14) -> float:
-    """
-    Average True Range — misura la volatilità assoluta del prezzo.
-    Usato per TP/SL adattivi invece di percentuali fisse.
+    """Average True Range — measures absolute price volatility.
+    Used for adaptive TP/SL instead of fixed percentages.
     """
     if len(closes) < period + 2:
         return (max(highs[-period:]) - min(lows[-period:])) / period if len(highs) >= period else highs[-1] - lows[-1]
@@ -240,7 +239,7 @@ def analyze(pair: str) -> Optional[Analysis]:
         else:
             rsi_15m = rsi_1h
 
-        # ── Multi-timeframe: 4h e daily (cached) ─────────────────────────────
+        # ── Multi-timeframe: 4h and daily (cached) ───────────────────────────
         rsi_4h = rsi_1h
         try:
             candles_4h = _get_ohlc(pair, 240)

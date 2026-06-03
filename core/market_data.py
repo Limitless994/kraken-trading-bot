@@ -36,9 +36,9 @@ def get_fear_greed() -> Optional[dict]:
     """
     Returns {"value": int 0-100, "label": str}.
     0-24  = Extreme Fear   → blocca longs
-    25-49 = Fear           → riduci size
-    50-74 = Greed          → neutro
-    75-100= Extreme Greed  → blocca longs (mercato surriscaldato)
+    25-49 = Fear           → reduce size
+    50-74 = Greed          → neutral
+    75-100= Extreme Greed  → blocks longs (overheated market)
     """
     def fetch():
         try:
@@ -58,8 +58,8 @@ def get_fear_greed() -> Optional[dict]:
 def get_funding_rates() -> Optional[dict]:
     """
     Returns {"BTCUSDT": float, "ETHUSDT": float}.
-    > +0.001  (0.1%): longs in eccesso → rischio long squeeze
-    < -0.0005 (-0.05%): shorts in eccesso → favorevole per long spot
+    > +0.001  (0.1%): crowded longs → long squeeze risk
+    < -0.0005 (-0.05%): crowded shorts → favorable for spot longs
     """
     def fetch():
         rates = {}
@@ -82,9 +82,9 @@ def get_funding_rates() -> Optional[dict]:
 def get_order_book_imbalance(pair: str) -> Optional[float]:
     """
     Returns bid / (bid + ask) volume ratio for top 10 levels.
-    > 0.60 = pressione acquisto (bullish)
-    < 0.40 = pressione vendita (bearish)
-    ~0.50  = neutro
+    > 0.60 = buy pressure (bullish)
+    < 0.40 = sell pressure (bearish)
+    ~0.50  = neutral
     """
     try:
         result = kraken_client._public("Depth", {"pair": pair, "count": 10})
@@ -172,7 +172,7 @@ def get_exchange_inflow_proxy() -> Optional[dict]:
             return {
                 "btc_volume_eur":    total_vol,
                 "vol_mcap_ratio":    round(vol_ratio, 4),
-                "high_activity":     vol_ratio > 0.05,   # >5% vol/mcap = alta attività
+                "high_activity":     vol_ratio > 0.05,   # >5% vol/mcap = high activity
             }
         except Exception as exc:
             logger.warning("Exchange inflow proxy failed: %s", exc)
@@ -201,14 +201,14 @@ def get_market_context() -> dict:
 
 
 def fear_greed_blocks_trading(fg_value: Optional[int]) -> bool:
-    """Blocca i LONG: extreme fear (basso) o extreme greed (alto)."""
+    """Blocks LONG trades: extreme fear (low) or extreme greed (high)."""
     if fg_value is None:
         return False
     return fg_value < config.FEAR_GREED_MIN or fg_value > config.FEAR_GREED_MAX
 
 
 def fear_greed_blocks_short(fg_value: Optional[int]) -> bool:
-    """Blocca i SHORT solo in extreme greed — extreme fear è favorevole per shortare."""
+    """Blocks SHORT trades only in extreme greed — extreme fear is favorable for shorting."""
     if fg_value is None:
         return False
     return fg_value > config.FEAR_GREED_MAX
@@ -218,4 +218,4 @@ def funding_rate_warning(btc_rate: Optional[float]) -> bool:
     """Returns True if BTC funding rate signals crowded longs."""
     if btc_rate is None:
         return False
-    return btc_rate > 0.001   # > 0.1% = longs molto in eccesso
+    return btc_rate > 0.001   # > 0.1% = heavily crowded longs

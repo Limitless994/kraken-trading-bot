@@ -21,7 +21,7 @@ def _setup_logging(log_dir: "Path") -> None:
         h = RotatingFileHandler(
             log_dir / f"{name}.log",
             maxBytes=2 * 1024 * 1024,   # 2 MB per file
-            backupCount=3,               # mantieni 3 backup
+            backupCount=3,               # keep 3 backup files
             encoding="utf-8",
         )
         h.setFormatter(fmt)
@@ -33,7 +33,7 @@ def _setup_logging(log_dir: "Path") -> None:
     root.addHandler(logging.StreamHandler(sys.stdout))
     root.addHandler(_file_handler("bot"))
 
-    # Componenti con log dedicato
+    # Modules with a dedicated log file
     for module, logfile in [
         ("bot.telegram_bot",      "trading"),
         ("core.analyzer",         "analyzer"),
@@ -45,13 +45,13 @@ def _setup_logging(log_dir: "Path") -> None:
     ]:
         lgr = logging.getLogger(module)
         lgr.addHandler(_file_handler(logfile))
-        lgr.propagate = True   # sale anche al root (bot.log)
+        lgr.propagate = True   # also propagates to the root logger (bot.log)
 
 logger = logging.getLogger(__name__)
 
 
 def _notify_crash(exc: Exception) -> None:
-    """Tenta di inviare l'errore critico su Telegram prima di uscire."""
+    """Attempts to send the critical error to Telegram before exiting."""
     try:
         import requests
         from core import config

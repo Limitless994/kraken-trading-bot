@@ -72,7 +72,7 @@ BTC_RSI_MAX        = int(os.getenv("BTC_RSI_MAX",       "65"))
 BTC_RSI_SHORT_MIN  = int(os.getenv("BTC_RSI_SHORT_MIN", "28"))
 BTC_EMA_FILTER     = os.getenv("BTC_EMA_FILTER", "true").lower() == "true"
 
-# ── Correlazione ─────────────────────────────────────────────────────────────
+# ── Correlation groups ───────────────────────────────────────────────────────
 CORR_GROUPS: list = [
     ["SOLEUR", "ETHEUR"],
     ["DOGEEUR", "XRPEUR"],
@@ -90,7 +90,7 @@ NEWS_HEADLINES = int(os.getenv("NEWS_HEADLINES", "4"))
 # ── On-chain data ─────────────────────────────────────────────────────────────
 ONCHAIN_ENABLED = os.getenv("ONCHAIN_ENABLED", "true").lower() == "true"
 
-# ── Groq confidence e sizing ─────────────────────────────────────────────────
+# ── Groq confidence and sizing ───────────────────────────────────────────────
 GROQ_MIN_CONFIDENCE = int(os.getenv("GROQ_MIN_CONFIDENCE", "6"))
 AI_SIZE_HIGH        = float(os.getenv("AI_SIZE_HIGH", "0.25"))
 AI_SIZE_MED         = float(os.getenv("AI_SIZE_MED",  "0.18"))
