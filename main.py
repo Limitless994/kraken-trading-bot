@@ -35,17 +35,18 @@ def _setup_logging(log_dir: "Path") -> None:
 
     # Componenti con log dedicato
     for module, logfile in [
-        ("telegram_bot",    "trading"),
-        ("analyzer",        "analyzer"),
-        ("strategy",        "strategy"),
-        ("groq_evaluator",  "groq"),
-        ("market_data",     "market"),
-        ("discovery",       "discovery"),
-        ("kraken_client",   "kraken"),
+        ("bot.telegram_bot",      "trading"),
+        ("core.analyzer",         "analyzer"),
+        ("core.strategy",         "strategy"),
+        ("services.groq_evaluator", "groq"),
+        ("core.market_data",      "market"),
+        ("services.discovery",    "discovery"),
+        ("core.kraken_client",    "kraken"),
     ]:
         lgr = logging.getLogger(module)
         lgr.addHandler(_file_handler(logfile))
         lgr.propagate = True   # sale anche al root (bot.log)
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,7 +54,7 @@ def _notify_crash(exc: Exception) -> None:
     """Tenta di inviare l'errore critico su Telegram prima di uscire."""
     try:
         import requests
-        import config
+        from core import config
         msg = (
             f"BOT CRASH\n\n"
             f"{type(exc).__name__}: {exc}\n\n"
@@ -70,7 +71,7 @@ def _notify_crash(exc: Exception) -> None:
 
 def main() -> None:
     from pathlib import Path
-    import config
+    from core import config
 
     _setup_logging(Path(__file__).parent / "logs")
 
@@ -80,7 +81,7 @@ def main() -> None:
         logger.critical(str(exc))
         sys.exit(1)
 
-    from telegram_bot import TradingBot
+    from bot.telegram_bot import TradingBot
     try:
         bot = TradingBot()
         bot.run()

@@ -14,8 +14,7 @@ from pathlib import Path
 import requests
 from flask import Flask, jsonify, redirect, render_template_string, request, url_for
 
-import config
-import market_data
+from core import config, market_data
 
 app = Flask(__name__)
 
@@ -115,8 +114,8 @@ def action_profile():
     if name not in config.PROFILES:
         return redirect(url_for("index", msg="unknown_profile"))
     try:
-        config.apply_profile(name)                        # aggiorna questo processo
-        _queue_command({"cmd": "profile", "name": name})  # aggiorna il bot
+        config.apply_profile(name)
+        _queue_command({"cmd": "profile", "name": name})
         return redirect(url_for("index", msg="profile_changed"))
     except Exception:
         return redirect(url_for("index", msg="error"))
@@ -146,7 +145,7 @@ def action_close():
 @app.route("/api/balance")
 def api_balance():
     try:
-        import kraken_client
+        from core import kraken_client
         bal = kraken_client.get_balance()
         eur = bal.pop("ZEUR", bal.pop("EUR", 0.0))
         return jsonify({"ok": True, "eur": eur, "crypto": bal})
@@ -181,11 +180,15 @@ TEMPLATE = """
     .metric-label { color: #aaa; font-size: 0.78rem; }
     .pnl-pos { color: #4caf82; }
     .pnl-neg { color: #e05c5c; }
-    .groq-esegui  { border-left: 3px solid #4caf82; background: #0d1f14; padding: 8px 12px; border-radius: 4px; margin-bottom: 6px; }
-    .groq-rifiuta { border-left: 3px solid #e05c5c; background: #1f0d0d; padding: 8px 12px; border-radius: 4px; margin-bottom: 6px; }
+    .groq-esegui  { border-left: 3px solid #4caf82; background: #111c14; color: #e0e0e0; padding: 10px 14px; border-radius: 4px; margin-bottom: 8px; }
+    .groq-rifiuta { border-left: 3px solid #e05c5c; background: #1c1111; color: #e0e0e0; padding: 10px 14px; border-radius: 4px; margin-bottom: 8px; }
+    .groq-reason  { font-size: 0.9rem;  margin-top: 6px; color: #e8e8e8; line-height: 1.4; }
+    .groq-stats   { font-size: 0.83rem; color: #c0c0c0; margin-top: 5px; display: flex; flex-wrap: wrap; gap: 6px 16px; }
     .refresh-note { font-size: 0.75rem; color: #aaa; }
     .text-muted   { color: #aaa !important; }
     .conf-badge   { font-size: 0.7rem; padding: 2px 6px; border-radius: 10px; background: #2a2d3e; color: #ccc; }
+    .side-long    { color: #4caf82; font-size: 0.75rem; font-weight: 600; }
+    .side-short   { color: #e05c5c; font-size: 0.75rem; font-weight: 600; }
     canvas        { max-height: 220px; }
   </style>
 </head>
@@ -224,8 +227,6 @@ TEMPLATE = """
   <div class="card mb-3">
     <div class="card-body py-2 px-3">
       <div class="d-flex flex-wrap align-items-center gap-2">
-
-        <!-- Profile selector -->
         <span style="font-size:0.78rem;color:#aaa;">Profilo:</span>
         {% set profile_colors = {'conservative': 'btn-success', 'moderate': 'btn-warning', 'aggressive': 'btn-danger'} %}
         {% for p_name in ['conservative', 'moderate', 'aggressive'] %}
@@ -238,10 +239,7 @@ TEMPLATE = """
           </button>
         </form>
         {% endfor %}
-
         <div class="vr" style="height:24px;"></div>
-
-        <!-- Action buttons -->
         <form method="post" action="/action/scan" class="mb-0">
           <button type="submit" class="btn btn-sm btn-outline-light" style="font-size:0.78rem;">Scan ora</button>
         </form>
@@ -249,15 +247,11 @@ TEMPLATE = """
           <button type="submit" class="btn btn-sm btn-outline-info" style="font-size:0.78rem;">Discovery ora</button>
         </form>
         <button type="button" class="btn btn-sm btn-outline-secondary" style="font-size:0.78rem;" onclick="loadBalance()">Saldo Kraken</button>
-
-        <!-- Feedback message -->
         {% if msg %}
         <span class="badge {% if 'error' in msg or 'unknown' in msg or 'no_pair' in msg %}bg-danger{% else %}bg-success{% endif %} ms-1" style="font-size:0.78rem;">
           {{ msg_label }}
         </span>
         {% endif %}
-
-        <!-- Balance inline result -->
         <span id="balance-result" style="font-size:0.82rem;"></span>
       </div>
     </div>
@@ -378,13 +372,14 @@ TEMPLATE = """
       {% if positions %}
       <table class="table table-dark table-hover mb-0">
         <thead><tr>
-          <th>Coppia</th><th>Entry</th><th>Ora</th><th>P&L %</th><th>P&L €</th>
-          <th>TP</th><th>SL</th><th>Trailing</th><th>ADX</th><th>Size</th><th>Aperta</th><th></th>
+          <th>Coppia</th><th>Tipo</th><th>Entry</th><th>Ora</th><th>P&L %</th><th>P&L €</th>
+          <th>TP</th><th>SL</th><th>Trailing</th><th>Size</th><th>Aperta</th><th></th>
         </tr></thead>
         <tbody>
         {% for p in positions %}
         <tr>
           <td><strong>{{ p.pair }}</strong></td>
+          <td><span class="{% if p.side == 'short' %}side-short{% else %}side-long{% endif %}">{{ p.side|upper }}</span></td>
           <td>{{ "%.6f"|format(p.entry) }}</td>
           <td>{{ "%.6f"|format(p.price) if p.price else "—" }}</td>
           <td class="{% if p.pnl_pct >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}">{{ "%+.2f"|format(p.pnl_pct) }}%</td>
@@ -392,7 +387,6 @@ TEMPLATE = """
           <td>{{ "%.6f"|format(p.tp) }}</td>
           <td class="pnl-neg">{{ "%.6f"|format(p.sl) }}</td>
           <td class="text-warning">{{ "%.6f"|format(p.trailing) if p.trailing else "—" }}</td>
-          <td>{{ "%.1f"|format(p.adx) if p.adx else "—" }}</td>
           <td>{{ "%.2f"|format(p.size_eur) }}€</td>
           <td>{{ p.opened_at }}</td>
           <td>
@@ -455,21 +449,24 @@ TEMPLATE = """
       {% if groq_log %}
         {% for g in groq_log %}
         <div class="{% if g.decision == 'ESEGUI' %}groq-esegui{% else %}groq-rifiuta{% endif %}">
-          <div class="d-flex justify-content-between align-items-center">
-            <strong>{% if g.decision == 'ESEGUI' %}✅{% else %}❌{% endif %} {{ g.decision }} — {{ g.pair }}</strong>
+          <div class="d-flex justify-content-between align-items-center flex-wrap gap-1">
+            <strong style="color:{% if g.decision == 'ESEGUI' %}#4caf82{% else %}#e05c5c{% endif %}">
+              {% if g.decision == 'ESEGUI' %}✅{% else %}❌{% endif %}
+              {{ g.decision }}{% if g.get('direction') %} [{{ g.direction }}]{% endif %} — {{ g.pair }}
+            </strong>
             <div class="d-flex gap-2 align-items-center">
               {% if g.get('confidence') %}<span class="conf-badge">{{ g.confidence }}/10</span>{% endif %}
-              <span class="text-muted" style="font-size:0.75rem">{{ fmt_time(g.ts) }} | Score {{ g.score }}/6</span>
+              <span style="font-size:0.75rem;color:#aaa;">{{ fmt_time(g.ts) }} | Score {{ g.score }}/6</span>
             </div>
           </div>
-          <div style="font-size:0.85rem; margin-top:4px;">{{ g.reason }}</div>
-          <div style="font-size:0.78rem; color:#888; margin-top:4px;">
-            RSI(1h): {{ "%.1f"|format(g.rsi_1h) }} |
-            RSI(15m): {{ "%.1f"|format(g.rsi_15m) }} |
-            MACD: {{ "%+.6f"|format(g.macd_hist) }} |
-            Vol: {{ "%.2f"|format(g.volume_ratio) }}× |
-            ADX: {{ "%.1f"|format(g.get('adx', 0)) }} |
-            Prezzo: {{ "%.6f"|format(g.price) }}
+          <div class="groq-reason">{{ g.reason }}</div>
+          <div class="groq-stats">
+            <span>RSI 1h: <b>{{ "%.1f"|format(g.rsi_1h) }}</b></span>
+            <span>RSI 15m: <b>{{ "%.1f"|format(g.rsi_15m) }}</b></span>
+            <span>MACD: <b>{{ "%+.4f"|format(g.macd_hist) }}</b></span>
+            <span>Vol: <b>{{ "%.2f"|format(g.volume_ratio) }}×</b></span>
+            <span>ADX: <b>{{ "%.1f"|format(g.get('adx', 0)) }}</b></span>
+            <span>Prezzo: <b>{{ "%.6g"|format(g.price) }}</b></span>
           </div>
         </div>
         {% endfor %}
@@ -588,7 +585,6 @@ TEMPLATE = """
               <li><span class="text-warning">ADX 20–40</span> — Trend moderato</li>
               <li><span class="pnl-neg">ADX &gt; 40</span> — Trend molto forte (rialzo o ribasso deciso)</li>
             </ul>
-            <small class="text-muted">Con ADX alto in downtrend il bot è più cauto: un trend forte verso il basso è pericoloso per i long.</small>
           </div>
           <div class="col-md-6">
             <h6 class="text-warning">MACD</h6>
@@ -604,21 +600,21 @@ TEMPLATE = """
             <p>Prima di aprire un trade il bot verifica 6 condizioni. Servono almeno {{ min_score }}/6 per procedere.</p>
             <ul>
               <li>RSI multi-timeframe OK → 1 pt</li>
-              <li>MACD rialzista → 1 pt</li>
+              <li>MACD rialzista (o ribassista per short) → 1 pt</li>
               <li>Volume spike ≥ {{ vol_mult }}× la media → 1 pt</li>
-              <li>Prezzo sopra EMA50 → 1 pt</li>
-              <li>Order book bullish → 1 pt</li>
+              <li>Prezzo sopra (o sotto) EMA50 → 1 pt</li>
+              <li>Order book bullish (o bearish per short) → 1 pt</li>
               <li>ADX &gt; 30 → 1 pt</li>
             </ul>
           </div>
           <div class="col-md-6">
             <h6 class="text-warning">TP / SL / Trailing Stop</h6>
             <ul>
-              <li><span class="pnl-pos">TP (Take Profit)</span> — Prezzo a cui il bot vende in profitto automaticamente</li>
-              <li><span class="pnl-neg">SL (Stop Loss)</span> — Prezzo a cui il bot vende in perdita per limitare il danno</li>
-              <li><span class="text-warning">Trailing Stop</span> — SL che si sposta verso l'alto man mano che il prezzo sale, bloccando i guadagni</li>
+              <li><span class="pnl-pos">TP (Take Profit)</span> — Prezzo a cui il bot chiude in profitto automaticamente</li>
+              <li><span class="pnl-neg">SL (Stop Loss)</span> — Prezzo a cui il bot chiude in perdita per limitare il danno</li>
+              <li><span class="text-warning">Trailing Stop</span> — SL che si sposta con il prezzo, bloccando i guadagni</li>
             </ul>
-            <small class="text-muted">R:R ≈ 2.5:1 — rischi 1€ per potenzialmente guadagnarne 2.5€</small>
+            <small class="text-muted">R:R ≈ 2.5:1 — rischi 1€ per potenzialmente guadagnarne 2.5€. Short: TP/SL invertiti.</small>
           </div>
         </div>
       </div>
@@ -660,7 +656,6 @@ TEMPLATE = """
 
 {% if pnl_chart_labels %}
 <script>
-// P&L cumulativo
 new Chart(document.getElementById('pnlChart'), {
   type: 'line',
   data: {
@@ -684,7 +679,6 @@ new Chart(document.getElementById('pnlChart'), {
   }
 });
 
-// Esiti
 new Chart(document.getElementById('outcomeChart'), {
   type: 'doughnut',
   data: {
@@ -694,14 +688,9 @@ new Chart(document.getElementById('outcomeChart'), {
       backgroundColor: ['#4caf82', '#e05c5c', '#7a7a9a'],
     }]
   },
-  options: {
-    plugins: {
-      legend: { labels: { color: '#ccc', font: { size: 11 } } }
-    }
-  }
+  options: { plugins: { legend: { labels: { color: '#ccc', font: { size: 11 } } } } }
 });
 
-// Groq
 new Chart(document.getElementById('groqChart'), {
   type: 'doughnut',
   data: {
@@ -711,11 +700,7 @@ new Chart(document.getElementById('groqChart'), {
       backgroundColor: ['#4caf82', '#e05c5c'],
     }]
   },
-  options: {
-    plugins: {
-      legend: { labels: { color: '#ccc', font: { size: 11 } } }
-    }
-  }
+  options: { plugins: { legend: { labels: { color: '#ccc', font: { size: 11 } } } } }
 });
 </script>
 {% endif %}
@@ -759,19 +744,27 @@ def index():
     mempool        = market_data.get_btc_mempool() if config.ONCHAIN_ENABLED else None
 
     # Circuit breaker check
-    trades_all   = _load_json(TRADES_LOG_FILE, [])
-    today_ts     = time.time() - 86400
-    daily_loss   = sum(t["pnl_eur"] for t in trades_all if t.get("closed_at", 0) > today_ts and t["pnl_eur"] < 0)
-    cb_active    = config.CIRCUIT_BREAKER_ENABLED and abs(daily_loss) >= config.CIRCUIT_BREAKER_LOSS_EUR
+    today_ts   = time.time() - 86400
+    daily_loss = sum(t["pnl_eur"] for t in trades_log if t.get("closed_at", 0) > today_ts and t["pnl_eur"] < 0)
+    cb_active  = config.CIRCUIT_BREAKER_ENABLED and abs(daily_loss) >= config.CIRCUIT_BREAKER_LOSS_EUR
 
-    # Posizioni arricchite con prezzi live
+    # Posizioni arricchite con prezzi live (P&L corretto per long e short)
     enriched = []
     for pair, pos in positions_raw.items():
-        price   = _fetch_price(pair)
-        pnl_pct = ((price - pos["entry"]) / pos["entry"] * 100) if price else 0.0
-        pnl_eur = ((price - pos["entry"]) * pos["size_crypto"]) if price else 0.0
+        price = _fetch_price(pair)
+        side  = pos.get("side", "long")
+        if price:
+            if side == "short":
+                pnl_pct = (pos["entry"] - price) / pos["entry"] * 100
+                pnl_eur = (pos["entry"] - price) * pos["size_crypto"]
+            else:
+                pnl_pct = (price - pos["entry"]) / pos["entry"] * 100
+                pnl_eur = (price - pos["entry"]) * pos["size_crypto"]
+        else:
+            pnl_pct = pnl_eur = 0.0
         enriched.append({
             "pair":      pair,
+            "side":      side,
             "entry":     pos["entry"],
             "price":     price,
             "pnl_pct":   pnl_pct,
@@ -793,7 +786,7 @@ def index():
     groq_approved = sum(1 for g in groq_log if g["decision"] == "ESEGUI")
     groq_rejected = sum(1 for g in groq_log if g["decision"] == "RIFIUTA")
 
-    # Dati grafici P&L cumulativo
+    # P&L cumulativo
     pnl_cum = 0.0
     pnl_labels, pnl_data = [], []
     for t in trades_log:
@@ -807,7 +800,6 @@ def index():
         sum(1 for t in trades_log if t["exit_reason"] == "manual"),
     ]
 
-    # BTC RSI per badge header
     btc_rsi = None
     for g in reversed(groq_log):
         if g.get("pair") == config.BTC_PAIR:

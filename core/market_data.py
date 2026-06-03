@@ -12,7 +12,7 @@ from typing import Optional
 
 import requests
 
-import kraken_client
+from . import config, kraken_client
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +97,6 @@ def get_order_book_imbalance(pair: str) -> Optional[float]:
         logger.warning("Order book %s failed: %s", pair, exc)
         return None
 
-
-# ── Consolidated context ──────────────────────────────────────────────────────
 
 # ── Crypto News (CoinGecko free) ─────────────────────────────────────────────
 
@@ -188,9 +186,9 @@ def get_market_context() -> dict:
     """Single call that returns all market context for Groq evaluation."""
     fg      = get_fear_greed()
     fr      = get_funding_rates()
-    news    = get_crypto_news() if __import__("config").NEWS_ENABLED else []
-    mempool = get_btc_mempool() if __import__("config").ONCHAIN_ENABLED else None
-    inflow  = get_exchange_inflow_proxy() if __import__("config").ONCHAIN_ENABLED else None
+    news    = get_crypto_news() if config.NEWS_ENABLED else []
+    mempool = get_btc_mempool() if config.ONCHAIN_ENABLED else None
+    inflow  = get_exchange_inflow_proxy() if config.ONCHAIN_ENABLED else None
     return {
         "fear_greed_value": fg["value"]  if fg else None,
         "fear_greed_label": fg["label"]  if fg else None,
@@ -203,11 +201,17 @@ def get_market_context() -> dict:
 
 
 def fear_greed_blocks_trading(fg_value: Optional[int]) -> bool:
-    """Returns True if Fear & Greed suggests avoiding new longs."""
-    import config
+    """Blocca i LONG: extreme fear (basso) o extreme greed (alto)."""
     if fg_value is None:
         return False
     return fg_value < config.FEAR_GREED_MIN or fg_value > config.FEAR_GREED_MAX
+
+
+def fear_greed_blocks_short(fg_value: Optional[int]) -> bool:
+    """Blocca i SHORT solo in extreme greed — extreme fear è favorevole per shortare."""
+    if fg_value is None:
+        return False
+    return fg_value > config.FEAR_GREED_MAX
 
 
 def funding_rate_warning(btc_rate: Optional[float]) -> bool:

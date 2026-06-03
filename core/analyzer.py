@@ -11,9 +11,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-import config
-import kraken_client
-import market_data
+from . import config, kraken_client, market_data
 
 logger = logging.getLogger(__name__)
 

@@ -1,6 +1,16 @@
 #!/bin/bash
-PYTHON="/volume1/homes/limitless/venv_trading/bin/python"
-DIR="/volume1/homes/limitless/trading yt"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Carica .env se esiste (per BOT_DIR e BOT_PYTHON)
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
+
+PYTHON="${BOT_PYTHON:-$SCRIPT_DIR/venv/bin/python}"
+DIR="${BOT_DIR:-$SCRIPT_DIR}"
 LOOP_PID_FILE="$DIR/logs/bot_loop.pid"
 DASH_PID_FILE="$DIR/logs/dashboard.pid"
 
@@ -23,8 +33,8 @@ if [ -f "$DASH_PID_FILE" ]; then
     rm -f "$DASH_PID_FILE"
 fi
 
-# Uccidi tutto: python E i loop bash orfani legati a "trading yt"
-pkill -9 -f "trading yt" 2>/dev/null
+# Uccidi i processi Python del bot (esclude start.sh stesso)
+pkill -9 -f "python.*kraken-trading-bot" 2>/dev/null
 sleep 2
 
 # Auto-restart loop con PID file
@@ -55,4 +65,4 @@ echo "  discovery.log — discovery giornaliera"
 echo "  kraken.log    — API Kraken"
 echo ""
 echo "Discovery separata: aggiungi cron in DSM Task Scheduler:"
-echo "  $PYTHON \"$DIR/discovery.py\""
+echo "  $PYTHON \"$DIR/services/discovery.py\""

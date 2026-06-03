@@ -34,17 +34,14 @@ from telegram.ext import (
     ContextTypes,
 )
 
-import config
-import discovery
-import groq_evaluator
-import kraken_client
-import market_data
-from analyzer import analyze
-from strategy import Signal, generate_signal, generate_short_signal, kelly_size_pct
+from core import config, kraken_client, market_data
+from core.analyzer import analyze
+from core.strategy import Signal, generate_signal, generate_short_signal, kelly_size_pct
+from services import discovery, groq_evaluator
 
 logger = logging.getLogger(__name__)
 
-_DIR                = Path(__file__).parent
+_DIR                = Path(__file__).parent.parent   # project root
 POSITIONS_FILE      = _DIR / "positions.json"
 TRADES_LOG_FILE     = _DIR / "trades_log.json"
 GROQ_LOG_FILE       = _DIR / "groq_log.json"
@@ -366,7 +363,7 @@ class TradingBot:
                     "trailing_stop": signal.trailing_stop,
                 }
                 PENDING_ORDERS_FILE.write_text(
-                    __import__("json").dumps(pending, indent=2), encoding="utf-8"
+                    json.dumps(pending, indent=2), encoding="utf-8"
                 )
                 await self.app.bot.send_message(
                     chat_id=config.TELEGRAM_CHAT_ID,
@@ -507,10 +504,12 @@ class TradingBot:
         mkt_ctx = await asyncio.to_thread(market_data.get_market_context)
         fg_val  = mkt_ctx.get("fear_greed_value")
 
-        if config.FEAR_GREED_ENABLED and market_data.fear_greed_blocks_trading(fg_val):
+        long_blocked_fg = config.FEAR_GREED_ENABLED and market_data.fear_greed_blocks_trading(fg_val)
+        short_blocked_fg = config.FEAR_GREED_ENABLED and market_data.fear_greed_blocks_short(fg_val)
+
+        if long_blocked_fg:
             label = mkt_ctx.get("fear_greed_label", "")
-            logger.info("SCAN BLOCKED (all pairs): fear_greed=%d (%s)", fg_val, label)
-            return False
+            logger.info("LONG BLOCKED: fear_greed=%d (%s)", fg_val, label)
 
         # ── Kelly sizing da storico trade ─────────────────────────────────────
         trades_history = _load_json(TRADES_LOG_FILE, [])
@@ -536,7 +535,7 @@ class TradingBot:
         dynamic = _load_json(DYNAMIC_PAIRS_FILE, [])
         scan_pairs = list(dict.fromkeys(config.PAIRS + dynamic))
 
-        for pair in scan_pairs:
+        for pair in ([] if long_blocked_fg else scan_pairs):
             if pair in already_open:
                 continue
             if len(self.positions) >= config.MAX_OPEN_TRADES:
@@ -614,7 +613,11 @@ class TradingBot:
             await asyncio.sleep(1)
 
         # ── Short scan ────────────────────────────────────────────────────────
-        for pair in scan_pairs:
+        if short_blocked_fg:
+            label = mkt_ctx.get("fear_greed_label", "")
+            logger.info("SHORT BLOCKED: fear_greed=%d (%s) — extreme greed", fg_val, label)
+
+        for pair in ([] if short_blocked_fg else scan_pairs):
             if pair in already_open:
                 continue
             if len(self.positions) >= config.MAX_OPEN_TRADES:
@@ -913,7 +916,7 @@ class TradingBot:
             pending.pop(pair, None)
         if to_remove:
             PENDING_ORDERS_FILE.write_text(
-                __import__("json").dumps(pending, indent=2), encoding="utf-8"
+                json.dumps(pending, indent=2), encoding="utf-8"
             )
 
     async def _cmd_ai(self, update, ctx) -> None:
@@ -1014,13 +1017,13 @@ class TradingBot:
             return
 
         DISCOVERY_FILE.write_text(
-            __import__("json").dumps(result, indent=2, ensure_ascii=False),
+            json.dumps(result, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
 
         top_pairs = [c["pair"] for c in result.get("candidates", [])[:5]]
         DYNAMIC_PAIRS_FILE.write_text(
-            __import__("json").dumps(top_pairs, ensure_ascii=False),
+            json.dumps(top_pairs, ensure_ascii=False),
             encoding="utf-8",
         )
 

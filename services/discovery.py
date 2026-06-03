@@ -17,9 +17,8 @@ from typing import Optional
 
 from groq import Groq
 
-import config
-import kraken_client
-from analyzer import _adx, _ema, _macd_histogram, _rsi, _volume_ratio
+from core import config, kraken_client, prompts
+from core.analyzer import _adx, _ema, _macd_histogram, _rsi, _volume_ratio
 
 logger = logging.getLogger(__name__)
 
@@ -294,21 +293,18 @@ def _groq_rank(candidates: list) -> str:
                 f"score meccanico {c.get('mech_score', 0)}"
             )
 
-        prompt = (
-            f"Strategia: momentum crypto/EUR su Kraken. TP +{tp_pct:.0f}%, SL -{sl_pct:.0f}%, R:R {rr:.1f}:1.\n"
-            f"Dati backtest 90gg + indicatori ATTUALI per {len(candidates)} coppie candidate:\n\n"
-            + "\n\n".join(lines)
-            + "\n\nRispondi a queste due domande:\n"
-            "1) INVESTIRE ORA? Considerando RSI, ADX, volume attuale e consistenza backtest, "
-            "vale la pena aprire una posizione adesso? (Sì/No e perché in 1 riga)\n"
-            "2) TOP SCELTA: se sì, quale coppia e perché (max 1 riga). Se no, quale monitorare.\n"
-            "Sii conciso — max 4 righe totali."
+        prompt = prompts.DISCOVERY_USER.format(
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+            rr=rr,
+            n_candidates=len(candidates),
+            candidates_block="\n\n".join(lines),
         )
 
         resp = client.chat.completions.create(
             model=config.GROQ_MODEL,
             messages=[
-                {"role": "system", "content": "Analista quantitativo crypto esperto. Rispondi in italiano. Sii diretto e concreto."},
+                {"role": "system", "content": prompts.DISCOVERY_SYSTEM},
                 {"role": "user",   "content": prompt},
             ],
             temperature=0.2,
@@ -375,7 +371,7 @@ if __name__ == "__main__":
     from pathlib import Path
     from logging.handlers import RotatingFileHandler
 
-    _dir = Path(__file__).parent
+    _dir = Path(__file__).parent.parent   # project root
     (_dir / "logs").mkdir(exist_ok=True)
 
     logging.basicConfig(

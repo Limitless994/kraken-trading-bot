@@ -1,52 +1,54 @@
+# ── SSH config ────────────────────────────────────────────────────────────────
 $NAS  = "limitless@192.168.0.200"
 $PORT = "2299"
-$KEY  = "C:\Users\Davide\.ssh\nas_trading"
-$SRC  = "C:\Users\Davide\Desktop\trading yt"
-$DST  = "~/tradingyt"
+$KEY  = "$env:USERPROFILE\.ssh\nas_trading"
 
-$files = @(
-    "config.py",
-    "main.py",
-    "analyzer.py",
-    "strategy.py",
-    "groq_evaluator.py",
-    "kraken_client.py",
-    "market_data.py",
-    "telegram_bot.py",
-    "dashboard.py",
-    "discovery.py",
-    "start.sh"
-)
+# ── Local source (directory di questo script) ─────────────────────────────────
+$SRC = Split-Path -Parent $MyInvocation.MyCommand.Definition
 
-Write-Host "Deploy in corso..." -ForegroundColor Cyan
+# ── Legge BOT_DIR e BOT_PYTHON da .env (stessi valori usati da start.sh) ──────
+$BOT_DIR    = "~/kraken-trading-bot"
+$BOT_PYTHON = "~/venv_trading/bin/python"
 
-foreach ($f in $files) {
-    Write-Host "  Copio $f" -ForegroundColor Gray
-    & scp -O -P $PORT -i $KEY "$SRC\$f" "${NAS}:${DST}/${f}"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "  ERRORE su $f" -ForegroundColor Red
+$ENV_FILE = Join-Path $SRC ".env"
+if (Test-Path $ENV_FILE) {
+    Get-Content $ENV_FILE | ForEach-Object {
+        if ($_ -match '^\s*BOT_DIR\s*=\s*(.+?)\s*$')    { $BOT_DIR    = $Matches[1] }
+        if ($_ -match '^\s*BOT_PYTHON\s*=\s*(.+?)\s*$') { $BOT_PYTHON = $Matches[1] }
     }
 }
 
-Write-Host "Aggiorno configurazione NAS..." -ForegroundColor Cyan
-& ssh -p $PORT -i $KEY $NAS @'
-sed -i 's/GROQ_MODEL=.*/GROQ_MODEL=llama-3.3-70b-versatile/' '/volume1/homes/limitless/trading yt/.env'
-echo -n "GROQ_MODEL aggiornato: "; grep GROQ_MODEL '/volume1/homes/limitless/trading yt/.env'
-'@
+Write-Host "Deploy verso $NAS`:$BOT_DIR" -ForegroundColor Cyan
 
+# ── File e directory da copiare ───────────────────────────────────────────────
+$files = @("main.py", "dashboard.py", "tests.py", "start.sh", "requirements.txt")
+$dirs  = @("core", "bot", "services")
+
+# Crea le directory sul NAS
+& ssh -p $PORT -i $KEY $NAS "mkdir -p '$BOT_DIR/core' '$BOT_DIR/bot' '$BOT_DIR/services' '$BOT_DIR/logs'"
+
+# Copia file singoli
+foreach ($f in $files) {
+    Write-Host "  $f" -ForegroundColor Gray
+    & scp -O -P $PORT -i $KEY "$SRC\$f" "${NAS}:${BOT_DIR}/${f}"
+    if ($LASTEXITCODE -ne 0) { Write-Host "  ERRORE su $f" -ForegroundColor Red }
+}
+
+# Copia directory (ricorsivo)
+foreach ($d in $dirs) {
+    Write-Host "  $d/" -ForegroundColor Gray
+    & scp -O -r -P $PORT -i $KEY "$SRC\$d" "${NAS}:${BOT_DIR}/"
+    if ($LASTEXITCODE -ne 0) { Write-Host "  ERRORE su $d/" -ForegroundColor Red }
+}
+
+# ── Dipendenze Python ─────────────────────────────────────────────────────────
 Write-Host "Aggiorno dipendenze Python sul NAS..." -ForegroundColor Cyan
-& ssh -p $PORT -i $KEY $NAS @'
-/volume1/homes/limitless/venv_trading/bin/pip install -q --upgrade httpx anyio sniffio
-/volume1/homes/limitless/venv_trading/bin/pip install -q -r '/volume1/homes/limitless/trading yt/requirements.txt'
-'@
+& ssh -p $PORT -i $KEY $NAS "'$BOT_PYTHON' -m pip install -q --upgrade pip && '$BOT_PYTHON' -m pip install -q -r '$BOT_DIR/requirements.txt'"
 
-Write-Host "Riavvio bot e dashboard sul NAS..." -ForegroundColor Cyan
-& ssh -p $PORT -i $KEY $NAS @'
-bash ~/tradingyt/start.sh
-sleep 3
-COUNT=$(ps aux | grep "venv_trading/bin/python" | grep "main.py" | grep -v grep | wc -l)
-echo "Istanze main.py attive: $COUNT"
-'@
+# ── Riavvio ───────────────────────────────────────────────────────────────────
+Write-Host "Riavvio bot e dashboard..." -ForegroundColor Cyan
+& ssh -p $PORT -i $KEY $NAS "bash '$BOT_DIR/start.sh'"
 
+Write-Host ""
 Write-Host "Deploy completato." -ForegroundColor Green
 Write-Host "Dashboard: http://192.168.0.200:8501" -ForegroundColor Yellow

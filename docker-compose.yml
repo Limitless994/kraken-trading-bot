@@ -1,0 +1,21 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./logs:/app/logs
+      - ./positions.json:/app/positions.json
+      - ./active_profile.json:/app/active_profile.json
+      - ./dynamic_pairs.json:/app/dynamic_pairs.json
+
+  dashboard:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    command: python dashboard.py
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./logs:/app/logs
+      - ./positions.json:/app/positions.json

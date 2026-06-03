@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 # ── Credentials ───────────────────────────────────────────────────────────────
 KRAKEN_API_KEY    = os.getenv("KRAKEN_API_KEY", "")
@@ -23,56 +23,54 @@ MAX_OPEN_TRADES      = int(os.getenv("MAX_OPEN_TRADES", "4"))
 MAX_CAPITAL_DEPLOYED = float(os.getenv("MAX_CAPITAL_DEPLOYED", "0.80"))
 
 # ── Risk parameters ───────────────────────────────────────────────────────────
-TAKE_PROFIT_PCT  = 0.10
-STOP_LOSS_PCT    = 0.04
-KRAKEN_TAKER_FEE = 0.004
-KRAKEN_MAKER_FEE = 0.0025   # 0.25% — limit orders (maker)
-MARGIN_LEVERAGE          = 2
-MARGIN_OPEN_FEE          = 0.0002   # 0.02% — Kraken margin opening fee
-MARGIN_ROLLOVER_FEE_PER_4H = 0.0002 # 0.02% ogni 4h — rollover fee
+TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT", "0.10"))
+STOP_LOSS_PCT    = float(os.getenv("STOP_LOSS_PCT",   "0.04"))
+SLIPPAGE_PCT     = float(os.getenv("SLIPPAGE_PCT",    "0.001"))
+
+# Exchange fees — set by Kraken, not user-configurable
+KRAKEN_TAKER_FEE         = 0.004
+KRAKEN_MAKER_FEE         = 0.0025
+MARGIN_LEVERAGE          = int(os.getenv("MARGIN_LEVERAGE", "2"))
+MARGIN_OPEN_FEE          = 0.0002
+MARGIN_ROLLOVER_FEE_PER_4H = 0.0002
 
 # ── Limit orders ──────────────────────────────────────────────────────────────
 LIMIT_ORDERS_ENABLED = os.getenv("LIMIT_ORDERS_ENABLED", "true").lower() == "true"
-LIMIT_OFFSET_PCT     = float(os.getenv("LIMIT_OFFSET_PCT", "0.001"))  # 0.1% sotto bid
-LIMIT_TIMEOUT_SEC    = int(os.getenv("LIMIT_TIMEOUT_SEC", "300"))     # 5 min poi market
+LIMIT_OFFSET_PCT     = float(os.getenv("LIMIT_OFFSET_PCT", "0.001"))
+LIMIT_TIMEOUT_SEC    = int(os.getenv("LIMIT_TIMEOUT_SEC", "300"))
 
 # ── ATR-based TP/SL ───────────────────────────────────────────────────────────
-ATR_PERIOD  = 14
-ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "2.5"))   # TP = entry + mult×ATR
-ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.0"))   # SL = entry − mult×ATR  →  R:R ≈ 2.5:1
-
-# ── Slippage ──────────────────────────────────────────────────────────────────
-SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.001"))  # 0.1% per lato
+ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "2.5"))
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.0"))
 
 # ── Trailing stop ─────────────────────────────────────────────────────────────
-TRAILING_STOP_ENABLED = True
-TRAILING_STOP_PCT     = 0.03
+TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "true").lower() == "true"
+TRAILING_STOP_PCT     = float(os.getenv("TRAILING_STOP_PCT", "0.03"))
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
-CIRCUIT_BREAKER_ENABLED  = True
+CIRCUIT_BREAKER_ENABLED  = os.getenv("CIRCUIT_BREAKER_ENABLED", "true").lower() == "true"
 CIRCUIT_BREAKER_LOSS_EUR = float(os.getenv("CIRCUIT_BREAKER_LOSS_EUR", "15"))
 
 # ── Signal scoring ────────────────────────────────────────────────────────────
-MIN_SIGNAL_SCORE  = 3
-VOLUME_SPIKE_MULT = 1.15
-RSI_1H_BUY_MAX    = 65
-RSI_15M_BUY_MAX   = 62
-RSI_4H_BUY_MAX    = 70    # multi-timeframe: RSI 4h deve essere < 70
-RSI_SHORT_MIN     = 35    # non shortare se RSI sotto questa soglia (già oversold)
+MIN_SIGNAL_SCORE  = int(os.getenv("MIN_SIGNAL_SCORE",  "3"))
+VOLUME_SPIKE_MULT = float(os.getenv("VOLUME_SPIKE_MULT", "1.15"))
+RSI_1H_BUY_MAX    = int(os.getenv("RSI_1H_BUY_MAX",   "65"))
+RSI_15M_BUY_MAX   = int(os.getenv("RSI_15M_BUY_MAX",  "62"))
+RSI_4H_BUY_MAX    = int(os.getenv("RSI_4H_BUY_MAX",   "70"))
+RSI_SHORT_MIN     = int(os.getenv("RSI_SHORT_MIN",     "35"))
 
 # ── ADX ───────────────────────────────────────────────────────────────────────
-ADX_PERIOD = 14
-ADX_MIN    = 20
+ADX_MIN = int(os.getenv("ADX_MIN", "20"))
 
 # ── Multi-timeframe ───────────────────────────────────────────────────────────
 DAILY_EMA_FILTER = os.getenv("DAILY_EMA_FILTER", "true").lower() == "true"
 
 # ── BTC market filter ─────────────────────────────────────────────────────────
-BTC_FILTER_ENABLED = True
-BTC_PAIR           = "XBTEUR"
-BTC_RSI_MAX        = 65
-BTC_RSI_SHORT_MIN  = 28      # non shortare alt se BTC RSI già così basso (rimbalzo imminente)
-BTC_EMA_FILTER     = True
+BTC_FILTER_ENABLED = os.getenv("BTC_FILTER_ENABLED", "true").lower() == "true"
+BTC_PAIR           = os.getenv("BTC_PAIR", "XBTEUR")
+BTC_RSI_MAX        = int(os.getenv("BTC_RSI_MAX",       "65"))
+BTC_RSI_SHORT_MIN  = int(os.getenv("BTC_RSI_SHORT_MIN", "28"))
+BTC_EMA_FILTER     = os.getenv("BTC_EMA_FILTER", "true").lower() == "true"
 
 # ── Correlazione ─────────────────────────────────────────────────────────────
 CORR_GROUPS: list = [
@@ -81,39 +79,37 @@ CORR_GROUPS: list = [
 ]
 
 # ── Fear & Greed ─────────────────────────────────────────────────────────────
-FEAR_GREED_ENABLED = True
-FEAR_GREED_MIN     = 20
-FEAR_GREED_MAX     = 80
+FEAR_GREED_ENABLED = os.getenv("FEAR_GREED_ENABLED", "true").lower() == "true"
+FEAR_GREED_MIN     = int(os.getenv("FEAR_GREED_MIN", "20"))
+FEAR_GREED_MAX     = int(os.getenv("FEAR_GREED_MAX", "80"))
 
 # ── News sentiment ────────────────────────────────────────────────────────────
-NEWS_ENABLED       = os.getenv("NEWS_ENABLED", "true").lower() == "true"
-NEWS_HEADLINES     = int(os.getenv("NEWS_HEADLINES", "4"))
+NEWS_ENABLED   = os.getenv("NEWS_ENABLED", "true").lower() == "true"
+NEWS_HEADLINES = int(os.getenv("NEWS_HEADLINES", "4"))
 
 # ── On-chain data ─────────────────────────────────────────────────────────────
-ONCHAIN_ENABLED    = os.getenv("ONCHAIN_ENABLED", "true").lower() == "true"
+ONCHAIN_ENABLED = os.getenv("ONCHAIN_ENABLED", "true").lower() == "true"
 
 # ── Groq confidence e sizing ─────────────────────────────────────────────────
-GROQ_MIN_CONFIDENCE = 6
+GROQ_MIN_CONFIDENCE = int(os.getenv("GROQ_MIN_CONFIDENCE", "6"))
 AI_SIZE_HIGH        = float(os.getenv("AI_SIZE_HIGH", "0.25"))
 AI_SIZE_MED         = float(os.getenv("AI_SIZE_MED",  "0.18"))
 AI_SIZE_MIN         = float(os.getenv("AI_SIZE_MIN",  "0.12"))
 
 # ── Kelly Criterion ───────────────────────────────────────────────────────────
-KELLY_ENABLED      = True
-KELLY_MIN_TRADES   = int(os.getenv("KELLY_MIN_TRADES", "50"))  # trade minimi prima di attivare Kelly
-KELLY_FRACTION     = 0.25   # quarter-Kelly (più conservativo di half-Kelly)
-KELLY_MIN_SIZE_PCT = 0.10
-KELLY_MAX_SIZE_PCT = 0.25
+KELLY_ENABLED      = os.getenv("KELLY_ENABLED", "true").lower() == "true"
+KELLY_MIN_TRADES   = int(os.getenv("KELLY_MIN_TRADES",   "50"))
+KELLY_FRACTION     = float(os.getenv("KELLY_FRACTION",   "0.25"))
+KELLY_MIN_SIZE_PCT = float(os.getenv("KELLY_MIN_SIZE_PCT", "0.10"))
+KELLY_MAX_SIZE_PCT = float(os.getenv("KELLY_MAX_SIZE_PCT", "0.25"))
 
-# ── Daily report ──────────────────────────────────────────────────────────────
-DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "8"))
-
-# ── Scan interval ─────────────────────────────────────────────────────────────
-SCAN_INTERVAL_MINUTES  = 15
-POSITION_CHECK_SECONDS = 60
+# ── Scan timing ───────────────────────────────────────────────────────────────
+SCAN_INTERVAL_MINUTES  = int(os.getenv("SCAN_INTERVAL_MINUTES",  "15"))
+POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "60"))
+DAILY_REPORT_HOUR      = int(os.getenv("DAILY_REPORT_HOUR",      "8"))
 
 # ── Pairs ─────────────────────────────────────────────────────────────────────
-PAIRS = ["DOGEEUR", "XRPEUR", "SOLEUR", "ETHEUR", "XBTEUR"]
+PAIRS = [p.strip() for p in os.getenv("PAIRS", "DOGEEUR,XRPEUR,SOLEUR,ETHEUR,XBTEUR").split(",")]
 
 # ── Volume decimal precision per pair ────────────────────────────────────────
 PAIR_VOLUME_DECIMALS: dict = {
@@ -124,13 +120,15 @@ PAIR_VOLUME_DECIMALS: dict = {
     "DOGEEUR": 0,
 }
 
-# ── Indicator periods ─────────────────────────────────────────────────────────
+# ── Indicator periods — technical constants, not user-configurable ────────────
 RSI_PERIOD  = 14
 MACD_FAST   = 12
 MACD_SLOW   = 26
 MACD_SIGNAL = 9
 EMA_FAST    = 20
 EMA_SLOW    = 50
+ADX_PERIOD  = 14
+ATR_PERIOD  = 14
 
 
 # ── Trading profiles ──────────────────────────────────────────────────────────
@@ -164,10 +162,9 @@ PROFILE_CONSERVATIVE: dict = {
 }
 
 PROFILE_MODERATE: dict = {
-    # Filtri: un gradino più permissivi del conservativo
-    "MIN_SIGNAL_SCORE":       2,      # basta 2/6 condizioni (vs 3)
-    "ADX_MIN":                17,     # trend meno forte accettato (vs 20)
-    "VOLUME_SPIKE_MULT":      1.08,   # meno volume richiesto (vs 1.15)
+    "MIN_SIGNAL_SCORE":       2,
+    "ADX_MIN":                17,
+    "VOLUME_SPIKE_MULT":      1.08,
     "RSI_1H_BUY_MAX":         68,
     "RSI_15M_BUY_MAX":        65,
     "RSI_4H_BUY_MAX":         73,
@@ -175,7 +172,6 @@ PROFILE_MODERATE: dict = {
     "FEAR_GREED_MIN":         15,
     "FEAR_GREED_MAX":         85,
     "GROQ_MIN_CONFIDENCE":    6,
-    # Sizing: posizioni medie
     "MAX_OPEN_TRADES":        5,
     "MAX_CAPITAL_DEPLOYED":   0.87,
     "ATR_TP_MULT":            3.2,
@@ -194,8 +190,7 @@ PROFILE_MODERATE: dict = {
 }
 
 PROFILE_AGGRESSIVE: dict = {
-    # Filtri: molto permissivi, entra in quasi tutti i trend
-    "MIN_SIGNAL_SCORE":       2,      # stesso del moderate ma RSI/ADX molto più laschi
+    "MIN_SIGNAL_SCORE":       2,
     "ADX_MIN":                15,
     "VOLUME_SPIKE_MULT":      1.05,
     "RSI_1H_BUY_MAX":         72,
@@ -205,7 +200,6 @@ PROFILE_AGGRESSIVE: dict = {
     "FEAR_GREED_MIN":         10,
     "FEAR_GREED_MAX":         90,
     "GROQ_MIN_CONFIDENCE":    5,
-    # Sizing: posizioni grandi
     "MAX_OPEN_TRADES":        6,
     "MAX_CAPITAL_DEPLOYED":   0.95,
     "ATR_TP_MULT":            4.0,
@@ -229,7 +223,7 @@ PROFILES: dict = {
     "aggressive":   PROFILE_AGGRESSIVE,
 }
 
-_ACTIVE_PROFILE_FILE = Path(__file__).parent / "active_profile.json"
+_ACTIVE_PROFILE_FILE = Path(__file__).parent.parent / "active_profile.json"
 
 ACTIVE_PROFILE: str = "conservative"
 

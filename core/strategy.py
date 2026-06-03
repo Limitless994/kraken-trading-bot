@@ -29,8 +29,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-import config
-from analyzer import Analysis
+from . import config
+from .analyzer import Analysis
 
 logger = logging.getLogger(__name__)
 

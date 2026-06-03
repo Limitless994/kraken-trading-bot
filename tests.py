@@ -24,9 +24,10 @@ os.environ.setdefault("PAPER_TRADING",     "true")
 os.environ.setdefault("KRAKEN_API_KEY",    "")
 os.environ.setdefault("KRAKEN_API_SECRET", "")
 
-import config
-from analyzer import Analysis, _adx, _atr, _ema, _macd_histogram, _rsi, _volume_ratio
-from strategy import Signal, generate_signal, kelly_size_pct
+from core import config
+config.apply_profile("conservative")   # reset to known state regardless of active_profile.json
+from core.analyzer import Analysis, _adx, _atr, _ema, _macd_histogram, _rsi, _volume_ratio
+from core.strategy import Signal, generate_signal, kelly_size_pct
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -238,19 +239,19 @@ class TestATRTPSL(unittest.TestCase):
         if sig_h and sig_l:
             self.assertGreater(sig_h.take_profit, sig_l.take_profit)
 
-    def test_tp_min_enforced(self):
-        a = _make_analysis(atr=0.01, price=100.0)   # ATR molto basso
+    def test_tp_equals_entry_plus_atr_mult(self):
+        a = _make_analysis(atr=2.0, price=100.0)
         sig = generate_signal(a, 100.0)
         if sig:
-            tp_pct = (sig.take_profit - 100.0) / 100.0
-            self.assertGreaterEqual(tp_pct, config.ATR_TP_MIN - 0.001)
+            expected = round(100.0 + config.ATR_TP_MULT * 2.0, 8)
+            self.assertAlmostEqual(sig.take_profit, expected, places=4)
 
-    def test_sl_max_enforced(self):
-        a = _make_analysis(atr=50.0, price=100.0)   # ATR enorme
+    def test_sl_equals_entry_minus_atr_mult(self):
+        a = _make_analysis(atr=2.0, price=100.0)
         sig = generate_signal(a, 100.0)
         if sig:
-            sl_pct = (100.0 - sig.stop_loss) / 100.0
-            self.assertLessEqual(sl_pct, config.ATR_SL_MAX + 0.001)
+            expected = round(100.0 - config.ATR_SL_MULT * 2.0, 8)
+            self.assertAlmostEqual(sig.stop_loss, expected, places=4)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -356,36 +357,36 @@ class TestCircuitBreaker(unittest.TestCase):
 class TestFearGreed(unittest.TestCase):
 
     def test_extreme_fear_blocks(self):
-        from market_data import fear_greed_blocks_trading
+        from core.market_data import fear_greed_blocks_trading
         self.assertTrue(fear_greed_blocks_trading(15))
 
     def test_extreme_greed_blocks(self):
-        from market_data import fear_greed_blocks_trading
+        from core.market_data import fear_greed_blocks_trading
         self.assertTrue(fear_greed_blocks_trading(85))
 
     def test_neutral_allows(self):
-        from market_data import fear_greed_blocks_trading
+        from core.market_data import fear_greed_blocks_trading
         self.assertFalse(fear_greed_blocks_trading(50))
 
     def test_none_allows(self):
-        from market_data import fear_greed_blocks_trading
+        from core.market_data import fear_greed_blocks_trading
         self.assertFalse(fear_greed_blocks_trading(None))
 
-    @patch("market_data.requests")
+    @patch("core.market_data.requests")
     def test_api_returns_value(self, mock_requests):
         mock_requests.get.return_value.json.return_value = {
             "data": [{"value": "42", "value_classification": "Fear"}]
         }
-        from market_data import _cache, get_fear_greed
+        from core.market_data import _cache, get_fear_greed
         _cache.pop("fear_greed", None)
         result = get_fear_greed()
         self.assertIsNotNone(result)
         self.assertEqual(result["value"], 42)
 
-    @patch("market_data.requests")
+    @patch("core.market_data.requests")
     def test_api_failure_returns_none(self, mock_requests):
         mock_requests.get.side_effect = Exception("timeout")
-        from market_data import _cache, get_fear_greed
+        from core.market_data import _cache, get_fear_greed
         _cache.pop("fear_greed", None)
         result = get_fear_greed()
         self.assertIsNone(result)
@@ -404,59 +405,59 @@ class TestGroqEvaluator(unittest.TestCase):
         mock_client.chat.completions.create.return_value.choices = [mock_choice]
         return mock_client
 
-    @patch("groq_evaluator._get_client")
+    @patch("services.groq_evaluator._get_client")
     def test_esegui_high_confidence(self, mock_gc):
         mock_gc.return_value = self._mock_groq("ESEGUI:9: RSI oversold con volume confermato")
-        import groq_evaluator
+        from services import groq_evaluator
         execute, conf, reason, size = groq_evaluator.evaluate(_make_signal())
         self.assertTrue(execute)
         self.assertEqual(conf, 9)
         self.assertEqual(size, config.AI_SIZE_HIGH)
 
-    @patch("groq_evaluator._get_client")
+    @patch("services.groq_evaluator._get_client")
     def test_esegui_med_confidence(self, mock_gc):
         mock_gc.return_value = self._mock_groq("ESEGUI:8: buon setup ma non eccezionale")
-        import groq_evaluator
+        from services import groq_evaluator
         execute, conf, reason, size = groq_evaluator.evaluate(_make_signal())
         self.assertTrue(execute)
         self.assertEqual(size, config.AI_SIZE_MED)
 
-    @patch("groq_evaluator._get_client")
+    @patch("services.groq_evaluator._get_client")
     def test_esegui_min_confidence(self, mock_gc):
         mock_gc.return_value = self._mock_groq("ESEGUI:7: setup borderline ma accettabile")
-        import groq_evaluator
+        from services import groq_evaluator
         execute, conf, reason, size = groq_evaluator.evaluate(_make_signal())
         self.assertTrue(execute)
         self.assertEqual(size, config.AI_SIZE_MIN)
 
-    @patch("groq_evaluator._get_client")
+    @patch("services.groq_evaluator._get_client")
     def test_esegui_below_threshold_blocked(self, mock_gc):
         mock_gc.return_value = self._mock_groq("ESEGUI:5: segnale debole")
-        import groq_evaluator
+        from services import groq_evaluator
         execute, conf, reason, size = groq_evaluator.evaluate(_make_signal())
         self.assertFalse(execute)
         self.assertEqual(size, 0.0)
 
-    @patch("groq_evaluator._get_client")
+    @patch("services.groq_evaluator._get_client")
     def test_rifiuta_response(self, mock_gc):
         mock_gc.return_value = self._mock_groq("RIFIUTA:3: volume insufficiente")
-        import groq_evaluator
+        from services import groq_evaluator
         execute, conf, reason, size = groq_evaluator.evaluate(_make_signal())
         self.assertFalse(execute)
         self.assertEqual(size, 0.0)
 
-    @patch("groq_evaluator._get_client")
+    @patch("services.groq_evaluator._get_client")
     def test_groq_offline_fallback(self, mock_gc):
         mock_gc.side_effect = Exception("Connection refused")
-        import groq_evaluator
+        from services import groq_evaluator
         execute, conf, reason, size = groq_evaluator.evaluate(_make_signal())
         self.assertTrue(execute)
         self.assertEqual(size, config.AI_SIZE_MIN)
 
-    @patch("groq_evaluator._get_client")
+    @patch("services.groq_evaluator._get_client")
     def test_market_context_included(self, mock_gc):
         mock_gc.return_value = self._mock_groq("ESEGUI:8: ok")
-        import groq_evaluator
+        from services import groq_evaluator
         ctx = {"fear_greed_value": 35, "fear_greed_label": "Fear",
                "btc_funding": 0.0005, "news_headlines": ["BTC rallies"]}
         execute, _, _, _ = groq_evaluator.evaluate(_make_signal(), market_ctx=ctx)
@@ -471,7 +472,7 @@ class TestGroqEvaluator(unittest.TestCase):
 
 class TestKrakenStatus(unittest.TestCase):
 
-    @patch("kraken_client._SESSION")
+    @patch("core.kraken_client._SESSION")
     def test_online_status(self, mock_session):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {
@@ -480,11 +481,11 @@ class TestKrakenStatus(unittest.TestCase):
         }
         mock_resp.raise_for_status = MagicMock()
         mock_session.get.return_value = mock_resp
-        import kraken_client
+        from core import kraken_client
         status, _ = kraken_client.get_system_status()
         self.assertEqual(status, "online")
 
-    @patch("kraken_client._SESSION")
+    @patch("core.kraken_client._SESSION")
     def test_maintenance_not_online(self, mock_session):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {
@@ -493,14 +494,14 @@ class TestKrakenStatus(unittest.TestCase):
         }
         mock_resp.raise_for_status = MagicMock()
         mock_session.get.return_value = mock_resp
-        import kraken_client
+        from core import kraken_client
         status, _ = kraken_client.get_system_status()
         self.assertNotEqual(status, kraken_client.KRAKEN_ONLINE)
 
-    @patch("kraken_client._SESSION")
+    @patch("core.kraken_client._SESSION")
     def test_network_error_raises(self, mock_session):
         mock_session.get.side_effect = ConnectionError("timeout")
-        import kraken_client
+        from core import kraken_client
         with self.assertRaises(Exception):
             kraken_client.get_system_status()
 

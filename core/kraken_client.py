@@ -15,7 +15,7 @@ import urllib.parse
 import requests
 from typing import Any
 
-import config
+from . import config
 
 BASE_URL = "https://api.kraken.com"
 _SESSION = requests.Session()
