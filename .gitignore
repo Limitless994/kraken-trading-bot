@@ -1,0 +1,21 @@
+# Credenziali — MAI committare
+.env
+
+# Runtime state
+positions.json
+trades_log.json
+groq_log.json
+discovery_log.json
+logs/
+*.pid
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Claude
+.claude/
