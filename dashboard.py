@@ -7,23 +7,25 @@ Run with:
 import json
 import re
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 import requests
-from flask import Flask, render_template_string
+from flask import Flask, jsonify, redirect, render_template_string, request, url_for
 
 import config
 import market_data
 
 app = Flask(__name__)
 
-_DIR             = Path(__file__).parent
-TRADING_LOG_FILE = _DIR / "logs" / "trading.log"
-POSITIONS_FILE   = _DIR / "positions.json"
-TRADES_LOG_FILE  = _DIR / "trades_log.json"
-GROQ_LOG_FILE    = _DIR / "groq_log.json"
-DISCOVERY_FILE   = _DIR / "discovery_log.json"
+_DIR              = Path(__file__).parent
+TRADING_LOG_FILE  = _DIR / "logs" / "trading.log"
+POSITIONS_FILE    = _DIR / "positions.json"
+TRADES_LOG_FILE   = _DIR / "trades_log.json"
+GROQ_LOG_FILE     = _DIR / "groq_log.json"
+DISCOVERY_FILE    = _DIR / "discovery_log.json"
+BOT_COMMANDS_FILE = _DIR / "bot_commands.json"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -76,6 +78,80 @@ def _parse_btc_filter() -> dict:
     except Exception:
         pass
     return {}
+
+
+# ── Command queue ────────────────────────────────────────────────────────────
+
+def _queue_command(cmd: dict) -> None:
+    """Append a command to bot_commands.json for the bot to process."""
+    try:
+        existing = _load_json(BOT_COMMANDS_FILE, [])
+        cmd.setdefault("id", str(uuid.uuid4())[:8])
+        cmd.setdefault("ts", time.time())
+        existing.append(cmd)
+        BOT_COMMANDS_FILE.write_text(
+            json.dumps(existing, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception as exc:
+        app.logger.error("queue_command error: %s", exc)
+
+
+# ── Action routes ─────────────────────────────────────────────────────────────
+
+_MSG_LABELS = {
+    "profile_changed": "Profilo aggiornato",
+    "scan_queued":     "Scan in coda — eseguito entro 15s",
+    "discover_queued": "Discovery avviata in background",
+    "close_queued":    "Chiusura in coda — eseguita entro 15s",
+    "error":           "Errore — controlla i log",
+    "unknown_profile": "Profilo non valido",
+    "no_pair":         "Coppia non specificata",
+}
+
+
+@app.route("/action/profile", methods=["POST"])
+def action_profile():
+    name = request.form.get("profile", "").lower()
+    if name not in config.PROFILES:
+        return redirect(url_for("index", msg="unknown_profile"))
+    try:
+        config.apply_profile(name)                        # aggiorna questo processo
+        _queue_command({"cmd": "profile", "name": name})  # aggiorna il bot
+        return redirect(url_for("index", msg="profile_changed"))
+    except Exception:
+        return redirect(url_for("index", msg="error"))
+
+
+@app.route("/action/scan", methods=["POST"])
+def action_scan():
+    _queue_command({"cmd": "scan"})
+    return redirect(url_for("index", msg="scan_queued"))
+
+
+@app.route("/action/discover", methods=["POST"])
+def action_discover():
+    _queue_command({"cmd": "discover"})
+    return redirect(url_for("index", msg="discover_queued"))
+
+
+@app.route("/action/close", methods=["POST"])
+def action_close():
+    pair = request.form.get("pair", "").upper()
+    if not pair:
+        return redirect(url_for("index", msg="no_pair"))
+    _queue_command({"cmd": "close", "pair": pair})
+    return redirect(url_for("index", msg="close_queued"))
+
+
+@app.route("/api/balance")
+def api_balance():
+    try:
+        import kraken_client
+        bal = kraken_client.get_balance()
+        eur = bal.pop("ZEUR", bal.pop("EUR", 0.0))
+        return jsonify({"ok": True, "eur": eur, "crypto": bal})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)})
 
 
 # ── HTML template ─────────────────────────────────────────────────────────────
@@ -142,6 +218,49 @@ TEMPLATE = """
     <span class="badge badge-error">CIRCUIT BREAKER ATTIVO</span>
     {% endif %}
     <span class="refresh-note ms-auto">Aggiornamento ogni 15s — {{ now }}</span>
+  </div>
+
+  <!-- Control Panel -->
+  <div class="card mb-3">
+    <div class="card-body py-2 px-3">
+      <div class="d-flex flex-wrap align-items-center gap-2">
+
+        <!-- Profile selector -->
+        <span style="font-size:0.78rem;color:#aaa;">Profilo:</span>
+        {% set profile_colors = {'conservative': 'btn-success', 'moderate': 'btn-warning', 'aggressive': 'btn-danger'} %}
+        {% for p_name in ['conservative', 'moderate', 'aggressive'] %}
+        <form method="post" action="/action/profile" class="mb-0">
+          <input type="hidden" name="profile" value="{{ p_name }}">
+          <button type="submit"
+            class="btn btn-sm {% if active_profile == p_name %}{{ profile_colors[p_name] }}{% else %}btn-outline-secondary{% endif %}"
+            style="font-size:0.78rem;">
+            {{ p_name|capitalize }}
+          </button>
+        </form>
+        {% endfor %}
+
+        <div class="vr" style="height:24px;"></div>
+
+        <!-- Action buttons -->
+        <form method="post" action="/action/scan" class="mb-0">
+          <button type="submit" class="btn btn-sm btn-outline-light" style="font-size:0.78rem;">Scan ora</button>
+        </form>
+        <form method="post" action="/action/discover" class="mb-0">
+          <button type="submit" class="btn btn-sm btn-outline-info" style="font-size:0.78rem;">Discovery ora</button>
+        </form>
+        <button type="button" class="btn btn-sm btn-outline-secondary" style="font-size:0.78rem;" onclick="loadBalance()">Saldo Kraken</button>
+
+        <!-- Feedback message -->
+        {% if msg %}
+        <span class="badge {% if 'error' in msg or 'unknown' in msg or 'no_pair' in msg %}bg-danger{% else %}bg-success{% endif %} ms-1" style="font-size:0.78rem;">
+          {{ msg_label }}
+        </span>
+        {% endif %}
+
+        <!-- Balance inline result -->
+        <span id="balance-result" style="font-size:0.82rem;"></span>
+      </div>
+    </div>
   </div>
 
   <!-- Metrics -->
@@ -260,7 +379,7 @@ TEMPLATE = """
       <table class="table table-dark table-hover mb-0">
         <thead><tr>
           <th>Coppia</th><th>Entry</th><th>Ora</th><th>P&L %</th><th>P&L €</th>
-          <th>TP</th><th>SL</th><th>Trailing</th><th>ADX</th><th>Size</th><th>Aperta</th>
+          <th>TP</th><th>SL</th><th>Trailing</th><th>ADX</th><th>Size</th><th>Aperta</th><th></th>
         </tr></thead>
         <tbody>
         {% for p in positions %}
@@ -276,6 +395,13 @@ TEMPLATE = """
           <td>{{ "%.1f"|format(p.adx) if p.adx else "—" }}</td>
           <td>{{ "%.2f"|format(p.size_eur) }}€</td>
           <td>{{ p.opened_at }}</td>
+          <td>
+            <form method="post" action="/action/close" class="mb-0"
+                  onsubmit="return confirm('Chiudere {{ p.pair }}?')">
+              <input type="hidden" name="pair" value="{{ p.pair }}">
+              <button type="submit" class="btn btn-sm btn-outline-danger" style="font-size:0.75rem;">Chiudi</button>
+            </form>
+          </td>
         </tr>
         {% endfor %}
         </tbody>
@@ -501,23 +627,29 @@ TEMPLATE = """
 
   <!-- Config -->
   <div class="card mb-3">
-    <div class="card-header">Configurazione attiva</div>
+    <div class="card-header d-flex align-items-center gap-2">
+      Configurazione attiva
+      {% set pc = {'conservative':'bg-success','moderate':'bg-warning text-dark','aggressive':'bg-danger'} %}
+      <span class="badge {{ pc[active_profile] }}" style="font-size:0.75rem;">{{ active_profile|upper }}</span>
+    </div>
     <div class="card-body" style="font-size:0.82rem; color:#aaa;">
       <div class="row">
         <div class="col-md-4">
-          <strong>Strategia</strong><br>
-          Score min: {{ min_score }}/6 | Volume: ≥{{ vol_mult }}× | RSI(1h): &lt;{{ rsi_1h_max }} | RSI(15m): &lt;{{ rsi_15m_max }}<br>
-          ADX min: {{ adx_min }} | TP: +{{ tp_pct }}% | SL: -{{ sl_pct }}% | Trailing: {{ trailing_pct }}%
+          <strong>Filtri</strong><br>
+          Score min: {{ min_score }}/6 | Volume: ≥{{ vol_mult }}× | ADX min: {{ adx_min }}<br>
+          RSI(1h): &lt;{{ rsi_1h_max }} | RSI(15m): &lt;{{ rsi_15m_max }}<br>
+          BTC filter: {{ "ON" if btc_filter else "OFF" }} (RSI max {{ btc_rsi_max }}) | Groq: {{ groq_conf }}/10
         </div>
         <div class="col-md-4">
-          <strong>Filtri</strong><br>
-          BTC filter: {{ "ON" if btc_filter else "OFF" }} (RSI max {{ btc_rsi_max }}) |
-          Correlazione: {{ corr_groups }}<br>
-          Groq confidence min: {{ groq_conf }}/10
+          <strong>Risk / Sizing</strong><br>
+          TP: +{{ tp_pct }}% | SL: -{{ sl_pct }}% | Trailing: {{ trailing_pct }}%<br>
+          Max pos: {{ max_trades }} | Capitale max: {{ capital_pct }}%<br>
+          Size: {{ size_high }}% / {{ size_med }}% / {{ size_min }}%
         </div>
         <div class="col-md-4">
           <strong>Sistema</strong><br>
-          Coppie: {{ pairs }} | Scan: {{ scan_interval }}min | Max pos: {{ max_trades }}<br>
+          Coppie: {{ pairs }} | Scan: {{ scan_interval }}min<br>
+          Circuit breaker: {{ cb_eur }}€/giorno<br>
           Fee: {{ fee_pct }}%/lato | Groq: {{ groq_model }}
         </div>
       </div>
@@ -587,6 +719,26 @@ new Chart(document.getElementById('groqChart'), {
 });
 </script>
 {% endif %}
+<script>
+function loadBalance() {
+  var el = document.getElementById('balance-result');
+  el.innerHTML = '<span style="color:#aaa">Caricamento...</span>';
+  fetch('/api/balance')
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.ok) { el.innerHTML = '<span style="color:#e05c5c">Errore: ' + d.error + '</span>'; return; }
+      var txt = '<span style="color:#4caf82">EUR: ' + d.eur.toFixed(2) + '€</span>';
+      var keys = Object.keys(d.crypto);
+      if (keys.length) {
+        txt += '<span style="color:#aaa;margin-left:8px;">';
+        keys.forEach(function(k){ txt += k + ': ' + parseFloat(d.crypto[k]).toFixed(4) + '  '; });
+        txt += '</span>';
+      }
+      el.innerHTML = txt;
+    })
+    .catch(function(){ el.innerHTML = '<span style="color:#e05c5c">Connessione fallita</span>'; });
+}
+</script>
 </body>
 </html>
 """
@@ -596,6 +748,7 @@ new Chart(document.getElementById('groqChart'), {
 
 @app.route("/")
 def index():
+    msg = request.args.get("msg", "")
     positions_raw = _load_json(POSITIONS_FILE, {})
     trades_log    = _load_json(TRADES_LOG_FILE, [])
     groq_log      = _load_json(GROQ_LOG_FILE, [])
@@ -663,6 +816,16 @@ def index():
 
     btc_s = _parse_btc_filter()
 
+    _MSG_LABELS = {
+        "profile_changed": "Profilo aggiornato",
+        "scan_queued":     "Scan in coda — eseguito entro 15s",
+        "discover_queued": "Discovery avviata",
+        "close_queued":    "Chiusura in coda — entro 15s",
+        "error":           "Errore",
+        "unknown_profile": "Profilo non valido",
+        "no_pair":         "Coppia non specificata",
+    }
+
     return render_template_string(
         TEMPLATE,
         positions=enriched,
@@ -707,6 +870,14 @@ def index():
         btc_ema_filter=config.BTC_EMA_FILTER,
         now=datetime.now().strftime("%H:%M:%S"),
         fmt_time=_fmt_time,
+        active_profile=config.ACTIVE_PROFILE,
+        capital_pct=f"{config.MAX_CAPITAL_DEPLOYED*100:.0f}",
+        size_high=f"{config.AI_SIZE_HIGH*100:.0f}",
+        size_med=f"{config.AI_SIZE_MED*100:.0f}",
+        size_min=f"{config.AI_SIZE_MIN*100:.0f}",
+        cb_eur=f"{config.CIRCUIT_BREAKER_LOSS_EUR:.0f}",
+        msg=msg,
+        msg_label=_MSG_LABELS.get(msg, msg),
     )
 
 

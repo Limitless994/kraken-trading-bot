@@ -278,33 +278,41 @@ def _groq_rank(candidates: list) -> str:
     try:
         client = Groq(api_key=config.GROQ_API_KEY)
 
+        tp_pct = config.TAKE_PROFIT_PCT * 100
+        sl_pct = config.STOP_LOSS_PCT * 100
+        rr     = tp_pct / sl_pct if sl_pct > 0 else 2.5
+
         lines = []
         for i, c in enumerate(candidates, 1):
             lines.append(
                 f"{i}. {c['pair']}\n"
-                f"   Walk-forward: train {c['train_win_rate']}% | test {c['test_win_rate']}% | "
+                f"   Backtest walk-forward: train {c['train_win_rate']}% | test {c['test_win_rate']}% | "
                 f"consistenza {c['consistency']:.0%} | Sharpe {c.get('test_sharpe', 0):.2f}\n"
                 f"   P&L medio {c['avg_pnl_pct']:+.2f}% | prezzo 90gg {c['price_chg_90d']:+.1f}%\n"
-                f"   Ora: RSI {c['rsi_now']} | ADX {c['adx_now']} | "
-                f"Vol {c['vol_ratio_now']}× | {'↑EMA50' if c['above_ema50'] else '↓EMA50'}"
+                f"   ADESSO: RSI {c['rsi_now']} | ADX {c['adx_now']} | "
+                f"Vol {c['vol_ratio_now']}× | {'↑EMA50' if c['above_ema50'] else '↓EMA50'} | "
+                f"score meccanico {c.get('mech_score', 0)}"
             )
 
         prompt = (
-            "Strategia: momentum crypto/EUR, TP +10%, SL -4%, R:R 2.5:1.\n"
-            "Dati backtest 90gg + situazione attuale per queste coppie:\n\n"
+            f"Strategia: momentum crypto/EUR su Kraken. TP +{tp_pct:.0f}%, SL -{sl_pct:.0f}%, R:R {rr:.1f}:1.\n"
+            f"Dati backtest 90gg + indicatori ATTUALI per {len(candidates)} coppie candidate:\n\n"
             + "\n\n".join(lines)
-            + "\n\nSeleziona le TOP 3 più promettenti. "
-            "Per ognuna: nome + 1 riga motivazione. Sii conciso."
+            + "\n\nRispondi a queste due domande:\n"
+            "1) INVESTIRE ORA? Considerando RSI, ADX, volume attuale e consistenza backtest, "
+            "vale la pena aprire una posizione adesso? (Sì/No e perché in 1 riga)\n"
+            "2) TOP SCELTA: se sì, quale coppia e perché (max 1 riga). Se no, quale monitorare.\n"
+            "Sii conciso — max 4 righe totali."
         )
 
         resp = client.chat.completions.create(
             model=config.GROQ_MODEL,
             messages=[
-                {"role": "system", "content": "Analista quantitativo crypto. Rispondi in italiano."},
+                {"role": "system", "content": "Analista quantitativo crypto esperto. Rispondi in italiano. Sii diretto e concreto."},
                 {"role": "user",   "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=250,
+            max_tokens=200,
         )
         return resp.choices[0].message.content.strip()
 

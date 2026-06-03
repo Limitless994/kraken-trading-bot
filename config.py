@@ -128,6 +128,135 @@ EMA_FAST    = 20
 EMA_SLOW    = 50
 
 
+# ── Trading profiles ──────────────────────────────────────────────────────────
+
+PROFILE_CONSERVATIVE: dict = {
+    "MAX_OPEN_TRADES":        4,
+    "MAX_CAPITAL_DEPLOYED":   0.80,
+    "ATR_TP_MULT":            2.5,
+    "ATR_SL_MULT":            1.0,
+    "TAKE_PROFIT_PCT":        0.10,
+    "STOP_LOSS_PCT":          0.04,
+    "AI_SIZE_HIGH":           0.25,
+    "AI_SIZE_MED":            0.18,
+    "AI_SIZE_MIN":            0.12,
+    "GROQ_MIN_CONFIDENCE":    6,
+    "MIN_SIGNAL_SCORE":       3,
+    "CIRCUIT_BREAKER_LOSS_EUR": 15.0,
+    "TRAILING_STOP_PCT":      0.03,
+    "FEAR_GREED_MIN":         20,
+    "FEAR_GREED_MAX":         80,
+    "BTC_RSI_MAX":            65,
+    "VOLUME_SPIKE_MULT":      1.15,
+    "ADX_MIN":                20,
+    "RSI_1H_BUY_MAX":         65,
+    "RSI_15M_BUY_MAX":        62,
+    "RSI_4H_BUY_MAX":         70,
+    "KELLY_FRACTION":         0.25,
+    "KELLY_MAX_SIZE_PCT":     0.25,
+}
+
+PROFILE_MODERATE: dict = {
+    # Filtri: un gradino più permissivi del conservativo
+    "MIN_SIGNAL_SCORE":       2,      # basta 2/6 condizioni (vs 3)
+    "ADX_MIN":                17,     # trend meno forte accettato (vs 20)
+    "VOLUME_SPIKE_MULT":      1.08,   # meno volume richiesto (vs 1.15)
+    "RSI_1H_BUY_MAX":         68,
+    "RSI_15M_BUY_MAX":        65,
+    "RSI_4H_BUY_MAX":         73,
+    "BTC_RSI_MAX":            68,
+    "FEAR_GREED_MIN":         15,
+    "FEAR_GREED_MAX":         85,
+    "GROQ_MIN_CONFIDENCE":    6,
+    # Sizing: posizioni medie
+    "MAX_OPEN_TRADES":        5,
+    "MAX_CAPITAL_DEPLOYED":   0.87,
+    "ATR_TP_MULT":            3.2,
+    "ATR_SL_MULT":            1.2,
+    "TAKE_PROFIT_PCT":        0.14,
+    "STOP_LOSS_PCT":          0.05,
+    "AI_SIZE_HIGH":           0.35,
+    "AI_SIZE_MED":            0.26,
+    "AI_SIZE_MIN":            0.17,
+    "CIRCUIT_BREAKER_LOSS_EUR": 22.0,
+    "TRAILING_STOP_PCT":      0.04,
+    "KELLY_FRACTION":         0.35,
+    "KELLY_MAX_SIZE_PCT":     0.35,
+}
+
+PROFILE_AGGRESSIVE: dict = {
+    # Filtri: molto permissivi, entra in quasi tutti i trend
+    "MIN_SIGNAL_SCORE":       2,      # stesso del moderate ma RSI/ADX molto più laschi
+    "ADX_MIN":                15,
+    "VOLUME_SPIKE_MULT":      1.05,
+    "RSI_1H_BUY_MAX":         72,
+    "RSI_15M_BUY_MAX":        68,
+    "RSI_4H_BUY_MAX":         76,
+    "BTC_RSI_MAX":            72,
+    "FEAR_GREED_MIN":         10,
+    "FEAR_GREED_MAX":         90,
+    "GROQ_MIN_CONFIDENCE":    5,
+    # Sizing: posizioni grandi
+    "MAX_OPEN_TRADES":        6,
+    "MAX_CAPITAL_DEPLOYED":   0.95,
+    "ATR_TP_MULT":            4.0,
+    "ATR_SL_MULT":            1.5,
+    "TAKE_PROFIT_PCT":        0.18,
+    "STOP_LOSS_PCT":          0.07,
+    "AI_SIZE_HIGH":           0.45,
+    "AI_SIZE_MED":            0.35,
+    "AI_SIZE_MIN":            0.25,
+    "CIRCUIT_BREAKER_LOSS_EUR": 30.0,
+    "TRAILING_STOP_PCT":      0.05,
+    "KELLY_FRACTION":         0.50,
+    "KELLY_MAX_SIZE_PCT":     0.45,
+}
+
+PROFILES: dict = {
+    "conservative": PROFILE_CONSERVATIVE,
+    "moderate":     PROFILE_MODERATE,
+    "aggressive":   PROFILE_AGGRESSIVE,
+}
+
+_ACTIVE_PROFILE_FILE = Path(__file__).parent / "active_profile.json"
+
+ACTIVE_PROFILE: str = "conservative"
+
+
+def apply_profile(name: str) -> None:
+    """Switch trading profile at runtime and persist the choice."""
+    import sys, json as _json
+    name = name.lower().strip()
+    if name not in PROFILES:
+        raise ValueError(f"Profilo '{name}' sconosciuto. Scegli: {list(PROFILES)}")
+    module = sys.modules[__name__]
+    for key, val in PROFILES[name].items():
+        setattr(module, key, val)
+    setattr(module, "ACTIVE_PROFILE", name)
+    try:
+        _ACTIVE_PROFILE_FILE.write_text(
+            _json.dumps({"profile": name}), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def _load_active_profile() -> str:
+    import json as _json
+    default = os.getenv("TRADING_PROFILE", "conservative").lower()
+    try:
+        if _ACTIVE_PROFILE_FILE.exists():
+            data = _json.loads(_ACTIVE_PROFILE_FILE.read_text(encoding="utf-8"))
+            candidate = data.get("profile", default)
+            return candidate if candidate in PROFILES else default
+    except Exception:
+        pass
+    return default
+
+
+apply_profile(_load_active_profile())
+
+
 def validate():
     missing = []
     if not TELEGRAM_TOKEN:    missing.append("TELEGRAM_TOKEN")

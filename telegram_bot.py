@@ -16,10 +16,12 @@ Commands:
   /balance    — Kraken EUR + crypto balances
   /scan       — trigger an immediate manual market scan
   /close XYZ  — manually close position for pair XYZ
+  /profile    — show active profile or switch (/profile aggressive|conservative)
 """
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import time
@@ -48,6 +50,7 @@ TRADES_LOG_FILE     = _DIR / "trades_log.json"
 GROQ_LOG_FILE       = _DIR / "groq_log.json"
 DISCOVERY_FILE      = _DIR / "discovery_log.json"
 PENDING_ORDERS_FILE = _DIR / "pending_orders.json"
+BOT_COMMANDS_FILE   = _DIR / "bot_commands.json"
 
 
 # ── Persistence helpers ───────────────────────────────────────────────────────
@@ -125,6 +128,7 @@ class TradingBot:
         add(CommandHandler("close",     self._cmd_close))
         add(CommandHandler("discover",  self._cmd_discover))
         add(CommandHandler("ai",        self._cmd_ai))
+        add(CommandHandler("profile",   self._cmd_profile))
 
     # ── Commands ──────────────────────────────────────────────────────────────
 
@@ -141,10 +145,11 @@ class TradingBot:
             "/scan       — scansione manuale immediata\n"
             "/close XYZ  — chiudi posizione su XYZ (es. /close SOLEUR)\n"
             "/ai [N]     — ultime N decisioni Groq (default 5)\n"
-            "/discover   — discovery manuale nuove coppie\n\n"
+            "/discover   — discovery manuale nuove coppie\n"
+            "/profile    — mostra/cambia profilo di rischio\n\n"
+            f"Profilo: {config.ACTIVE_PROFILE.upper()}  |  "
             f"TP: +{config.TAKE_PROFIT_PCT*100:.0f}%  "
-            f"SL: -{config.STOP_LOSS_PCT*100:.0f}%  "
-            f"Max 2 posizioni aperte."
+            f"SL: -{config.STOP_LOSS_PCT*100:.0f}%"
         )
 
     async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -158,6 +163,7 @@ class TradingBot:
         await update.message.reply_text(
             f"Sistema: ATTIVO ({mode})\n"
             f"{kraken_line}\n"
+            f"Profilo: {config.ACTIVE_PROFILE.upper()}\n"
             f"Decisioni: Groq AI ({config.GROQ_MODEL})\n"
             f"Posizioni aperte: {len(self.positions)} / {config.MAX_OPEN_TRADES}\n"
             f"Coppie monitorate: {', '.join(config.PAIRS)}\n"
@@ -220,60 +226,60 @@ class TradingBot:
         if not found:
             await update.message.reply_text("Nessun segnale trovato.")
 
+    async def _do_close(self, pair: str) -> str:
+        """Execute market close for pair. Returns notification message."""
+        pos = self.positions[pair]
+        ticker  = await asyncio.to_thread(kraken_client.get_ticker, pair)
+        current = ticker["last"]
+
+        if config.PAPER_TRADING:
+            txid = "PAPER"
+        else:
+            vol_str = kraken_client.format_volume(pair, pos["size_crypto"])
+            order   = await asyncio.to_thread(
+                kraken_client.add_order, pair, "sell", "market", vol_str
+            )
+            txids = order.get("txid", [])
+            txid  = txids[0] if txids else "unknown"
+
+        gross_pnl_eur = (current - pos["entry"]) * pos["size_crypto"]
+        fee_exit      = round(current * pos["size_crypto"] * config.KRAKEN_TAKER_FEE, 4)
+        fee_entry     = pos.get("fee_entry_eur", 0.0)
+        slip_eur      = round(pos["size_eur"] * config.SLIPPAGE_PCT * 2, 4)
+        net_pnl_eur   = gross_pnl_eur - fee_entry - fee_exit - slip_eur
+        net_pnl_pct   = net_pnl_eur / pos["size_eur"] * 100
+
+        del self.positions[pair]
+        _save_positions(self.positions)
+        _append_trade_log({
+            "pair": pair, "exit_reason": "manual",
+            "entry": pos["entry"], "exit": current,
+            "size_eur": pos["size_eur"],
+            "gross_pnl_eur": round(gross_pnl_eur, 4),
+            "fee_eur": round(fee_entry + fee_exit, 4),
+            "pnl_eur": round(net_pnl_eur, 4),
+            "pnl_pct": round(net_pnl_pct, 4),
+            "paper": config.PAPER_TRADING, "closed_at": time.time(),
+        })
+        return (
+            f"Posizione chiusa: {pair}\n"
+            f"P&L lordo: {gross_pnl_eur:+.2f}€\n"
+            f"Fee totali: -{fee_entry + fee_exit:.4f}€\n"
+            f"P&L netto: {net_pnl_eur:+.2f}€  ({net_pnl_pct:+.2f}%)\n"
+            f"TX: {txid}"
+        )
+
     async def _cmd_close(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not ctx.args:
-            await update.message.reply_text(
-                "Uso: /close <pair>\nEsempio: /close SOLEUR"
-            )
+            await update.message.reply_text("Uso: /close <pair>\nEsempio: /close SOLEUR")
             return
-
         pair = ctx.args[0].upper()
         if pair not in self.positions:
             await update.message.reply_text(f"Nessuna posizione aperta per {pair}.")
             return
-
-        pos = self.positions[pair]
         try:
-            ticker  = await asyncio.to_thread(kraken_client.get_ticker, pair)
-            current = ticker["last"]
-
-            if config.PAPER_TRADING:
-                txid = "PAPER"
-            else:
-                vol_str = kraken_client.format_volume(pair, pos["size_crypto"])
-                order   = await asyncio.to_thread(
-                    kraken_client.add_order, pair, "sell", "market", vol_str
-                )
-                txids = order.get("txid", [])
-                txid  = txids[0] if txids else "unknown"
-
-            gross_pnl_eur = (current - pos["entry"]) * pos["size_crypto"]
-            fee_exit      = round(current * pos["size_crypto"] * config.KRAKEN_TAKER_FEE, 4)
-            fee_entry     = pos.get("fee_entry_eur", 0.0)
-            slip_eur      = round(pos["size_eur"] * config.SLIPPAGE_PCT * 2, 4)
-            net_pnl_eur   = gross_pnl_eur - fee_entry - fee_exit - slip_eur
-            net_pnl_pct   = net_pnl_eur / pos["size_eur"] * 100
-
-            del self.positions[pair]
-            _save_positions(self.positions)
-            _append_trade_log({
-                "pair": pair, "exit_reason": "manual",
-                "entry": pos["entry"], "exit": current,
-                "size_eur": pos["size_eur"],
-                "gross_pnl_eur": round(gross_pnl_eur, 4),
-                "fee_eur": round(fee_entry + fee_exit, 4),
-                "pnl_eur": round(net_pnl_eur, 4),
-                "pnl_pct": round(net_pnl_pct, 4),
-                "paper": config.PAPER_TRADING, "closed_at": time.time(),
-            })
-
-            await update.message.reply_text(
-                f"Posizione chiusa: {pair}\n"
-                f"P&L lordo: {gross_pnl_eur:+.2f}€\n"
-                f"Fee totali: -{fee_entry + fee_exit:.4f}€\n"
-                f"P&L netto: {net_pnl_eur:+.2f}€  ({net_pnl_pct:+.2f}%)\n"
-                f"TX: {txid}"
-            )
+            msg = await self._do_close(pair)
+            await update.message.reply_text(msg)
         except Exception as exc:
             await update.message.reply_text(f"Errore chiusura {pair}: {exc}")
 
@@ -775,6 +781,42 @@ class TradingBot:
             )
         await update.message.reply_text("\n\n".join(lines))
 
+    async def _cmd_profile(self, update, ctx) -> None:
+        """Mostra il profilo attivo o cambia profilo (/profile aggressive|conservative)."""
+        if ctx.args:
+            name = ctx.args[0].lower()
+            try:
+                config.apply_profile(name)
+                p = config.PROFILES[name]
+                await update.message.reply_text(
+                    f"Profilo cambiato: {name.upper()}\n\n"
+                    f"Posizioni max: {p['MAX_OPEN_TRADES']}  |  Capitale: {p['MAX_CAPITAL_DEPLOYED']*100:.0f}%\n"
+                    f"TP: {p['ATR_TP_MULT']}×ATR ({p['TAKE_PROFIT_PCT']*100:.0f}% fallback)  "
+                    f"SL: {p['ATR_SL_MULT']}×ATR ({p['STOP_LOSS_PCT']*100:.0f}% fallback)\n"
+                    f"Size AI alto/medio/basso: {p['AI_SIZE_HIGH']*100:.0f}% / {p['AI_SIZE_MED']*100:.0f}% / {p['AI_SIZE_MIN']*100:.0f}%\n"
+                    f"Confidenza min Groq: {p['GROQ_MIN_CONFIDENCE']}/10  |  Score min: {p['MIN_SIGNAL_SCORE']}/6\n"
+                    f"Circuit breaker: -{p['CIRCUIT_BREAKER_LOSS_EUR']:.0f}€/giorno\n"
+                    f"Trailing stop: {p['TRAILING_STOP_PCT']*100:.0f}%  |  ADX min: {p['ADX_MIN']}\n"
+                    f"Fear&Greed: {p['FEAR_GREED_MIN']}–{p['FEAR_GREED_MAX']}  |  BTC RSI max: {p['BTC_RSI_MAX']}"
+                )
+            except ValueError as exc:
+                await update.message.reply_text(str(exc))
+            return
+
+        p = config.PROFILES[config.ACTIVE_PROFILE]
+        await update.message.reply_text(
+            f"Profilo attivo: {config.ACTIVE_PROFILE.upper()}\n\n"
+            f"Posizioni max: {p['MAX_OPEN_TRADES']}  |  Capitale: {p['MAX_CAPITAL_DEPLOYED']*100:.0f}%\n"
+            f"TP: {p['ATR_TP_MULT']}×ATR ({p['TAKE_PROFIT_PCT']*100:.0f}% fallback)  "
+            f"SL: {p['ATR_SL_MULT']}×ATR ({p['STOP_LOSS_PCT']*100:.0f}% fallback)\n"
+            f"Size AI alto/medio/basso: {p['AI_SIZE_HIGH']*100:.0f}% / {p['AI_SIZE_MED']*100:.0f}% / {p['AI_SIZE_MIN']*100:.0f}%\n"
+            f"Confidenza min Groq: {p['GROQ_MIN_CONFIDENCE']}/10  |  Score min: {p['MIN_SIGNAL_SCORE']}/6\n"
+            f"Circuit breaker: -{p['CIRCUIT_BREAKER_LOSS_EUR']:.0f}€/giorno\n"
+            f"Trailing stop: {p['TRAILING_STOP_PCT']*100:.0f}%  |  ADX min: {p['ADX_MIN']}\n"
+            f"Fear&Greed: {p['FEAR_GREED_MIN']}–{p['FEAR_GREED_MAX']}  |  BTC RSI max: {p['BTC_RSI_MAX']}\n\n"
+            f"Cambia con: /profile conservative | /profile moderate | /profile aggressive"
+        )
+
     async def _cmd_discover(self, update, ctx) -> None:
         if self._discovering:
             await update.message.reply_text("Discovery già in corso — attendi la notifica.")
@@ -791,6 +833,8 @@ class TradingBot:
         try:
             result = await asyncio.to_thread(discovery.run_discovery)
             await self._notify_discovery(result)
+            if not result.get("error"):
+                await self._act_on_discovery(result)
         except Exception as exc:
             logger.error("Discovery fallita: %s", exc, exc_info=True)
             try:
@@ -838,6 +882,178 @@ class TradingBot:
             ),
         )
 
+    async def _job_process_commands(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Process commands queued by the web dashboard (bot_commands.json)."""
+        if not BOT_COMMANDS_FILE.exists():
+            return
+        try:
+            commands = _load_json(BOT_COMMANDS_FILE, [])
+            if not commands:
+                return
+            BOT_COMMANDS_FILE.write_text("[]", encoding="utf-8")
+        except Exception as exc:
+            logger.error("bot_commands.json read error: %s", exc)
+            return
+
+        for cmd in commands:
+            try:
+                c = cmd.get("cmd")
+                if c == "scan":
+                    if not self._scanning:
+                        self._scanning = True
+                        try:
+                            await self._run_scan_inner()
+                        finally:
+                            self._scanning = False
+                elif c == "discover":
+                    asyncio.create_task(self._run_discovery_bg())
+                elif c == "close":
+                    pair = cmd.get("pair", "").upper()
+                    if pair in self.positions:
+                        msg = await self._do_close(pair)
+                        await self.app.bot.send_message(
+                            chat_id=config.TELEGRAM_CHAT_ID,
+                            text=f"[Dashboard] {msg}",
+                        )
+                    else:
+                        logger.warning("Dashboard close: %s non in posizioni", pair)
+                elif c == "profile":
+                    name = cmd.get("name", "")
+                    try:
+                        config.apply_profile(name)
+                        await self.app.bot.send_message(
+                            chat_id=config.TELEGRAM_CHAT_ID,
+                            text=f"[Dashboard] Profilo cambiato: {name.upper()}",
+                        )
+                    except ValueError as exc:
+                        logger.error("Profile change error: %s", exc)
+            except Exception as exc:
+                logger.error("Command error [%s]: %s", cmd, exc)
+
+    async def _act_on_discovery(self, result: dict) -> None:
+        """Run live signal evaluation on top discovery candidates and trade if approved."""
+        candidates = result.get("candidates", [])
+        if not candidates:
+            return
+
+        # Capital check
+        if config.PAPER_TRADING:
+            spent = sum(p["size_eur"] for p in self.positions.values())
+            available_eur = max(config.BUDGET_EUR - spent, 0.0)
+        else:
+            try:
+                bal = await asyncio.to_thread(kraken_client.get_balance)
+                spent = sum(p["size_eur"] for p in self.positions.values())
+                available_eur = bal.get("ZEUR", bal.get("EUR", 0.0))
+            except Exception as exc:
+                logger.error("Discovery: impossibile recuperare saldo: %s", exc)
+                return
+
+        max_allowed = config.BUDGET_EUR * config.MAX_CAPITAL_DEPLOYED
+        spent = sum(p["size_eur"] for p in self.positions.values())
+        available_eur = min(available_eur, max_allowed - spent)
+
+        if available_eur < 10.0 or len(self.positions) >= config.MAX_OPEN_TRADES:
+            return
+
+        # Circuit breaker
+        if config.CIRCUIT_BREAKER_ENABLED:
+            trades = _load_json(TRADES_LOG_FILE, [])
+            daily_loss = sum(
+                t["pnl_eur"] for t in trades
+                if t.get("closed_at", 0) > time.time() - 86400 and t["pnl_eur"] < 0
+            )
+            if abs(daily_loss) >= config.CIRCUIT_BREAKER_LOSS_EUR:
+                return
+
+        mkt_ctx = await asyncio.to_thread(market_data.get_market_context)
+        if config.FEAR_GREED_ENABLED and market_data.fear_greed_blocks_trading(
+            mkt_ctx.get("fear_greed_value")
+        ):
+            return
+
+        btc_analysis = None
+        if config.BTC_FILTER_ENABLED:
+            btc_analysis = await asyncio.to_thread(analyze, config.BTC_PAIR)
+
+        trades_history = _load_json(TRADES_LOG_FILE, [])
+        kelly_pct = kelly_size_pct(trades_history)
+        already_open = set(self.positions.keys())
+
+        evaluated: list[str] = []
+        any_executed = False
+
+        for c in candidates[:3]:
+            pair = c["pair"]
+            if pair in already_open:
+                continue
+            if len(self.positions) >= config.MAX_OPEN_TRADES:
+                break
+
+            logger.info("Discovery live eval: %s (mech_score=%.1f)", pair, c.get("mech_score", 0))
+            analysis = await asyncio.to_thread(analyze, pair)
+            if analysis is None:
+                evaluated.append(f"• {pair}: dati non disponibili")
+                continue
+
+            signal = generate_signal(
+                analysis, available_eur, already_open,
+                btc_analysis=btc_analysis, open_pairs=already_open,
+            )
+            if not signal:
+                evaluated.append(f"• {pair}: gate live non superati")
+                continue
+
+            execute, confidence, reason, size_pct = await asyncio.to_thread(
+                groq_evaluator.evaluate, signal, mkt_ctx
+            )
+            effective_size_pct = kelly_pct if kelly_pct else size_pct
+
+            if execute and effective_size_pct > 0:
+                ai_size = max(round(available_eur * effective_size_pct, 2), 10.0)
+                if ai_size <= available_eur:
+                    signal.size_eur    = ai_size
+                    signal.size_crypto = ai_size / signal.price
+
+            _append_groq_log({
+                "ts":           time.time(),
+                "pair":         signal.pair,
+                "decision":     "ESEGUI" if execute else "RIFIUTA",
+                "confidence":   confidence,
+                "size_pct":     round(size_pct * 100, 0),
+                "size_eur":     signal.size_eur,
+                "reason":       f"[DISCOVERY] {reason}",
+                "score":        signal.score,
+                "adx":          signal.adx,
+                "rsi_1h":       signal.rsi_1h,
+                "rsi_15m":      signal.rsi_15m,
+                "macd_hist":    signal.macd_hist,
+                "volume_ratio": signal.volume_ratio,
+                "price":        signal.price,
+            })
+
+            if execute:
+                await self._execute_signal(
+                    signal, f"[DISCOVERY] {reason} [{confidence}/10, {size_pct*100:.0f}% capitale]"
+                )
+                already_open.add(pair)
+                any_executed = True
+            else:
+                evaluated.append(f"• {pair}: Groq rifiuta [{confidence}/10] — {reason}")
+
+            await asyncio.sleep(1)
+
+        if not any_executed and evaluated:
+            await self.app.bot.send_message(
+                chat_id=config.TELEGRAM_CHAT_ID,
+                text="DISCOVERY — valutazione live:\n" + "\n".join(evaluated),
+            )
+        elif not any_executed:
+            await self.app.bot.send_message(
+                chat_id=config.TELEGRAM_CHAT_ID,
+                text="DISCOVERY — nessun candidato supera i gate live al momento.",
+            )
+
     def run(self) -> None:
         jq = self.app.job_queue
         jq.run_repeating(
@@ -858,11 +1074,25 @@ class TradingBot:
             first=30,
             name="pending_orders",
         )
-        # Discovery è ora uno script autonomo (discovery.py)
-        # Aggiungila come Task Scheduler separato in DSM.
+        jq.run_repeating(
+            self._job_process_commands,
+            interval=15,
+            first=15,
+            name="dashboard_commands",
+        )
+        jq.run_daily(
+            self._job_discovery,
+            time=datetime.time(hour=7, minute=0),
+            name="discovery_morning",
+        )
+        jq.run_daily(
+            self._job_discovery,
+            time=datetime.time(hour=19, minute=0),
+            name="discovery_evening",
+        )
         jq.run_daily(
             self._job_daily_report,
-            time=__import__("datetime").time(hour=config.DAILY_REPORT_HOUR, minute=0),
+            time=datetime.time(hour=config.DAILY_REPORT_HOUR, minute=0),
             name="daily_report",
         )
 
