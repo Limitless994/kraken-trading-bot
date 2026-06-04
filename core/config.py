@@ -31,8 +31,16 @@ SLIPPAGE_PCT     = float(os.getenv("SLIPPAGE_PCT",    "0.001"))
 KRAKEN_TAKER_FEE         = 0.004
 KRAKEN_MAKER_FEE         = 0.0025
 MARGIN_LEVERAGE          = int(os.getenv("MARGIN_LEVERAGE", "2"))
-MARGIN_OPEN_FEE          = 0.0002
-MARGIN_ROLLOVER_FEE_PER_4H = 0.0002
+# Opening and rollover fees vary by pair: BTC/ETH = 0.01%, altcoins = 0.02%
+MARGIN_OPEN_FEE_BTC      = 0.0001
+MARGIN_OPEN_FEE_ALT      = 0.0002
+MARGIN_ROLLOVER_FEE_BTC  = 0.0001   # per 4h
+MARGIN_ROLLOVER_FEE_ALT  = 0.0002   # per 4h
+# Kept for backwards compat — used as fallback
+MARGIN_OPEN_FEE          = MARGIN_OPEN_FEE_ALT
+MARGIN_ROLLOVER_FEE_PER_4H = MARGIN_ROLLOVER_FEE_ALT
+
+_BTC_PAIRS = {"XBTEUR", "XBTUSD", "ETHEUR", "ETHUSD"}
 
 # ── Limit orders ──────────────────────────────────────────────────────────────
 LIMIT_ORDERS_ENABLED = os.getenv("LIMIT_ORDERS_ENABLED", "true").lower() == "true"

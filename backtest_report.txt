@@ -1,0 +1,75 @@
+================================================================================
+  KRAKEN TRADING BOT -- BACKTEST REPORT
+  Period : 2022-01-01  to  2026-06-04   Budget: 10000 EUR
+  Profiles: CONSERVATIVE, MODERATE, AGGRESSIVE
+================================================================================
+
+  !! KNOWN LIMITS:
+    1. ob_imbalance = None for all candles -> max score 5/6 (not 6/6).
+       Live bot earns the OB point when the order book confirms the move.
+    2. Groq AI -> deterministic rule: execute=True always, size=AI_SIZE_MED.
+       Live results differ when AI blocks or resizes signals.
+    3. 15m data unavailable from CryptoCompare free tier for historical dates.
+       rsi_15m falls back to rsi_1h. RSI_15M gate uses 1h value as proxy.
+    4. Price data from CryptoCompare (aggregated), not Kraken's own orderbook.
+       Minor price differences possible vs. actual Kraken execution.
+
+--------------------------------------------------------------------------------
+  BUY-AND-HOLD BENCHMARK  (same period, zero costs)
+--------------------------------------------------------------------------------
+    XBTEUR        +35.7%   (+3572.17 EUR on 10000 EUR)
+    ETHEUR        -51.7%   (-5172.87 EUR on 10000 EUR)
+
+--------------------------------------------------------------------------------
+  Profile                     CONSERVATIVE      MODERATE          AGGRESSIVE        
+--------------------------------------------------------------------------------
+  Net return EUR              -9990.16 EUR      -9990.15 EUR      -9990.02 EUR      
+  Net return %                -99.9%            -99.9%            -99.9%            
+  Max drawdown                99.9%             99.9%             99.9%             
+  # Trades                    4018              3333              2973              
+  Win rate                    23.4%             22.0%             24.2%             
+  Avg win EUR                 +3.755 EUR        +6.856 EUR        +7.496 EUR        
+  Avg loss EUR                -4.390 EUR        -5.775 EUR        -6.830 EUR        
+  Expectancy/trade            -2.486 EUR        -2.997 EUR        -3.360 EUR        
+  Gross return EUR            -98.68 EUR        +823.65 EUR       +864.62 EUR       
+  Total fees EUR              7823.50 EUR       8534.99 EUR       8559.42 EUR       
+  Total funding EUR           133.43 EUR        170.33 EUR        179.54 EUR        
+
+--------------------------------------------------------------------------------
+  GROSS vs NET  (how much costs ate)
+--------------------------------------------------------------------------------
+    CONSERVATIVE   gross -98.68 EUR  net -9990.16 EUR  costs ate 9891.48 EUR (10024% of gross)
+    MODERATE       gross +823.65 EUR  net -9990.15 EUR  costs ate 10813.79 EUR (1313% of gross)
+    AGGRESSIVE     gross +864.62 EUR  net -9990.02 EUR  costs ate 10854.64 EUR (1255% of gross)
+
+--------------------------------------------------------------------------------
+  REGIME: BEAR
+--------------------------------------------------------------------------------
+  Profile                     CONSERVATIVE      MODERATE          AGGRESSIVE        
+--------------------------------------------------------------------------------
+  Net return EUR              -7127.41 EUR      -9317.14 EUR      -9783.59 EUR      
+  # Trades                    788               1520              1909              
+  Win rate                    22.3%             24.1%             25.0%             
+  Expectancy/trade            -9.045 EUR        -6.130 EUR        -5.125 EUR        
+
+--------------------------------------------------------------------------------
+  REGIME: BULL
+--------------------------------------------------------------------------------
+  Profile                     CONSERVATIVE      MODERATE          AGGRESSIVE        
+--------------------------------------------------------------------------------
+  Net return EUR              -2730.72 EUR      -673.00 EUR       -206.43 EUR       
+  # Trades                    2008              1813              1064              
+  Win rate                    21.8%             20.2%             22.8%             
+  Expectancy/trade            -1.360 EUR        -0.371 EUR        -0.194 EUR        
+
+--------------------------------------------------------------------------------
+  REGIME: RECENT
+--------------------------------------------------------------------------------
+  Profile                     CONSERVATIVE      MODERATE          AGGRESSIVE        
+--------------------------------------------------------------------------------
+  Net return EUR              -132.03 EUR       n/a               n/a               
+  # Trades                    1222              n/a               n/a               
+  Win rate                    26.7%             n/a               n/a               
+  Expectancy/trade            -0.108 EUR        n/a               n/a               
+
+================================================================================

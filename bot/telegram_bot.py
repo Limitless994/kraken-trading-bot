@@ -95,13 +95,89 @@ def _append_groq_log(entry: dict) -> None:
     )
 
 
-def _funding_cost_eur(pos: dict) -> float:
-    """Accumulated Kraken margin rollover cost for an open short position (charged every 4h)."""
+def _margin_open_fee(pair: str) -> float:
+    """Kraken margin opening fee: 0.01% for BTC/ETH, 0.02% for altcoins."""
+    return config.MARGIN_OPEN_FEE_BTC if pair in config._BTC_PAIRS else config.MARGIN_OPEN_FEE_ALT
+
+
+def _margin_rollover_rate(pair: str) -> float:
+    """Kraken rollover fee per 4h: 0.01% for BTC/ETH, 0.02% for altcoins."""
+    return config.MARGIN_ROLLOVER_FEE_BTC if pair in config._BTC_PAIRS else config.MARGIN_ROLLOVER_FEE_ALT
+
+
+def _funding_cost_eur_pure(pos: dict, current_ts: float) -> float:
+    """Pure version: accepts timestamp so historical backtest code can use it."""
     if pos.get("side") != "short":
         return 0.0
-    holding_seconds = max(0.0, time.time() - pos.get("opened_at", time.time()))
+    holding_seconds = max(0.0, current_ts - pos.get("opened_at", current_ts))
     periods = holding_seconds / (4 * 3600)
-    return round(periods * config.MARGIN_ROLLOVER_FEE_PER_4H * pos["size_eur"], 4)
+    rate = _margin_rollover_rate(pos.get("pair", ""))
+    return round(periods * rate * pos["size_eur"], 4)
+
+
+def _funding_cost_eur(pos: dict) -> float:
+    """Accumulated Kraken margin rollover cost for an open short position (charged every 4h)."""
+    return _funding_cost_eur_pure(pos, time.time())
+
+
+def _update_trailing_stop(pos: dict, current: float, atr: float, cfg) -> bool:
+    """Update trailing stop in pos dict in-place. Returns True if the level was updated."""
+    if not cfg.TRAILING_STOP_ENABLED:
+        return False
+    old_trailing = pos.get("trailing_stop", pos["stop_loss"])
+    entry = pos["entry"]
+    side  = pos.get("side", "long")
+    if side == "short":
+        activation = (entry - cfg.TRAILING_ACTIVATION_ATR * atr) if atr > 0 else entry * (1 - cfg.TRAILING_STOP_PCT)
+        if current <= activation:
+            new_trailing = (round(current + cfg.TRAILING_DISTANCE_ATR * atr, 8) if atr > 0
+                            else round(current * (1 + cfg.TRAILING_STOP_PCT), 8))
+            if new_trailing < old_trailing:
+                pos["trailing_stop"] = new_trailing
+                return True
+    else:
+        activation = (entry + cfg.TRAILING_ACTIVATION_ATR * atr) if atr > 0 else entry * (1 + cfg.TRAILING_STOP_PCT)
+        if current >= activation:
+            new_trailing = (round(current - cfg.TRAILING_DISTANCE_ATR * atr, 8) if atr > 0
+                            else round(current * (1 - cfg.TRAILING_STOP_PCT), 8))
+            if new_trailing > old_trailing:
+                pos["trailing_stop"] = new_trailing
+                return True
+    return False
+
+
+def _check_exit_signals(pos: dict, current: float) -> tuple:
+    """Returns (hit_tp, hit_sl) based on current price and effective trailing stop."""
+    side        = pos.get("side", "long")
+    effective_sl = pos.get("trailing_stop", pos["stop_loss"])
+    if side == "short":
+        return current <= pos["take_profit"], current >= effective_sl
+    return current >= pos["take_profit"], current <= effective_sl
+
+
+def _calc_exit(pos: dict, exit_price: float, cfg, current_ts: float = None) -> dict:
+    """Calculate net P&L for closing a position. current_ts defaults to time.time()."""
+    if current_ts is None:
+        current_ts = time.time()
+    side = pos.get("side", "long")
+    gross_pnl_eur = (
+        (pos["entry"] - exit_price) if side == "short" else (exit_price - pos["entry"])
+    ) * pos["size_crypto"]
+    fee_exit     = round(exit_price * pos["size_crypto"] * cfg.KRAKEN_TAKER_FEE, 4)
+    fee_entry    = pos.get("fee_entry_eur", 0.0)
+    slip_eur     = round(pos["size_eur"] * cfg.SLIPPAGE_PCT * 2, 4)
+    funding_cost = _funding_cost_eur_pure(pos, current_ts)
+    net_pnl_eur  = gross_pnl_eur - fee_entry - fee_exit - slip_eur - funding_cost
+    size_eur     = pos["size_eur"]
+    return {
+        "gross_pnl_eur": round(gross_pnl_eur, 4),
+        "fee_exit":      fee_exit,
+        "fee_entry":     fee_entry,
+        "slip_eur":      slip_eur,
+        "funding_cost":  funding_cost,
+        "net_pnl_eur":   round(net_pnl_eur, 4),
+        "net_pnl_pct":   round(net_pnl_eur / size_eur * 100 if size_eur > 0 else 0.0, 4),
+    }
 
 
 def _append_trade_log(entry: dict) -> None:
@@ -277,16 +353,13 @@ class TradingBot:
             txids = order.get("txid", [])
             txid  = txids[0] if txids else "unknown"
 
-        if side == "short":
-            gross_pnl_eur = (pos["entry"] - current) * pos["size_crypto"]
-        else:
-            gross_pnl_eur = (current - pos["entry"]) * pos["size_crypto"]
-        fee_exit      = round(current * pos["size_crypto"] * config.KRAKEN_TAKER_FEE, 4)
-        fee_entry     = pos.get("fee_entry_eur", 0.0)
-        slip_eur      = round(pos["size_eur"] * config.SLIPPAGE_PCT * 2, 4)
-        funding_cost  = _funding_cost_eur(pos)
-        net_pnl_eur   = gross_pnl_eur - fee_entry - fee_exit - slip_eur - funding_cost
-        net_pnl_pct   = net_pnl_eur / pos["size_eur"] * 100
+        exit_data     = _calc_exit(pos, current, config)
+        gross_pnl_eur = exit_data["gross_pnl_eur"]
+        fee_exit      = exit_data["fee_exit"]
+        fee_entry     = exit_data["fee_entry"]
+        funding_cost  = exit_data["funding_cost"]
+        net_pnl_eur   = exit_data["net_pnl_eur"]
+        net_pnl_pct   = exit_data["net_pnl_pct"]
 
         del self.positions[pair]
         _save_positions(self.positions)
@@ -333,19 +406,24 @@ class TradingBot:
             # Short always uses market (no limit orders for margin)
             use_limit   = config.LIMIT_ORDERS_ENABLED and not config.PAPER_TRADING and not is_short
             fee_rate    = config.KRAKEN_MAKER_FEE if use_limit else config.KRAKEN_TAKER_FEE
-            # Short also includes margin opening fee
-            extra_fee   = config.MARGIN_OPEN_FEE if is_short else 0.0
+            # Short includes margin opening fee (rate depends on pair)
+            extra_fee   = _margin_open_fee(signal.pair) if is_short else 0.0
             fee_entry   = round(signal.size_eur * (fee_rate + extra_fee), 4)
-            size_crypto_net = signal.size_eur * (1 - fee_rate) / signal.price
+            # For shorts, fee doesn't reduce the crypto volume sold — use full size
+            if is_short:
+                size_crypto_net = signal.size_eur / signal.price
+            else:
+                size_crypto_net = signal.size_eur * (1 - fee_rate) / signal.price
 
             if config.PAPER_TRADING:
-                # Paper: simulate limit at a slightly better price
-                if config.LIMIT_ORDERS_ENABLED:
+                if config.LIMIT_ORDERS_ENABLED and not is_short:
+                    # Simulate limit fill at a slightly better price (long only)
                     limit_price = round(signal.price * (1 - config.LIMIT_OFFSET_PCT), 8)
                     size_crypto_net = signal.size_eur * (1 - fee_rate) / limit_price
                     actual_price = limit_price
                 else:
                     actual_price = signal.price
+                    # size_crypto_net already set above (correct for both long and short)
                 txid  = "PAPER"
                 descr = ""
 
@@ -411,6 +489,7 @@ class TradingBot:
                 size_crypto_net = signal.size_crypto  # real exchange handles net internally
 
             self.positions[signal.pair] = {
+                "pair":          signal.pair,
                 "side":          "short" if is_short else "long",
                 "entry":         actual_price if config.PAPER_TRADING else signal.price,
                 "size_crypto":   size_crypto_net,
@@ -769,54 +848,28 @@ class TradingBot:
 
                 # ── Trailing stop update ──────────────────────────────────
                 if config.TRAILING_STOP_ENABLED:
-                    atr_pos = pos.get("atr", 0)
+                    atr_pos      = pos.get("atr", 0)
                     old_trailing = pos.get("trailing_stop", pos["stop_loss"])
-                    entry = pos["entry"]
-                    if side == "short":
-                        # Activate only once price has dropped >= TRAILING_ACTIVATION_ATR * ATR from entry
-                        activation = (entry - config.TRAILING_ACTIVATION_ATR * atr_pos) if atr_pos > 0 else entry * (1 - config.TRAILING_STOP_PCT)
-                        if current <= activation:
-                            new_trailing = (round(current + config.TRAILING_DISTANCE_ATR * atr_pos, 8) if atr_pos > 0
-                                            else round(current * (1 + config.TRAILING_STOP_PCT), 8))
-                            if new_trailing < old_trailing:
-                                pos["trailing_stop"] = new_trailing
-                                self.positions[pair] = pos
-                                _save_positions(self.positions)
-                                logger.info("Trailing stop SHORT %s: %.6f → %.6f", pair, old_trailing, new_trailing)
-                    else:
-                        # Activate only once price has risen >= TRAILING_ACTIVATION_ATR * ATR from entry
-                        activation = (entry + config.TRAILING_ACTIVATION_ATR * atr_pos) if atr_pos > 0 else entry * (1 + config.TRAILING_STOP_PCT)
-                        if current >= activation:
-                            new_trailing = (round(current - config.TRAILING_DISTANCE_ATR * atr_pos, 8) if atr_pos > 0
-                                            else round(current * (1 - config.TRAILING_STOP_PCT), 8))
-                            if new_trailing > old_trailing:
-                                pos["trailing_stop"] = new_trailing
-                                self.positions[pair] = pos
-                                _save_positions(self.positions)
-                                logger.info("Trailing stop LONG %s: %.6f → %.6f", pair, old_trailing, new_trailing)
+                    if _update_trailing_stop(pos, current, atr_pos, config):
+                        self.positions[pair] = pos
+                        _save_positions(self.positions)
+                        logger.info(
+                            "Trailing stop %s %s: %.6f → %.6f",
+                            side.upper(), pair, old_trailing, pos["trailing_stop"],
+                        )
 
-                effective_sl = pos.get("trailing_stop", pos["stop_loss"])
-                if side == "short":
-                    hit_tp = current <= pos["take_profit"]   # prezzo sceso al target
-                    hit_sl = current >= effective_sl          # prezzo salito oltre lo stop
-                else:
-                    hit_tp = current >= pos["take_profit"]
-                    hit_sl = current <= effective_sl
-
+                hit_tp, hit_sl = _check_exit_signals(pos, current)
                 if not (hit_tp or hit_sl):
                     continue
 
                 label         = "TAKE PROFIT" if hit_tp else "STOP LOSS"
-                if side == "short":
-                    gross_pnl_eur = (pos["entry"] - current) * pos["size_crypto"]
-                else:
-                    gross_pnl_eur = (current - pos["entry"]) * pos["size_crypto"]
-                fee_exit      = round(current * pos["size_crypto"] * config.KRAKEN_TAKER_FEE, 4)
-                fee_entry     = pos.get("fee_entry_eur", 0.0)
-                slip_eur      = round(pos["size_eur"] * config.SLIPPAGE_PCT * 2, 4)
-                funding_cost  = _funding_cost_eur(pos)
-                net_pnl_eur   = gross_pnl_eur - fee_entry - fee_exit - slip_eur - funding_cost
-                net_pnl_pct   = net_pnl_eur / pos["size_eur"] * 100
+                exit_data     = _calc_exit(pos, current, config)
+                gross_pnl_eur = exit_data["gross_pnl_eur"]
+                fee_exit      = exit_data["fee_exit"]
+                fee_entry     = exit_data["fee_entry"]
+                funding_cost  = exit_data["funding_cost"]
+                net_pnl_eur   = exit_data["net_pnl_eur"]
+                net_pnl_pct   = exit_data["net_pnl_pct"]
 
                 try:
                     if config.PAPER_TRADING:
