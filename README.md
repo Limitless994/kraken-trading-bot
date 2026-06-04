@@ -229,6 +229,41 @@ $BOT_PYTHON "$BOT_DIR/services/discovery.py"
 ```
 (sostituendo `$BOT_PYTHON` e `$BOT_DIR` con i valori del tuo `.env`)
 
+### Deploy su Raspberry Pi
+
+`deploy_raspberry.sh` automatizza l'installazione completa su Raspberry Pi OS (o qualsiasi distro Debian/Ubuntu ARM).
+
+**Dal PC Windows, copia il progetto sul Raspberry:**
+
+```powershell
+scp -r kraken-trading-bot pi@<IP_RASPBERRY>:~/
+```
+
+**Sul Raspberry (via SSH), esegui lo script:**
+
+```bash
+ssh pi@<IP_RASPBERRY>
+bash ~/kraken-trading-bot/deploy_raspberry.sh
+```
+
+Lo script si occupa di:
+1. Verificare Python 3.10+ (lo installa se mancante)
+2. Creare il virtual environment e installare le dipendenze
+3. Guidare la configurazione del `.env` in modo interattivo
+4. Creare un servizio **systemd** per l'avvio automatico al boot
+5. Configurare **logrotate** (rotazione log giornaliera, 7 giorni)
+
+**Comandi utili dopo il deploy:**
+
+```bash
+sudo systemctl start kraken-bot      # avvia
+sudo systemctl stop kraken-bot       # ferma
+sudo systemctl status kraken-bot     # stato
+journalctl -u kraken-bot -f          # log in tempo reale
+```
+
+Il bot si riavvia automaticamente in caso di crash (dopo 30 secondi) e ad ogni reboot del Raspberry.
+
 ---
 
 ## Test
