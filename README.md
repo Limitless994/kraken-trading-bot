@@ -7,7 +7,7 @@ Bot di trading algoritmico per coppie crypto/EUR su Kraken, con segnali tecnici 
 - **Long e Short**: apre posizioni spot (BUY) e a margine (SELL/SHORT) in base alle condizioni di mercato
 - **Analisi tecnica multi-timeframe**: RSI su 15m/1h/4h/Daily, MACD, EMA50, ADX, ATR, volume
 - **Valutazione AI**: ogni segnale viene valutato da un LLM (Groq) che assegna uno score 1-10 e decide la size
-- **Trailing stop**: adatta lo stop loss al movimento del prezzo (sia per long che per short)
+- **Trailing stop**: si attiva solo dopo che il trade è in profitto di almeno `TRAILING_ACTIVATION_ATR × ATR`; la distanza è configurabile separatamente (`TRAILING_DISTANCE_ATR`)
 - **Paper trading**: modalità simulata senza eseguire ordini reali
 - **Profili di rischio**: conservative / moderate / aggressive, cambiabili a runtime via Telegram
 - **Discovery giornaliera**: scansione automatica di tutte le coppie EUR su Kraken per trovare opportunità
@@ -92,7 +92,8 @@ ogni 60 secondi: monitor posizioni → trailing stop, TP, SL → close se necess
 | BTC filter (invertito) | BTC deve essere in DOWNTREND, RSI BTC non già oversold |
 | Correlazione | Nessuna coppia correlata già aperta |
 | RSI non oversold | RSI 1h >= RSI_SHORT_MIN (non shortare in capitolazione) |
-| Fear & Greed | F&G non in extreme greed (> 80) — extreme fear è FAVOREVOLE per shorts |
+| Fear & Greed | F&G non in extreme greed (> FEAR_GREED_MAX) né extreme fear (< FEAR_GREED_SHORT_MIN, default 20) — extreme fear blocca gli short (rischio rimbalzo da capitolazione) |
+| BTC-beta bucket | Esposizione short totale < MAX_BTC_BETA_EXPOSURE_PCT × BUDGET_EUR (default 60%) |
 
 **Scoring (6 punti max, stessa soglia):**
 | Condizione | Punti |
@@ -104,8 +105,10 @@ ogni 60 secondi: monitor posizioni → trailing stop, TP, SL → close se necess
 | Order book bearish (bid/ask < 0.45) | 1 |
 | ADX >= 30 | 1 |
 
-**TP/SL invertiti**: `TP = entry − ATR_TP_MULT × ATR` · `SL = entry + ATR_SL_MULT × ATR`
-**Trailing stop**: scende col prezzo (si aggiorna solo quando il nuovo livello è più basso del precedente)
+**TP/SL invertiti**: `TP = entry − ATR_TP_MULT_SHORT × ATR` · `SL = entry + ATR_SL_MULT_SHORT × ATR` (default 2.5× / 1.3×, più largo dei long)
+**Size massima**: cappata a `AI_SIZE_MED` (più piccola dei long) per contenere il rischio illimitato degli short
+**Funding cost**: il rollover Kraken (0.02%/4h) viene sottratto dal P&L netto a chiusura
+**Trailing stop**: attivazione con soglia `TRAILING_ACTIVATION_ATR`; scende col prezzo solo quando il trade è già in profitto
 
 ---
 
@@ -117,12 +120,15 @@ Cambio a runtime: `/profile aggressive`
 |---|---|---|---|
 | MAX_OPEN_TRADES | 4 | 5 | 6 |
 | MAX_CAPITAL_DEPLOYED | 80% | 87% | 95% |
-| ATR TP/SL mult | 2.5× / 1.0× | 3.2× / 1.2× | 4.0× / 1.5× |
-| AI_SIZE_HIGH | 25% | 35% | 45% |
+| ATR TP/SL long | 2.5× / 1.0× | 3.2× / 1.2× | 4.0× / 1.5× |
+| ATR TP/SL short | 2.5× / 1.3× | 2.8× / 1.4× | 3.5× / 1.6× |
+| AI_SIZE_HIGH (long) | 25% | 35% | 45% |
 | GROQ_MIN_CONFIDENCE | 6/10 | 6/10 | 5/10 |
 | MIN_SIGNAL_SCORE | 3/6 | 2/6 | 2/6 |
 | CIRCUIT_BREAKER | €15 | €22 | €30 |
-| FEAR_GREED range | 20–80 | 15–85 | 10–90 |
+| FEAR_GREED long | 20–80 | 15–85 | 10–90 |
+| FEAR_GREED_SHORT_MIN | 20 | 15 | 10 |
+| TRAILING_ACTIVATION_ATR | 1.0× | 0.8× | 0.7× |
 
 Il profilo attivo viene salvato in `active_profile.json` e ripristinato al riavvio.
 
@@ -184,7 +190,7 @@ KRAKEN_API_SECRET=your_secret
 TELEGRAM_TOKEN=123456789:ABCdef...
 TELEGRAM_CHAT_ID=987654321
 GROQ_API_KEY=gsk_your_key
-GROQ_MODEL=llama3-8b-8192
+GROQ_MODEL=llama-3.3-70b-versatile
 
 # Opzionali
 BUDGET_EUR=100
@@ -192,6 +198,12 @@ PAPER_TRADING=true          # true = nessun ordine reale
 TRADING_PROFILE=conservative
 ATR_TP_MULT=2.5
 ATR_SL_MULT=1.0
+ATR_TP_MULT_SHORT=2.5
+ATR_SL_MULT_SHORT=1.3
+TRAILING_ACTIVATION_ATR=1.0
+TRAILING_DISTANCE_ATR=1.5
+FEAR_GREED_SHORT_MIN=20
+MAX_BTC_BETA_EXPOSURE_PCT=0.60
 
 # Solo per deploy su NAS/server remoto (non committare)
 BOT_DIR=/volume1/homes/youruser/kraken-trading-bot
