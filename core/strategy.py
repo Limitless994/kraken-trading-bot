@@ -310,7 +310,7 @@ def generate_short_signal(
         logger.info("%s: SHORT score=%d/6 → SKIP (min=%d)", analysis.pair, score, config.MIN_SIGNAL_SCORE)
         return None
 
-    size_eur = max(round(available_eur * config.AI_SIZE_HIGH, 2), 10.0)
+    size_eur = max(round(available_eur * config.AI_SIZE_MED, 2), 10.0)  # cap short initial size below long
     if size_eur > available_eur:
         return None
 
@@ -318,8 +318,8 @@ def generate_short_signal(
 
     atr = analysis.atr
     if atr and atr > 0:
-        take_profit = round(analysis.price - config.ATR_TP_MULT * atr, 8)
-        stop_loss   = round(analysis.price + config.ATR_SL_MULT * atr, 8)
+        take_profit = round(analysis.price - config.ATR_TP_MULT_SHORT * atr, 8)
+        stop_loss   = round(analysis.price + config.ATR_SL_MULT_SHORT * atr, 8)
     else:
         take_profit = round(analysis.price * (1 - config.TAKE_PROFIT_PCT), 8)
         stop_loss   = round(analysis.price * (1 + config.STOP_LOSS_PCT),   8)

@@ -50,6 +50,21 @@ def _setup_logging(log_dir: "Path") -> None:
 logger = logging.getLogger(__name__)
 
 
+class _TokenFilter(logging.Filter):
+    """Scrub the Telegram bot token from log records so it never appears in log files."""
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._token = token
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self._token:
+            msg = record.getMessage()
+            if self._token in msg:
+                record.msg = msg.replace(self._token, "<TOKEN>")
+                record.args = ()
+        return True
+
+
 def _notify_crash(exc: Exception) -> None:
     """Attempts to send the critical error to Telegram before exiting."""
     try:
@@ -74,6 +89,11 @@ def main() -> None:
     from core import config
 
     _setup_logging(Path(__file__).parent / "logs")
+
+    if config.TELEGRAM_TOKEN:
+        _tf = _TokenFilter(config.TELEGRAM_TOKEN)
+        logging.getLogger("httpx").addFilter(_tf)
+        logging.getLogger().addFilter(_tf)
 
     try:
         config.validate()

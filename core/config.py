@@ -40,12 +40,16 @@ LIMIT_OFFSET_PCT     = float(os.getenv("LIMIT_OFFSET_PCT", "0.001"))
 LIMIT_TIMEOUT_SEC    = int(os.getenv("LIMIT_TIMEOUT_SEC", "300"))
 
 # ── ATR-based TP/SL ───────────────────────────────────────────────────────────
-ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "2.5"))
-ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.0"))
+ATR_TP_MULT       = float(os.getenv("ATR_TP_MULT",       "2.5"))
+ATR_SL_MULT       = float(os.getenv("ATR_SL_MULT",       "1.0"))
+ATR_TP_MULT_SHORT = float(os.getenv("ATR_TP_MULT_SHORT", "2.5"))
+ATR_SL_MULT_SHORT = float(os.getenv("ATR_SL_MULT_SHORT", "1.3"))  # wider: short squeezes are more violent
 
 # ── Trailing stop ─────────────────────────────────────────────────────────────
-TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "true").lower() == "true"
-TRAILING_STOP_PCT     = float(os.getenv("TRAILING_STOP_PCT", "0.03"))
+TRAILING_STOP_ENABLED   = os.getenv("TRAILING_STOP_ENABLED", "true").lower() == "true"
+TRAILING_ACTIVATION_ATR = float(os.getenv("TRAILING_ACTIVATION_ATR", "1.0"))  # ATR multiples in profit before activating
+TRAILING_DISTANCE_ATR   = float(os.getenv("TRAILING_DISTANCE_ATR",   "1.5"))  # trailing distance once active
+TRAILING_STOP_PCT       = float(os.getenv("TRAILING_STOP_PCT", "0.03"))       # fallback when ATR unavailable
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
 CIRCUIT_BREAKER_ENABLED  = os.getenv("CIRCUIT_BREAKER_ENABLED", "true").lower() == "true"
@@ -77,11 +81,16 @@ CORR_GROUPS: list = [
     ["SOLEUR", "ETHEUR"],
     ["DOGEEUR", "XRPEUR"],
 ]
+# BTC-beta bucket: all positions (alts + BTC) count as full BTC-beta exposure.
+# Caps long exposure and short exposure separately as a fraction of BUDGET_EUR.
+# Set to 1.0 to disable. Example: 0.60 → max 60€ long + max 60€ short on a 100€ budget.
+MAX_BTC_BETA_EXPOSURE_PCT = float(os.getenv("MAX_BTC_BETA_EXPOSURE_PCT", "0.60"))
 
 # ── Fear & Greed ─────────────────────────────────────────────────────────────
-FEAR_GREED_ENABLED = os.getenv("FEAR_GREED_ENABLED", "true").lower() == "true"
-FEAR_GREED_MIN     = int(os.getenv("FEAR_GREED_MIN", "20"))
-FEAR_GREED_MAX     = int(os.getenv("FEAR_GREED_MAX", "80"))
+FEAR_GREED_ENABLED   = os.getenv("FEAR_GREED_ENABLED", "true").lower() == "true"
+FEAR_GREED_MIN       = int(os.getenv("FEAR_GREED_MIN",       "20"))   # blocks longs (extreme fear)
+FEAR_GREED_MAX       = int(os.getenv("FEAR_GREED_MAX",       "80"))   # blocks both longs and shorts (extreme greed)
+FEAR_GREED_SHORT_MIN = int(os.getenv("FEAR_GREED_SHORT_MIN", "20"))   # blocks shorts (extreme fear = capitulation bounce risk)
 
 # ── News sentiment ────────────────────────────────────────────────────────────
 NEWS_ENABLED   = os.getenv("NEWS_ENABLED", "true").lower() == "true"
@@ -159,6 +168,11 @@ PROFILE_CONSERVATIVE: dict = {
     "KELLY_MAX_SIZE_PCT":     0.25,
     "RSI_SHORT_MIN":          42,
     "BTC_RSI_SHORT_MIN":      32,
+    "ATR_TP_MULT_SHORT":      2.5,
+    "ATR_SL_MULT_SHORT":      1.3,
+    "TRAILING_ACTIVATION_ATR": 1.0,
+    "TRAILING_DISTANCE_ATR":  1.5,
+    "FEAR_GREED_SHORT_MIN":   20,
 }
 
 PROFILE_MODERATE: dict = {
@@ -187,31 +201,51 @@ PROFILE_MODERATE: dict = {
     "KELLY_MAX_SIZE_PCT":     0.35,
     "RSI_SHORT_MIN":          36,
     "BTC_RSI_SHORT_MIN":      28,
+    "ATR_TP_MULT_SHORT":      2.8,
+    "ATR_SL_MULT_SHORT":      1.4,
+    "TRAILING_ACTIVATION_ATR": 0.8,
+    "TRAILING_DISTANCE_ATR":  1.5,
+    "FEAR_GREED_SHORT_MIN":   15,
 }
 
 PROFILE_AGGRESSIVE: dict = {
-    "MIN_SIGNAL_SCORE":       2,
-    "ADX_MIN":                15,
-    "VOLUME_SPIKE_MULT":      1.05,
+    # ── Entry filters — lower = more trades, higher noise ratio ──────────────
+    "MIN_SIGNAL_SCORE":       2,    # conservative=3: accepts weaker setups
+    "ADX_MIN":                15,   # conservative=20: enters ranging markets
+    "VOLUME_SPIKE_MULT":      1.05, # conservative=1.15: lower bar for volume confirmation
+    # ── RSI thresholds — higher = buys more extended moves ───────────────────
     "RSI_1H_BUY_MAX":         72,
     "RSI_15M_BUY_MAX":        68,
     "RSI_4H_BUY_MAX":         76,
     "BTC_RSI_MAX":            72,
-    "FEAR_GREED_MIN":         10,
-    "FEAR_GREED_MAX":         90,
-    "GROQ_MIN_CONFIDENCE":    5,
-    "MAX_OPEN_TRADES":        6,
-    "MAX_CAPITAL_DEPLOYED":   0.95,
-    "ATR_TP_MULT":            4.0,
-    "ATR_SL_MULT":            1.5,
+    # ── Sentiment gates — wider window keeps more signals alive ──────────────
+    "FEAR_GREED_MIN":         10,   # conservative=20: trades deeper into fear
+    "FEAR_GREED_MAX":         90,   # conservative=80: trades deeper into greed
+    "FEAR_GREED_SHORT_MIN":   10,
+    # ── AI quality gate ───────────────────────────────────────────────────────
+    "GROQ_MIN_CONFIDENCE":    5,    # conservative=6: accepts lower-conviction approvals
+    # ── Position limits — more simultaneous exposure ──────────────────────────
+    "MAX_OPEN_TRADES":        6,    # conservative=4: more concurrent positions
+    "MAX_CAPITAL_DEPLOYED":   0.95, # conservative=0.80: nearly full capital deployed
+    # ── R:R — wider TP and SL, larger target but survives more noise ──────────
+    "ATR_TP_MULT":            4.0,  # conservative=2.5: larger profit target
+    "ATR_SL_MULT":            1.5,  # conservative=1.0: wider stop
+    "ATR_TP_MULT_SHORT":      3.5,
+    "ATR_SL_MULT_SHORT":      1.6,
     "TAKE_PROFIT_PCT":        0.18,
     "STOP_LOSS_PCT":          0.07,
-    "AI_SIZE_HIGH":           0.45,
+    # ── Position sizing — larger per-trade allocation ─────────────────────────
+    "AI_SIZE_HIGH":           0.45, # conservative=0.25: 45% of capital per trade
     "AI_SIZE_MED":            0.35,
     "AI_SIZE_MIN":            0.25,
-    "CIRCUIT_BREAKER_LOSS_EUR": 30.0,
+    # ── Loss protection — allows larger drawdown before halting ───────────────
+    "CIRCUIT_BREAKER_LOSS_EUR": 30.0, # conservative=15€: halts after larger daily loss
+    # ── Trailing stop — activates sooner, tighter on the way down ────────────
     "TRAILING_STOP_PCT":      0.05,
-    "KELLY_FRACTION":         0.50,
+    "TRAILING_ACTIVATION_ATR": 0.7, # conservative=1.0: trail starts earlier in the move
+    "TRAILING_DISTANCE_ATR":  1.5,
+    # ── Kelly criterion ───────────────────────────────────────────────────────
+    "KELLY_FRACTION":         0.50, # conservative=0.25: bets larger relative to edge
     "KELLY_MAX_SIZE_PCT":     0.45,
     "RSI_SHORT_MIN":          30,
     "BTC_RSI_SHORT_MIN":      25,
