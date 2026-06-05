@@ -56,6 +56,10 @@ class Signal:
     reasons: list
     base_currency: str
     blocked_reason: str = ""
+    rsi_4h: float = 50.0
+    rsi_daily: float = 50.0
+    macd_hist_prev: float = 0.0
+    rsi_1h_prev: float = 50.0   # RSI 3h ago — used by Groq to compute slope
 
 
 def _base_currency(pair: str) -> str:
@@ -221,6 +225,10 @@ def generate_signal(
         score=score,
         reasons=reasons,
         base_currency=_base_currency(analysis.pair),
+        rsi_4h=analysis.rsi_4h,
+        rsi_daily=analysis.rsi_daily,
+        macd_hist_prev=analysis.macd_hist_prev,
+        rsi_1h_prev=analysis.rsi_1h_prev,
     )
 
 
@@ -266,6 +274,17 @@ def generate_short_signal(
     # Gate 4: RSI not yet oversold — avoid shorting into capitulation
     if analysis.rsi_1h < config.RSI_SHORT_MIN:
         logger.info("%s: SHORT SKIP gate=RSI_oversold (%.1f < %d)", analysis.pair, analysis.rsi_1h, config.RSI_SHORT_MIN)
+        return None
+
+    # Gate 5: RSI slope — reject if RSI is bouncing from oversold territory.
+    # Pattern: RSI hit low (e.g. 31) and is now recovering (e.g. 38) = buyers stepping in.
+    # Threshold: RSI < 42 and rising by >3 points over last 3h = clear bounce, not short continuation.
+    rsi_slope = analysis.rsi_1h - analysis.rsi_1h_prev
+    if analysis.rsi_1h < 42 and rsi_slope > 3.0:
+        logger.info(
+            "%s: SHORT SKIP gate=RSI_rimbalzo (RSI=%.1f slope=+%.1f da prev=%.1f)",
+            analysis.pair, analysis.rsi_1h, rsi_slope, analysis.rsi_1h_prev,
+        )
         return None
 
     # ── Scoring (symmetric to longs, conditions inverted) ────────────────────
@@ -326,6 +345,19 @@ def generate_short_signal(
 
     take_profit = max(take_profit, analysis.price * 0.01)
 
+    # Gate: minimum profit check — TP gross must exceed round-trip costs with 30% margin.
+    # Round-trip costs: 2× taker fee (0.4% each) + 2× slippage cap (0.2% each) + margin open fee (0.02%)
+    # = 1.22% minimum; with 30% safety margin → 1.59% minimum TP distance.
+    _SLIP_EST = 0.002
+    _min_cost_pct = 2 * config.KRAKEN_TAKER_FEE + 2 * _SLIP_EST + config.MARGIN_OPEN_FEE_ALT
+    _tp_gross_pct = (analysis.price - take_profit) / analysis.price
+    if _tp_gross_pct < _min_cost_pct * 1.3:
+        logger.info(
+            "%s: SHORT SKIP gate=tp_stretto (TP gross=%.2f%% < min=%.2f%%, ATR=%.6f)",
+            analysis.pair, _tp_gross_pct * 100, _min_cost_pct * 1.3 * 100, atr,
+        )
+        return None
+
     return Signal(
         id=str(uuid.uuid4())[:8],
         pair=analysis.pair,
@@ -345,6 +377,10 @@ def generate_short_signal(
         score=score,
         reasons=reasons,
         base_currency=_base_currency(analysis.pair),
+        rsi_4h=analysis.rsi_4h,
+        rsi_daily=analysis.rsi_daily,
+        macd_hist_prev=analysis.macd_hist_prev,
+        rsi_1h_prev=analysis.rsi_1h_prev,
     )
 
 

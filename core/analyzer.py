@@ -72,6 +72,7 @@ class Analysis:
     rsi_daily: float = 50.0
     daily_above_ema50: bool = True
     price_change_24h: float = 0.0
+    rsi_1h_prev: float = 50.0   # RSI(1h) computed 3 candles ago — used for slope/direction detection
 
     candles_1h: list = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
@@ -235,6 +236,7 @@ def analyze(pair: str) -> Optional[Analysis]:
         volumes_1h = [c["volume"] for c in candles_1h]
 
         rsi_1h = _rsi(closes_1h, config.RSI_PERIOD)
+        rsi_1h_prev = round(_rsi(closes_1h[:-3], config.RSI_PERIOD), 2)
 
         hist        = _macd_histogram(closes_1h, config.MACD_FAST, config.MACD_SLOW, config.MACD_SIGNAL)
         macd_h      = hist[-1] if hist else 0.0
@@ -288,6 +290,7 @@ def analyze(pair: str) -> Optional[Analysis]:
             low_24h=ticker["low_24h"],
             volume_24h=ticker["volume_24h"],
             rsi_1h=round(rsi_1h, 2),
+            rsi_1h_prev=rsi_1h_prev,
             macd_hist=macd_h,
             macd_hist_prev=macd_h_prev,
             ema20=ema20_series[-1] if ema20_series else ticker["last"],

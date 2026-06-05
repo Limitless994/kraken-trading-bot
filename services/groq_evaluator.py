@@ -60,16 +60,19 @@ def evaluate(signal: Signal, market_ctx: dict = None) -> tuple:
         size_min=config.AI_SIZE_MIN * 100,
     )
     reasons_text = "; ".join(signal.reasons)
+    rsi_slope    = round(signal.rsi_1h - signal.rsi_1h_prev, 1)
+    macd_slope   = signal.macd_hist - signal.macd_hist_prev
+    slope_label  = "⬆ in salita" if rsi_slope > 1 else ("⬇ in discesa" if rsi_slope < -1 else "→ piatto")
     user_msg = (
         f"Coppia: {signal.pair}\n"
         f"Prezzo: {signal.price:.6f} EUR\n"
         f"Size: {signal.size_eur:.2f}€ ({signal.size_crypto:.6f} {signal.base_currency})\n"
-        f"RSI(1h): {signal.rsi_1h:.1f}  |  RSI(15m): {signal.rsi_15m:.1f}\n"
-        f"MACD histogram: {signal.macd_hist:+.6f}\n"
+        f"RSI(1h): {signal.rsi_1h:.1f}  slope(3h): {rsi_slope:+.1f} ({slope_label})\n"
+        f"RSI(15m): {signal.rsi_15m:.1f}  |  RSI(4h): {signal.rsi_4h:.1f}  |  RSI(daily): {signal.rsi_daily:.1f}\n"
+        f"MACD histogram: {signal.macd_hist:+.6f}  slope: {macd_slope:+.6f}\n"
         f"Volume ratio: {signal.volume_ratio:.2f}×\n"
         f"ADX: {signal.adx:.1f}  |  ATR: {signal.atr:.6f}\n"
-        f"Score tecnico: {signal.score}/6\n"
-        f"Condizioni: {reasons_text}"
+        f"Condizioni tecniche: {reasons_text}"
     )
 
     # Aggiungi contesto mercato se disponibile

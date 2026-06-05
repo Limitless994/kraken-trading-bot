@@ -29,7 +29,7 @@ os.environ.setdefault("KRAKEN_API_SECRET", "")
 from core import config
 config.apply_profile("conservative")   # reset to known state regardless of active_profile.json
 from core.analyzer import Analysis, _adx, _atr, _ema, _macd_histogram, _rsi, _volume_ratio
-from core.strategy import Signal, generate_signal, kelly_size_pct
+from core.strategy import Signal, generate_signal, generate_short_signal, kelly_size_pct
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -70,6 +70,29 @@ def _make_signal(**overrides) -> Signal:
     )
     defaults.update(overrides)
     return Signal(**defaults)
+
+
+def _make_short_analysis(**overrides) -> Analysis:
+    """Analysis suitable for a SHORT signal: price below daily EMA50, bearish indicators."""
+    defaults = dict(
+        pair="DOGEEUR", price=0.07,
+        high_24h=0.075, low_24h=0.065, volume_24h=1_000_000.0,
+        rsi_1h=55.0,          # not oversold; above RSI_SHORT_MIN=42 (conservative)
+        rsi_1h_prev=58.0,     # falling (slope = -3) → short continuation, not bounce
+        macd_hist=-0.0001, macd_hist_prev=0.0001,  # bearish crossover
+        ema20=0.072, ema50=0.075,                   # price 0.07 < ema50 0.075 → below EMA50
+        volume_ratio=1.6,
+        rsi_15m=52.0,
+        adx=25.0,
+        atr=0.001,             # ATR 1.43% of price → 2.5×ATR = 3.57% TP distance > min 1.59%
+        ob_imbalance=0.40,     # bearish order book
+        rsi_4h=55.0,
+        rsi_daily=52.0,
+        daily_above_ema50=False,  # required: price must be below daily EMA50 for a SHORT
+        price_change_24h=-1.5,
+    )
+    defaults.update(overrides)
+    return Analysis(**defaults)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1321,6 +1344,94 @@ class TestReconcileOrders(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 22. FIX A — MINIMUM PROFIT GATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMinProfitGate(unittest.TestCase):
+    """generate_short_signal must reject signals where TP gross < round-trip costs × 1.3."""
+
+    def test_blocked_when_atr_too_tight(self):
+        # ATR=0.00025 → TP distance = 2.5×0.00025/0.07 = 0.89% < min 1.59% → SKIP
+        a = _make_short_analysis(price=0.07, atr=0.00025)
+        self.assertIsNone(generate_short_signal(a, 100.0))
+
+    def test_passes_with_adequate_atr(self):
+        # ATR=0.001 → TP distance = 2.5×0.001/0.07 = 3.57% > min 1.59% → OK
+        a = _make_short_analysis(price=0.07, atr=0.001)
+        sig = generate_short_signal(a, 100.0)
+        self.assertIsNotNone(sig, "Signal with adequate ATR should not be blocked by profit gate")
+
+    def test_tp_gross_pct_calculation(self):
+        # Verify the gate threshold formula: 2×taker + 2×slip_cap + margin_open = 1.22%, ×1.3 = 1.586%
+        _SLIP_EST = 0.002
+        min_cost = 2 * config.KRAKEN_TAKER_FEE + 2 * _SLIP_EST + config.MARGIN_OPEN_FEE_ALT
+        self.assertAlmostEqual(min_cost * 100, 1.22, places=1)
+        self.assertAlmostEqual(min_cost * 1.3 * 100, 1.586, places=2)
+
+    def test_blocked_at_boundary_atr(self):
+        # ATR exactly at boundary where TP% ≈ 1.59%: atr = 0.07 × 0.01586 / 2.5 = 0.000444
+        # Slightly below: 0.000440 → blocked
+        a = _make_short_analysis(price=0.07, atr=0.000440)
+        self.assertIsNone(generate_short_signal(a, 100.0))
+
+    def test_passes_at_boundary_atr(self):
+        # Slightly above boundary: 0.000460 → passes profit gate
+        a = _make_short_analysis(price=0.07, atr=0.000460)
+        sig = generate_short_signal(a, 100.0)
+        # Should not be blocked by profit gate; other gates may block, but not profit gate
+        # Check it's not None (all other conditions in _make_short_analysis are valid)
+        self.assertIsNotNone(sig)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 23. FIX B — RSI SLOPE (BOUNCE) FILTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRSISlopeFilter(unittest.TestCase):
+    """
+    SHORT Gate 5: when RSI(1h) < 42 and RSI is rising (slope > 3), skip signal.
+    This catches bounce patterns where RSI hit oversold and is recovering.
+    Only relevant when RSI_SHORT_MIN < 42 (moderate: 36, aggressive: 30).
+    """
+
+    def setUp(self):
+        # Lower RSI_SHORT_MIN so Gate 4 doesn't block RSI in 36-42 range
+        self._orig_rsi_min = config.RSI_SHORT_MIN
+        config.RSI_SHORT_MIN = 30
+
+    def tearDown(self):
+        config.RSI_SHORT_MIN = self._orig_rsi_min
+
+    def test_blocked_when_rsi_rising_from_oversold(self):
+        # RSI was 34, now 39 → slope = +5 > 3, RSI < 42 → bounce pattern → SKIP
+        a = _make_short_analysis(rsi_1h=39.0, rsi_1h_prev=34.0)
+        self.assertIsNone(generate_short_signal(a, 100.0))
+
+    def test_passes_when_rsi_falling_in_oversold(self):
+        # RSI was 44, now 39 → slope = -5 < 3 → still falling → NOT a bounce → OK
+        a = _make_short_analysis(rsi_1h=39.0, rsi_1h_prev=44.0)
+        sig = generate_short_signal(a, 100.0)
+        self.assertIsNotNone(sig, "Falling RSI (slope negative) must not trigger the bounce gate")
+
+    def test_passes_when_rsi_above_42_even_if_rising(self):
+        # RSI = 50 (above 42 threshold) → gate does not apply regardless of slope
+        a = _make_short_analysis(rsi_1h=50.0, rsi_1h_prev=46.0)  # slope +4 but RSI > 42
+        sig = generate_short_signal(a, 100.0)
+        self.assertIsNotNone(sig, "Gate only applies when RSI < 42; RSI=50 must not be blocked")
+
+    def test_passes_when_slope_below_threshold(self):
+        # RSI = 40, slope = +2.0 (below threshold of 3.0) → not classified as bounce
+        a = _make_short_analysis(rsi_1h=40.0, rsi_1h_prev=38.0)  # slope +2
+        sig = generate_short_signal(a, 100.0)
+        self.assertIsNotNone(sig, "Slope of +2 is below the +3 bounce threshold")
+
+    def test_blocked_exactly_at_threshold(self):
+        # RSI = 41, slope = +3.1 → just over threshold → SKIP
+        a = _make_short_analysis(rsi_1h=41.0, rsi_1h_prev=37.9)  # slope ≈ +3.1
+        self.assertIsNone(generate_short_signal(a, 100.0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Update TestGroqEvaluator to reset fallback counter between tests
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1367,6 +1478,7 @@ if __name__ == "__main__":
         TestKrakenRetry, TestGroqFallbackCounter,
         TestOHLCCache, TestAdaptiveSlippage,
         TestLimitOrderLock, TestShutdownHandler, TestReconcileOrders,
+        TestMinProfitGate, TestRSISlopeFilter,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
