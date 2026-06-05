@@ -21,13 +21,24 @@ _DYNAMIC_PAIRS_FILE = Path(__file__).parent / "dynamic_pairs.json"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+# Price cache: avoids hitting Kraken on every SSE event from multiple tabs.
+# TTL slightly below the 10-second SSE interval so data stays fresh.
+_price_cache: dict = {}   # {pair: (price, timestamp)}
+_PRICE_CACHE_TTL = 8.0    # seconds
+
+
 def _fetch_price(pair: str):
+    now = time.time()
+    cached = _price_cache.get(pair)
+    if cached and now - cached[1] < _PRICE_CACHE_TTL:
+        return cached[0]
     try:
         r = requests.get(f"https://api.kraken.com/0/public/Ticker?pair={pair}", timeout=3)
-        result = r.json()["result"]
-        return float(result[next(iter(result))]["c"][0])
+        price = float(r.json()["result"][next(iter(r.json()["result"]))]["c"][0])
+        _price_cache[pair] = (price, now)
+        return price
     except Exception:
-        return None
+        return cached[0] if cached else None
 
 
 def _fetch_prices_concurrent(pairs: list) -> dict:

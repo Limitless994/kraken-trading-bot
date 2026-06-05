@@ -16,6 +16,11 @@ from core.strategy import Signal
 logger = logging.getLogger(__name__)
 
 _client: Groq = None
+_consecutive_fallbacks: int = 0
+
+
+class GroqUnavailableError(Exception):
+    """Raised when Groq fails 3 or more consecutive times."""
 
 
 def _get_client() -> Groq:
@@ -34,8 +39,10 @@ def _size_pct(confidence: int) -> float:
 def evaluate(signal: Signal, market_ctx: dict = None) -> tuple:
     """
     Returns (execute: bool, confidence: int, reason: str, size_pct: float).
-    Falls back to (True, 6, reason, AI_SIZE_MIN) if Groq is unavailable.
+    Falls back to (True, 6, reason, AI_SIZE_MIN) if Groq is unavailable (<3 consecutive).
+    Raises GroqUnavailableError after 3 consecutive failures.
     """
+    global _consecutive_fallbacks
     is_short = signal.direction == "SELL"
     if is_short:
         tp_pct = (1 - signal.take_profit / signal.price) * 100 if signal.price > 0 else config.TAKE_PROFIT_PCT * 100
@@ -128,8 +135,17 @@ def evaluate(signal: Signal, market_ctx: dict = None) -> tuple:
             )
             return False, confidence, f"confidenza {confidence}/10 sotto soglia ({config.GROQ_MIN_CONFIDENCE})", 0.0
 
+        _consecutive_fallbacks = 0
         return execute, confidence, reason, _size_pct(confidence) if execute else 0.0
 
     except Exception as exc:
-        logger.error("Groq non disponibile per %s: %s — eseguo", signal.pair, exc)
+        _consecutive_fallbacks += 1
+        logger.error(
+            "Groq non disponibile per %s: %s — fallback consecutivo %d",
+            signal.pair, exc, _consecutive_fallbacks,
+        )
+        if _consecutive_fallbacks >= 3:
+            raise GroqUnavailableError(
+                f"Groq non raggiungibile da {_consecutive_fallbacks} tentativi consecutivi"
+            ) from exc
         return True, 6, f"Groq offline — eseguito (score {signal.score}/6)", config.AI_SIZE_MIN

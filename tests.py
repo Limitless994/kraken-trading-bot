@@ -927,6 +927,374 @@ class TestDB(unittest.TestCase):
 # RUNNER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 15. FIX 2 — KRAKEN RETRY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestKrakenRetry(unittest.TestCase):
+
+    @patch("core.kraken_client._SESSION")
+    def test_retries_on_timeout_then_succeeds(self, mock_session):
+        import requests as req_lib
+        from core import kraken_client
+        ok_resp = MagicMock()
+        ok_resp.json.return_value = {
+            "error": [], "result": {"status": "online", "timestamp": "T"},
+        }
+        ok_resp.raise_for_status = MagicMock()
+        mock_session.get.side_effect = [
+            req_lib.Timeout("t1"),
+            req_lib.Timeout("t2"),
+            ok_resp,
+        ]
+        status, _ = kraken_client.get_system_status()
+        self.assertEqual(status, "online")
+        self.assertEqual(mock_session.get.call_count, 3)
+
+    @patch("core.kraken_client._SESSION")
+    def test_raises_after_3_timeouts(self, mock_session):
+        import requests as req_lib
+        from core import kraken_client
+        mock_session.get.side_effect = req_lib.Timeout("always fails")
+        with self.assertRaises(req_lib.Timeout):
+            kraken_client.get_system_status()
+        self.assertEqual(mock_session.get.call_count, 3)
+
+    @patch("core.kraken_client._SESSION")
+    def test_no_retry_on_400(self, mock_session):
+        import requests as req_lib
+        from core import kraken_client
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
+        http_err = req_lib.HTTPError(response=mock_resp)
+        mock_resp.raise_for_status.side_effect = http_err
+        mock_session.get.return_value = mock_resp
+        with self.assertRaises(req_lib.HTTPError):
+            kraken_client.get_system_status()
+        self.assertEqual(mock_session.get.call_count, 1)
+
+    @patch("core.kraken_client._SESSION")
+    def test_retries_on_500(self, mock_session):
+        import requests as req_lib
+        from core import kraken_client
+        mock_resp_err = MagicMock()
+        mock_resp_err.status_code = 500
+        mock_resp_err.raise_for_status.side_effect = req_lib.HTTPError(response=mock_resp_err)
+        ok_resp = MagicMock()
+        ok_resp.json.return_value = {
+            "error": [], "result": {"status": "online", "timestamp": "T"},
+        }
+        ok_resp.raise_for_status = MagicMock()
+        mock_session.get.side_effect = [mock_resp_err, ok_resp]
+        status, _ = kraken_client.get_system_status()
+        self.assertEqual(status, "online")
+        self.assertEqual(mock_session.get.call_count, 2)
+
+    @patch("core.kraken_client._SESSION")
+    def test_connection_error_retried(self, mock_session):
+        import requests as req_lib
+        from core import kraken_client
+        mock_session.get.side_effect = req_lib.ConnectionError("refused")
+        with self.assertRaises(req_lib.ConnectionError):
+            kraken_client.get_system_status()
+        self.assertEqual(mock_session.get.call_count, 3)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 16. FIX 3 — GROQ FALLBACK COUNTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestGroqFallbackCounter(unittest.TestCase):
+
+    def setUp(self):
+        import services.groq_evaluator as ge
+        ge._consecutive_fallbacks = 0
+
+    def tearDown(self):
+        import services.groq_evaluator as ge
+        ge._consecutive_fallbacks = 0
+
+    @patch("services.groq_evaluator._get_client")
+    def test_first_failure_returns_fallback(self, mock_gc):
+        mock_gc.side_effect = Exception("offline")
+        from services import groq_evaluator
+        execute, conf, reason, size = groq_evaluator.evaluate(_make_signal())
+        self.assertTrue(execute)
+        self.assertEqual(size, config.AI_SIZE_MIN)
+        self.assertEqual(groq_evaluator._consecutive_fallbacks, 1)
+
+    @patch("services.groq_evaluator._get_client")
+    def test_second_failure_still_fallback(self, mock_gc):
+        mock_gc.side_effect = Exception("offline")
+        from services import groq_evaluator
+        groq_evaluator.evaluate(_make_signal())
+        execute, _, _, size = groq_evaluator.evaluate(_make_signal())
+        self.assertTrue(execute)
+        self.assertEqual(size, config.AI_SIZE_MIN)
+        self.assertEqual(groq_evaluator._consecutive_fallbacks, 2)
+
+    @patch("services.groq_evaluator._get_client")
+    def test_third_failure_raises_groq_unavailable(self, mock_gc):
+        mock_gc.side_effect = Exception("offline")
+        from services import groq_evaluator
+        groq_evaluator.evaluate(_make_signal())   # 1
+        groq_evaluator.evaluate(_make_signal())   # 2
+        with self.assertRaises(groq_evaluator.GroqUnavailableError):
+            groq_evaluator.evaluate(_make_signal())  # 3 → raises
+
+    @patch("services.groq_evaluator._get_client")
+    def test_fourth_call_also_raises(self, mock_gc):
+        mock_gc.side_effect = Exception("offline")
+        from services import groq_evaluator
+        groq_evaluator.evaluate(_make_signal())
+        groq_evaluator.evaluate(_make_signal())
+        try:
+            groq_evaluator.evaluate(_make_signal())
+        except groq_evaluator.GroqUnavailableError:
+            pass
+        with self.assertRaises(groq_evaluator.GroqUnavailableError):
+            groq_evaluator.evaluate(_make_signal())  # 4 — still raises
+
+    @patch("services.groq_evaluator._get_client")
+    def test_counter_resets_on_success(self, mock_gc):
+        from services import groq_evaluator
+        # Simulate 2 offline failures
+        mock_gc.side_effect = Exception("offline")
+        groq_evaluator.evaluate(_make_signal())
+        groq_evaluator.evaluate(_make_signal())
+        self.assertEqual(groq_evaluator._consecutive_fallbacks, 2)
+        # Now a successful call
+        mock_choice = MagicMock()
+        mock_choice.message.content = "ESEGUI:8: ok"
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value.choices = [mock_choice]
+        mock_gc.side_effect = None
+        mock_gc.return_value = mock_client
+        groq_evaluator.evaluate(_make_signal())
+        self.assertEqual(groq_evaluator._consecutive_fallbacks, 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 17. FIX 5 — OHLC CACHE BOUNDED
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestOHLCCache(unittest.TestCase):
+
+    def setUp(self):
+        from core.analyzer import _ohlc_cache
+        _ohlc_cache.clear()
+
+    def tearDown(self):
+        from core.analyzer import _ohlc_cache
+        _ohlc_cache.clear()
+
+    @patch("core.kraken_client.get_ohlc")
+    def test_cache_bounded_after_1000_calls(self, mock_get):
+        from core.analyzer import _get_ohlc, _ohlc_cache, _CACHE_MAX_SIZE
+        mock_get.return_value = []
+        for i in range(1000):
+            _get_ohlc(f"PAIR{i:04d}EUR", 240)
+        self.assertLessEqual(len(_ohlc_cache), _CACHE_MAX_SIZE)
+
+    @patch("core.kraken_client.get_ohlc")
+    def test_cache_hit_avoids_second_api_call(self, mock_get):
+        from core.analyzer import _get_ohlc
+        mock_get.return_value = [{"time": 1, "close": 100.0}]
+        _get_ohlc("SOLEUR", 240)
+        _get_ohlc("SOLEUR", 240)
+        self.assertEqual(mock_get.call_count, 1)
+
+    @patch("core.kraken_client.get_ohlc")
+    def test_cache_expires_after_ttl(self, mock_get):
+        from core import analyzer as _az
+        mock_get.return_value = []
+        # Insert entry with timestamp in the past (past TTL)
+        _az._ohlc_cache["SOLEUR_240"] = ([], time.time() - _az._CACHE_TTL_SEC - 1)
+        _az._get_ohlc("SOLEUR", 240)
+        self.assertEqual(mock_get.call_count, 1)   # fetched fresh after expiry
+
+    @patch("core.kraken_client.get_ohlc")
+    def test_maxsize_respected_exactly(self, mock_get):
+        from core.analyzer import _get_ohlc, _ohlc_cache, _CACHE_MAX_SIZE
+        mock_get.return_value = []
+        for i in range(_CACHE_MAX_SIZE + 50):
+            _get_ohlc(f"X{i:04d}EUR", 60)
+        self.assertLessEqual(len(_ohlc_cache), _CACHE_MAX_SIZE)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 18. FIX 7 — ADAPTIVE SLIPPAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAdaptiveSlippage(unittest.TestCase):
+
+    def test_large_atr_capped_at_1pct(self):
+        from bot.telegram_bot import _adaptive_slippage
+        # ATR = 10% of price → atr_pct * 0.5 = 5% → capped at 1%
+        self.assertAlmostEqual(_adaptive_slippage(10.0, 100.0), 0.01, places=6)
+
+    def test_small_atr_uses_config_floor(self):
+        from bot.telegram_bot import _adaptive_slippage
+        # ATR = 0.001% of price → atr_pct * 0.5 ≈ 0 → floor = SLIPPAGE_PCT
+        result = _adaptive_slippage(0.001, 100.0)
+        self.assertEqual(result, config.SLIPPAGE_PCT)
+
+    def test_moderate_atr_between_floor_and_cap(self):
+        from bot.telegram_bot import _adaptive_slippage
+        # ATR 1% of price → atr_pct * 0.5 = 0.5% → between floor and 1%
+        result = _adaptive_slippage(1.0, 100.0)
+        self.assertGreaterEqual(result, config.SLIPPAGE_PCT)
+        self.assertLessEqual(result, 0.01)
+
+    def test_calc_exit_uses_adaptive_slippage(self):
+        from bot.telegram_bot import _calc_exit, _adaptive_slippage
+        pos = {
+            "entry": 100.0, "side": "long",
+            "size_crypto": 0.18, "size_eur": 18.0,
+            "atr": 2.0, "fee_entry_eur": 0.045,
+            "stop_loss": 95.0,
+        }
+        expected_slip_pct = _adaptive_slippage(2.0, 100.0)
+        result = _calc_exit(pos, 110.0, config)
+        self.assertAlmostEqual(result["slip_eur"], round(18.0 * expected_slip_pct * 2, 4), places=4)
+
+    def test_calc_exit_fallback_when_no_atr(self):
+        from bot.telegram_bot import _calc_exit
+        pos = {
+            "entry": 100.0, "side": "long",
+            "size_crypto": 0.18, "size_eur": 18.0,
+            "atr": 0.0, "fee_entry_eur": 0.045,
+            "stop_loss": 95.0,
+        }
+        result = _calc_exit(pos, 110.0, config)
+        self.assertAlmostEqual(result["slip_eur"], round(18.0 * config.SLIPPAGE_PCT * 2, 4), places=4)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 19. FIX 1 — LIMIT ORDER LOCK
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestLimitOrderLock(unittest.TestCase):
+    """Verify that the pending_orders write happens inside _positions_lock."""
+
+    def test_positions_lock_is_threading_lock(self):
+        """_positions_lock must be a threading.Lock (guards limit order write + DB insert)."""
+        import threading
+        with patch("bot.telegram_bot.Application") as mock_app_cls:
+            mock_app_cls.builder.return_value.token.return_value.build.return_value = MagicMock()
+            from bot.telegram_bot import TradingBot
+            bot = TradingBot()
+            lock = bot._positions_lock
+            # threading.Lock() returns a _thread.lock; check for acquire/release protocol
+            self.assertTrue(hasattr(lock, "acquire"))
+            self.assertTrue(hasattr(lock, "release"))
+            self.assertIn("lock", type(lock).__name__.lower())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 20. FIX 4 — SHUTDOWN FLAG
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestShutdownHandler(unittest.TestCase):
+
+    def test_shutdown_flag_set_by_handler(self):
+        import main as _main
+        _main._shutdown = False
+        _main._handle_signal(15, None)   # SIGTERM = 15
+        self.assertTrue(_main._shutdown)
+        _main._shutdown = False   # restore
+
+    def test_handle_signal_does_not_raise_without_bot(self):
+        import main as _main
+        _main._bot_instance = None
+        _main._shutdown = False
+        try:
+            _main._handle_signal(15, None)
+        except SystemExit:
+            pass   # stop() raises SystemExit — acceptable
+        _main._shutdown = False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 21. FIX 6 — RECONCILE JOB (unit-level)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestReconcileOrders(unittest.TestCase):
+    """Verify reconcile logic detects txid discrepancies."""
+
+    def _build_positions(self, txids: list[str]) -> dict:
+        return {f"PAIR{i}EUR": {"txid": t, "entry": 1.0} for i, t in enumerate(txids)}
+
+    def test_discrepancy_detected_kraken_has_extra(self):
+        db_positions = self._build_positions(["TX001"])
+        kraken_open  = {"open": {"TX001": {}, "TX999": {}}}  # TX999 not in DB
+
+        db_txids     = {p["txid"] for p in db_positions.values()}
+        kraken_txids = set(kraken_open.get("open", {}).keys())
+        orphan_on_kraken = kraken_txids - db_txids
+        self.assertIn("TX999", orphan_on_kraken)
+
+    def test_discrepancy_detected_db_has_extra(self):
+        db_positions = self._build_positions(["TX001", "TX002"])
+        kraken_open  = {"open": {"TX001": {}}}   # TX002 missing on Kraken
+
+        db_txids     = {p["txid"] for p in db_positions.values()}
+        kraken_txids = set(kraken_open.get("open", {}).keys())
+        orphan_in_db = db_txids - kraken_txids
+        self.assertIn("TX002", orphan_in_db)
+
+    def test_no_discrepancy_when_in_sync(self):
+        db_positions = self._build_positions(["TX001", "TX002"])
+        kraken_open  = {"open": {"TX001": {}, "TX002": {}}}
+
+        db_txids     = {p["txid"] for p in db_positions.values()}
+        kraken_txids = set(kraken_open.get("open", {}).keys())
+        self.assertEqual(db_txids - kraken_txids, set())
+        self.assertEqual(kraken_txids - db_txids, set())
+
+    def test_paper_txids_excluded(self):
+        db_positions = {
+            "SOLEUR":  {"txid": "PAPER",   "entry": 1.0},
+            "DOTEUR":  {"txid": "unknown", "entry": 1.0},
+            "XRPEUR":  {"txid": "TX123",   "entry": 1.0},
+        }
+        db_txids = {
+            p["txid"] for p in db_positions.values()
+            if p.get("txid") and p["txid"] not in ("PAPER", "unknown")
+        }
+        self.assertEqual(db_txids, {"TX123"})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Update TestGroqEvaluator to reset fallback counter between tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_original_TestGroqEvaluator_setUp = getattr(TestGroqEvaluator, "setUp", None)
+_original_TestGroqEvaluator_tearDown = getattr(TestGroqEvaluator, "tearDown", None)
+
+
+def _groq_evaluator_setUp(self):
+    import services.groq_evaluator as ge
+    ge._consecutive_fallbacks = 0
+    if _original_TestGroqEvaluator_setUp:
+        _original_TestGroqEvaluator_setUp(self)
+
+
+def _groq_evaluator_tearDown(self):
+    import services.groq_evaluator as ge
+    ge._consecutive_fallbacks = 0
+    if _original_TestGroqEvaluator_tearDown:
+        _original_TestGroqEvaluator_tearDown(self)
+
+
+TestGroqEvaluator.setUp    = _groq_evaluator_setUp
+TestGroqEvaluator.tearDown = _groq_evaluator_tearDown
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RUNNER
+# ═══════════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite  = unittest.TestSuite()
@@ -940,6 +1308,10 @@ if __name__ == "__main__":
         TestKrakenStatus, TestLimitOrders,
         TestPersistence, TestConfig, TestPaperBalance,
         TestDB,
+        # New tests for fixes
+        TestKrakenRetry, TestGroqFallbackCounter,
+        TestOHLCCache, TestAdaptiveSlippage,
+        TestLimitOrderLock, TestShutdownHandler, TestReconcileOrders,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

@@ -8,6 +8,7 @@ Private methods (auth required): get_balance, add_order, cancel_order,
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import hmac
 import time
@@ -21,9 +22,43 @@ BASE_URL = "https://api.kraken.com"
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "KrakenTradingBot/1.0"})
 
+import logging as _logging
+_kc_logger = _logging.getLogger(__name__)
+
+
+def _with_retry(func):
+    """Retry transient Kraken errors: max 3 attempts, backoff 0.2→0.4→0.8 s.
+
+    Retries on: requests.Timeout, requests.ConnectionError, HTTP 5xx.
+    Does NOT retry on HTTP 4xx (logical client errors).
+    After the 3rd failure the original exception is re-raised.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        delay = 0.2
+        last_exc = None
+        for attempt in range(3):
+            try:
+                return func(*args, **kwargs)
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last_exc = exc
+                _kc_logger.warning("%s: transient error (attempt %d/3): %s", func.__name__, attempt + 1, exc)
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code >= 500:
+                    last_exc = exc
+                    _kc_logger.warning("%s: HTTP %d (attempt %d/3)", func.__name__, exc.response.status_code, attempt + 1)
+                else:
+                    raise   # 4xx — logic error, do not retry
+            if attempt < 2:
+                time.sleep(delay)
+                delay *= 2
+        raise last_exc
+    return wrapper
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+@_with_retry
 def _public(endpoint: str, params: dict | None = None) -> dict:
     url = f"{BASE_URL}/0/public/{endpoint}"
     resp = _SESSION.get(url, params=params or {}, timeout=10)
@@ -45,6 +80,7 @@ def _sign(api_path: str, post_data_str: str, nonce: str) -> str:
     ).decode()
 
 
+@_with_retry
 def _private(endpoint: str, params: dict | None = None) -> dict:
     if not config.KRAKEN_API_KEY or not config.KRAKEN_API_SECRET:
         raise RuntimeError("Kraken API credentials not set in .env")
@@ -192,7 +228,21 @@ def add_order(
         params["validate"] = "true"
     if leverage:
         params["leverage"] = str(leverage)
-    return _private("AddOrder", params)
+    try:
+        return _private("AddOrder", params)
+    except Exception as exc:
+        _kc_logger.error("add_order(%s %s) failed after retries: %s — checking for ghost orders", side, pair, exc)
+        try:
+            open_data = get_open_orders()
+            open_ids = list(open_data.get("open", {}).keys())
+            if open_ids:
+                _kc_logger.warning(
+                    "add_order failed but %d open order(s) found on Kraken — verify manually: %s",
+                    len(open_ids), open_ids,
+                )
+        except Exception as check_exc:
+            _kc_logger.debug("Cannot verify open orders after add_order failure: %s", check_exc)
+        raise
 
 
 def cancel_order(txid: str) -> dict:

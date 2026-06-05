@@ -2,8 +2,24 @@
 main.py — Entry point for the Kraken + Telegram trading bot.
 """
 import logging
+import signal
 import sys
 import traceback
+
+_shutdown = False
+_bot_instance = None
+
+
+def _handle_signal(signum, frame):
+    global _shutdown
+    _shutdown = True
+    logging.getLogger(__name__).info("Shutdown richiesto (signal %s)", signum)
+    if _bot_instance is not None:
+        _bot_instance.stop()
+
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
 
 def _setup_logging(log_dir: "Path") -> None:
     from logging.handlers import RotatingFileHandler
@@ -107,10 +123,13 @@ def main() -> None:
 
     from bot.telegram_bot import TradingBot
     try:
+        global _bot_instance
         bot = TradingBot()
+        _bot_instance = bot
         bot.run()
-    except KeyboardInterrupt:
-        logger.info("Bot fermato manualmente.")
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot fermato.")
+        sys.exit(0)
     except Exception as exc:
         logger.critical("CRASH: %s", exc, exc_info=True)
         _notify_crash(exc)

@@ -39,6 +39,7 @@ from core import config, db, kraken_client, market_data
 from core.analyzer import analyze
 from core.strategy import Signal, generate_signal, generate_short_signal, kelly_size_pct
 from services import discovery, groq_evaluator
+from services.groq_evaluator import GroqUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,12 @@ def _check_exit_signals(pos: dict, current: float) -> tuple:
     return current >= pos["take_profit"], current <= effective_sl
 
 
+def _adaptive_slippage(atr: float, price: float) -> float:
+    """Slippage estimate based on current ATR; capped at 1%, floored at config value."""
+    atr_pct = atr / price
+    return max(config.SLIPPAGE_PCT, min(atr_pct * 0.5, 0.01))
+
+
 def _calc_exit(pos: dict, exit_price: float, cfg, current_ts: float = None) -> dict:
     """Calculate net P&L for closing a position. current_ts defaults to time.time()."""
     if current_ts is None:
@@ -126,7 +133,10 @@ def _calc_exit(pos: dict, exit_price: float, cfg, current_ts: float = None) -> d
     ) * pos["size_crypto"]
     fee_exit     = round(exit_price * pos["size_crypto"] * cfg.KRAKEN_TAKER_FEE, 4)
     fee_entry    = pos.get("fee_entry_eur", 0.0)
-    slip_eur     = round(pos["size_eur"] * cfg.SLIPPAGE_PCT * 2, 4)
+    atr          = pos.get("atr", 0.0)
+    entry        = pos.get("entry", 0.0)
+    slip_pct     = _adaptive_slippage(atr, entry) if atr > 0 and entry > 0 else cfg.SLIPPAGE_PCT
+    slip_eur     = round(pos["size_eur"] * slip_pct * 2, 4)
     funding_cost = _funding_cost_eur_pure(pos, current_ts)
     net_pnl_eur  = gross_pnl_eur - fee_entry - fee_exit - slip_eur - funding_cost
     size_eur     = pos["size_eur"]
@@ -394,18 +404,19 @@ class TradingBot:
                 txid  = txids[0] if txids else "unknown"
                 descr = result.get("descr", {}).get("order", "")
                 actual_price = limit_price
-                pending = _load_json(PENDING_ORDERS_FILE, {})
-                pending[signal.pair] = {
-                    "txid": txid, "limit_price": limit_price,
-                    "signal_id": signal.id, "size_eur": signal.size_eur,
-                    "size_crypto": signal.size_crypto, "placed_at": time.time(),
-                    "timeout_at": time.time() + config.LIMIT_TIMEOUT_SEC,
-                    "take_profit": signal.take_profit, "stop_loss": signal.stop_loss,
-                    "trailing_stop": signal.trailing_stop,
-                }
-                PENDING_ORDERS_FILE.write_text(
-                    json.dumps(pending, indent=2), encoding="utf-8"
-                )
+                with self._positions_lock:
+                    pending = _load_json(PENDING_ORDERS_FILE, {})
+                    pending[signal.pair] = {
+                        "txid": txid, "limit_price": limit_price,
+                        "signal_id": signal.id, "size_eur": signal.size_eur,
+                        "size_crypto": signal.size_crypto, "placed_at": time.time(),
+                        "timeout_at": time.time() + config.LIMIT_TIMEOUT_SEC,
+                        "take_profit": signal.take_profit, "stop_loss": signal.stop_loss,
+                        "trailing_stop": signal.trailing_stop,
+                    }
+                    PENDING_ORDERS_FILE.write_text(
+                        json.dumps(pending, indent=2), encoding="utf-8"
+                    )
                 await self.app.bot.send_message(
                     chat_id=config.TELEGRAM_CHAT_ID,
                     text=(
@@ -620,9 +631,17 @@ class TradingBot:
                 signal.pair, signal.score, signal.adx, signal.price,
             )
 
-            execute, confidence, reason, size_pct = await asyncio.to_thread(
-                groq_evaluator.evaluate, signal, mkt_ctx
-            )
+            try:
+                execute, confidence, reason, size_pct = await asyncio.to_thread(
+                    groq_evaluator.evaluate, signal, mkt_ctx
+                )
+            except GroqUnavailableError as exc:
+                logger.warning("Groq non disponibile — segnale %s skippato: %s", signal.pair, exc)
+                await self.app.bot.send_message(
+                    chat_id=config.TELEGRAM_CHAT_ID,
+                    text=f"GROQ NON DISPONIBILE — {signal.pair} skippato\n{exc}",
+                )
+                continue
 
             effective_size_pct = min(kelly_pct, size_pct) if kelly_pct else size_pct
 
@@ -718,9 +737,17 @@ class TradingBot:
                 signal.pair, signal.score, signal.adx, signal.price,
             )
 
-            execute, confidence, reason, size_pct = await asyncio.to_thread(
-                groq_evaluator.evaluate, signal, mkt_ctx
-            )
+            try:
+                execute, confidence, reason, size_pct = await asyncio.to_thread(
+                    groq_evaluator.evaluate, signal, mkt_ctx
+                )
+            except GroqUnavailableError as exc:
+                logger.warning("Groq non disponibile — segnale SHORT %s skippato: %s", signal.pair, exc)
+                await self.app.bot.send_message(
+                    chat_id=config.TELEGRAM_CHAT_ID,
+                    text=f"GROQ NON DISPONIBILE — SHORT {signal.pair} skippato\n{exc}",
+                )
+                continue
 
             effective_size_pct = min(kelly_pct, size_pct) if kelly_pct else size_pct
 
@@ -1113,6 +1140,39 @@ class TradingBot:
             ),
         )
 
+    async def _job_reconcile_orders(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Compare Kraken open orders vs DB positions every 60 min and report discrepancies."""
+        if config.PAPER_TRADING:
+            return
+        try:
+            kraken_data = await asyncio.to_thread(kraken_client.get_open_orders)
+            kraken_txids = set(kraken_data.get("open", {}).keys())
+        except Exception as exc:
+            logger.error("Reconcile: impossibile recuperare ordini Kraken: %s", exc)
+            return
+
+        db_positions = db.get_positions()
+        db_txids = {
+            pos.get("txid") for pos in db_positions.values()
+            if pos.get("txid") and pos.get("txid") not in ("PAPER", "unknown")
+        }
+
+        orphan_on_kraken = kraken_txids - db_txids
+        orphan_in_db = db_txids - kraken_txids
+
+        issues: list[str] = []
+        if orphan_on_kraken:
+            issues.append(f"Ordini su Kraken non in DB: {', '.join(sorted(orphan_on_kraken))}")
+        if orphan_in_db:
+            issues.append(f"Posizioni in DB non su Kraken (possibilmente chiuse): {', '.join(sorted(orphan_in_db))}")
+
+        if issues:
+            msg = "RICONCILIAZIONE ORDINI — discrepanze rilevate:\n" + "\n".join(issues)
+            logger.warning("Reconcile: %s", " | ".join(issues))
+            await self.app.bot.send_message(chat_id=config.TELEGRAM_CHAT_ID, text=msg)
+        else:
+            logger.info("Reconcile: nessuna discrepanza (Kraken=%d, DB=%d)", len(kraken_txids), len(db_txids))
+
     async def _job_process_commands(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Process commands queued by the web dashboard."""
         try:
@@ -1234,9 +1294,15 @@ class TradingBot:
                 evaluated.append(f"• {pair}: gate live non superati")
                 continue
 
-            execute, confidence, reason, size_pct = await asyncio.to_thread(
-                groq_evaluator.evaluate, signal, mkt_ctx
-            )
+            try:
+                execute, confidence, reason, size_pct = await asyncio.to_thread(
+                    groq_evaluator.evaluate, signal, mkt_ctx
+                )
+            except GroqUnavailableError as exc:
+                logger.warning("Groq non disponibile — discovery %s skippato: %s", pair, exc)
+                evaluated.append(f"• {pair}: Groq non disponibile — {exc}")
+                continue
+
             effective_size_pct = min(kelly_pct, size_pct) if kelly_pct else size_pct
 
             if execute and effective_size_pct > 0:
@@ -1284,6 +1350,12 @@ class TradingBot:
                 text="DISCOVERY — nessun candidato supera i gate live al momento.",
             )
 
+    def stop(self) -> None:
+        """Request graceful shutdown. Called from the SIGTERM/SIGINT handler."""
+        logger.info("TradingBot.stop() — shutdown in corso")
+        import sys
+        sys.exit(0)
+
     def run(self) -> None:
         jq = self.app.job_queue
         jq.run_repeating(
@@ -1309,6 +1381,12 @@ class TradingBot:
             interval=15,
             first=15,
             name="dashboard_commands",
+        )
+        jq.run_repeating(
+            self._job_reconcile_orders,
+            interval=3600,
+            first=3600,
+            name="reconcile_orders",
         )
         jq.run_daily(
             self._job_discovery,

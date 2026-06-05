@@ -15,21 +15,34 @@ from . import config, kraken_client, market_data
 
 logger = logging.getLogger(__name__)
 
-# Cache OHLC for slow intervals (4h and daily change infrequently)
-_ohlc_cache: dict = {}
-_OHLC_TTL = {240: 1800, 1440: 7200}   # 4h: 30 min  |  daily: 2 ore
+# Bounded OHLC cache: max 200 entries, 16-minute TTL (slightly above default scan interval).
+# Purges expired entries on every access; evicts the oldest entry when at capacity.
+_CACHE_TTL_SEC  = 960   # 16 minutes
+_CACHE_MAX_SIZE = 200   # 10 pairs × 4 timeframes × 5 rotation slots
+_ohlc_cache: dict = {}  # {key: (data, insert_timestamp)}
 
 
 def _get_ohlc(pair: str, interval: int) -> list:
+    now = time.time()
+    # Purge all expired entries before each access
+    expired = [k for k, (_, ts) in list(_ohlc_cache.items()) if now - ts >= _CACHE_TTL_SEC]
+    for k in expired:
+        del _ohlc_cache[k]
+
     key = f"{pair}_{interval}"
-    ttl = _OHLC_TTL.get(interval, 0)
-    if ttl:
-        now = time.time()
-        if key in _ohlc_cache and now - _ohlc_cache[key]["ts"] < ttl:
-            return _ohlc_cache[key]["data"]
+    if key in _ohlc_cache:
+        data, ts = _ohlc_cache[key]
+        if now - ts < _CACHE_TTL_SEC:
+            return data
+
     data = kraken_client.get_ohlc(pair, interval=interval)
-    if ttl:
-        _ohlc_cache[key] = {"ts": time.time(), "data": data}
+
+    # Evict oldest entry if at capacity
+    if len(_ohlc_cache) >= _CACHE_MAX_SIZE:
+        oldest_key = min(_ohlc_cache, key=lambda k: _ohlc_cache[k][1])
+        del _ohlc_cache[oldest_key]
+
+    _ohlc_cache[key] = (data, time.time())
     return data
 
 
