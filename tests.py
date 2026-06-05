@@ -1426,9 +1426,20 @@ class TestRSISlopeFilter(unittest.TestCase):
         self.assertIsNotNone(sig, "Slope of +2 is below the +3 bounce threshold")
 
     def test_blocked_exactly_at_threshold(self):
-        # RSI = 41, slope = +3.1 → just over threshold → SKIP
+        # RSI = 41, slope = +3.1 → just over threshold (3.0) for RSI 38-42 → SKIP
         a = _make_short_analysis(rsi_1h=41.0, rsi_1h_prev=37.9)  # slope ≈ +3.1
         self.assertIsNone(generate_short_signal(a, 100.0))
+
+    def test_deep_oversold_blocked_with_small_slope(self):
+        # RSI = 36 (< 38) → threshold drops to 1.0; slope = +1.5 → SKIP even though < 3
+        a = _make_short_analysis(rsi_1h=36.0, rsi_1h_prev=34.5)  # slope +1.5
+        self.assertIsNone(generate_short_signal(a, 100.0))
+
+    def test_deep_oversold_passes_when_falling(self):
+        # RSI = 36 and still falling (slope = -4) → valid short continuation, not a bounce
+        a = _make_short_analysis(rsi_1h=36.0, rsi_1h_prev=40.0)  # slope -4
+        sig = generate_short_signal(a, 100.0)
+        self.assertIsNotNone(sig, "Falling RSI from 40→36 is short continuation, must not be blocked")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

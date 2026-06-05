@@ -277,13 +277,15 @@ def generate_short_signal(
         return None
 
     # Gate 5: RSI slope — reject if RSI is bouncing from oversold territory.
-    # Pattern: RSI hit low (e.g. 31) and is now recovering (e.g. 38) = buyers stepping in.
-    # Threshold: RSI < 42 and rising by >3 points over last 3h = clear bounce, not short continuation.
+    # Pattern: RSI hit low (e.g. 31) and is now recovering = buyers stepping in.
+    # When RSI < 38 (deeply oversold) even a small positive slope (+1) = likely bounce.
+    # When RSI 38-42 (mildly oversold) require a stronger slope (+3) before flagging a bounce.
     rsi_slope = analysis.rsi_1h - analysis.rsi_1h_prev
-    if analysis.rsi_1h < 42 and rsi_slope > 3.0:
+    slope_threshold = 1.0 if analysis.rsi_1h < 38 else 3.0
+    if analysis.rsi_1h < 42 and rsi_slope > slope_threshold:
         logger.info(
-            "%s: SHORT SKIP gate=RSI_rimbalzo (RSI=%.1f slope=+%.1f da prev=%.1f)",
-            analysis.pair, analysis.rsi_1h, rsi_slope, analysis.rsi_1h_prev,
+            "%s: SHORT SKIP gate=RSI_rimbalzo (RSI=%.1f slope=+%.1f > %.1f)",
+            analysis.pair, analysis.rsi_1h, rsi_slope, slope_threshold,
         )
         return None
 
