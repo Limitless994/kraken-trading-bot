@@ -86,7 +86,7 @@ def _notify_crash(exc: Exception) -> None:
 
 def main() -> None:
     from pathlib import Path
-    from core import config
+    from core import config, db
 
     _setup_logging(Path(__file__).parent / "logs")
 
@@ -100,6 +100,10 @@ def main() -> None:
     except EnvironmentError as exc:
         logger.critical(str(exc))
         sys.exit(1)
+
+    # ── DB bootstrap ─────────────────────────────────────────────────────────
+    db.init_db()
+    db.migrate_from_json()   # no-op after first run (files renamed to .bak)
 
     from bot.telegram_bot import TradingBot
     try:

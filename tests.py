@@ -10,7 +10,9 @@ All tests use mocks — no real calls to Kraken, Groq, or external APIs.
 """
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -630,6 +632,298 @@ class TestPaperBalance(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 14. DATABASE (SQLite WAL layer)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import core.db as _db_module   # imported here to allow DB_PATH patching in setUp
+
+
+class TestDB(unittest.TestCase):
+    """
+    Each test gets an isolated temporary DB.
+    core.db.DB_PATH is patched to a temp file so trading.db is never touched.
+    """
+
+    def setUp(self):
+        self._tmpdir = Path(tempfile.mkdtemp())
+        self._orig_db_path = _db_module.DB_PATH
+        _db_module.DB_PATH = self._tmpdir / "test_trading.db"
+        _db_module.init_db()
+
+    def tearDown(self):
+        _db_module.DB_PATH = self._orig_db_path
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    # ── Positions ──────────────────────────────────────────────────────────
+
+    def test_insert_and_get_position(self):
+        pos = {
+            "side": "long", "entry": 100.0, "size_eur": 50.0,
+            "size_crypto": 0.5, "take_profit": 110.0, "stop_loss": 95.0,
+            "opened_at": 1_000_000.0, "txid": "TEST123",
+        }
+        _db_module.insert_position("SOLEUR", pos)
+        result = _db_module.get_positions()
+        self.assertIn("SOLEUR", result)
+        self.assertAlmostEqual(result["SOLEUR"]["entry"], 100.0)
+        self.assertEqual(result["SOLEUR"]["txid"], "TEST123")
+
+    def test_extra_fields_roundtrip(self):
+        """Fields not in the schema (atr, fee_entry_eur) survive via the extra column."""
+        pos = {
+            "side": "long", "entry": 50.0, "size_eur": 20.0,
+            "size_crypto": 0.4, "take_profit": 55.0, "stop_loss": 48.0,
+            "opened_at": 1.0, "atr": 0.5, "fee_entry_eur": 0.08,
+        }
+        _db_module.insert_position("DOGEEUR", pos)
+        result = _db_module.get_positions()["DOGEEUR"]
+        self.assertAlmostEqual(result["atr"], 0.5)
+        self.assertAlmostEqual(result["fee_entry_eur"], 0.08)
+
+    def test_update_position(self):
+        pos = {
+            "side": "long", "entry": 100.0, "size_eur": 50.0,
+            "size_crypto": 0.5, "take_profit": 110.0, "stop_loss": 95.0,
+            "opened_at": 1.0,
+        }
+        _db_module.insert_position("XRPEUR", pos)
+        pos["trailing_stop"] = 97.0
+        _db_module.update_position("XRPEUR", pos)
+        result = _db_module.get_positions()["XRPEUR"]
+        self.assertAlmostEqual(result["trailing_stop"], 97.0)
+
+    def test_delete_position(self):
+        pos = {
+            "side": "long", "entry": 1.0, "size_eur": 10.0,
+            "size_crypto": 10.0, "take_profit": 1.1, "stop_loss": 0.96,
+            "opened_at": 1.0,
+        }
+        _db_module.insert_position("ADAEUR", pos)
+        self.assertIn("ADAEUR", _db_module.get_positions())
+        _db_module.delete_position("ADAEUR")
+        self.assertNotIn("ADAEUR", _db_module.get_positions())
+
+    def test_get_positions_empty_on_fresh_db(self):
+        self.assertEqual(_db_module.get_positions(), {})
+
+    # ── Trades ─────────────────────────────────────────────────────────────
+
+    def test_insert_and_get_trade(self):
+        trade = {
+            "pair": "XRPEUR", "side": "long",
+            "entry": 1.0, "exit": 1.1,
+            "size_eur": 45.0, "pnl_eur": 4.5, "pnl_pct": 10.0,
+            "fee_eur": 0.18, "gross_pnl_eur": 4.68, "exit_reason": "tp",
+            "opened_at": 1000.0, "closed_at": 2000.0,
+        }
+        _db_module.insert_trade(trade)
+        trades = _db_module.get_trades()
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["pair"], "XRPEUR")
+        self.assertAlmostEqual(trades[0]["exit"], 1.1)   # exit_price aliased to exit
+        self.assertEqual(trades[0]["exit_reason"], "tp")
+
+    def test_trades_ordered_by_insertion(self):
+        for i in range(3):
+            _db_module.insert_trade({
+                "pair": f"P{i}", "side": "long",
+                "entry": float(i), "exit": float(i + 1),
+                "size_eur": 10.0, "pnl_eur": 1.0, "pnl_pct": 10.0,
+                "closed_at": float(i * 1000),
+            })
+        trades = _db_module.get_trades()
+        self.assertEqual([t["pair"] for t in trades], ["P0", "P1", "P2"])
+
+    def test_get_trades_empty_on_fresh_db(self):
+        self.assertEqual(_db_module.get_trades(), [])
+
+    # ── Groq decisions ─────────────────────────────────────────────────────
+
+    def test_insert_and_get_groq_decision(self):
+        entry = {
+            "ts": 1000.0, "pair": "DOGEEUR", "direction": None,
+            "decision": "ESEGUI", "confidence": 8, "score": 4, "reason": "ok",
+            "rsi_1h": 45.0, "rsi_15m": 42.0, "macd_hist": 0.001,
+            "volume_ratio": 1.5, "adx": 25.0, "price": 0.08,
+        }
+        _db_module.insert_groq_decision(entry)
+        decisions = _db_module.get_groq_decisions()
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["pair"], "DOGEEUR")
+        self.assertEqual(decisions[0]["confidence"], 8)
+        self.assertEqual(decisions[0]["decision"], "ESEGUI")
+
+    def test_groq_decisions_limit(self):
+        for i in range(10):
+            _db_module.insert_groq_decision({
+                "ts": float(i), "pair": "X", "decision": "RIFIUTA",
+                "confidence": 3, "score": 1, "reason": "no",
+                "rsi_1h": 50.0, "rsi_15m": 50.0, "macd_hist": 0.0,
+                "volume_ratio": 1.0, "adx": 15.0, "price": 1.0,
+            })
+        self.assertEqual(len(_db_module.get_groq_decisions(limit=5)), 5)
+        self.assertEqual(len(_db_module.get_groq_decisions(limit=100)), 10)
+
+    # ── Settings ───────────────────────────────────────────────────────────
+
+    def test_settings_get_missing_returns_default(self):
+        self.assertIsNone(_db_module.get_setting("nonexistent"))
+        self.assertEqual(_db_module.get_setting("nonexistent", "fallback"), "fallback")
+
+    def test_settings_set_and_get(self):
+        _db_module.set_setting("active_profile", "aggressive")
+        self.assertEqual(_db_module.get_setting("active_profile"), "aggressive")
+
+    def test_settings_upsert(self):
+        _db_module.set_setting("k", "v1")
+        _db_module.set_setting("k", "v2")
+        self.assertEqual(_db_module.get_setting("k"), "v2")
+
+    # ── Commands ───────────────────────────────────────────────────────────
+
+    def test_push_and_pop_commands(self):
+        self.assertEqual(_db_module.pop_commands(), [])
+        _db_module.push_command({"cmd": "scan", "ts": 1.0})
+        _db_module.push_command({"cmd": "close", "pair": "SOLEUR", "ts": 2.0})
+        cmds = _db_module.pop_commands()
+        self.assertEqual(len(cmds), 2)
+        self.assertEqual(cmds[0]["cmd"], "scan")
+        self.assertEqual(cmds[1]["cmd"], "close")
+        self.assertEqual(cmds[1]["pair"], "SOLEUR")
+
+    def test_pop_commands_marks_processed(self):
+        _db_module.push_command({"cmd": "scan", "ts": 1.0})
+        _db_module.pop_commands()          # consume
+        self.assertEqual(_db_module.pop_commands(), [])   # already processed
+
+    def test_push_command_profile(self):
+        _db_module.push_command({"cmd": "profile", "name": "moderate", "ts": 1.0})
+        cmds = _db_module.pop_commands()
+        self.assertEqual(cmds[0]["name"], "moderate")
+
+    # ── Discovery ──────────────────────────────────────────────────────────
+
+    def test_insert_and_get_latest_discovery(self):
+        self.assertIsNone(_db_module.get_latest_discovery())
+        data = {"timestamp": 1000.0, "pairs_scanned": 10, "candidates": [{"pair": "ADAEUR"}]}
+        _db_module.insert_discovery(data)
+        result = _db_module.get_latest_discovery()
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pairs_scanned"], 10)
+
+    def test_get_latest_discovery_returns_most_recent(self):
+        _db_module.insert_discovery({"timestamp": 1000.0, "pairs_scanned": 5})
+        _db_module.insert_discovery({"timestamp": 2000.0, "pairs_scanned": 20})
+        result = _db_module.get_latest_discovery()
+        self.assertEqual(result["pairs_scanned"], 20)
+
+    # ── migrate_from_json ──────────────────────────────────────────────────
+
+    def test_migrate_positions_json(self):
+        pos_file = _db_module.DB_PATH.parent / "positions.json"
+        pos_file.write_text(json.dumps({
+            "SOLEUR": {
+                "side": "long", "entry": 150.0, "size_eur": 30.0,
+                "size_crypto": 0.2, "take_profit": 165.0, "stop_loss": 144.0,
+                "txid": "MIGRTEST", "opened_at": 1_234_567_890.0,
+            }
+        }), encoding="utf-8")
+        _db_module.migrate_from_json()
+        self.assertFalse(pos_file.exists(), "positions.json should be renamed to .bak")
+        self.assertTrue((pos_file.parent / "positions.json.bak").exists())
+        positions = _db_module.get_positions()
+        self.assertIn("SOLEUR", positions)
+        self.assertAlmostEqual(positions["SOLEUR"]["entry"], 150.0)
+        self.assertEqual(positions["SOLEUR"]["txid"], "MIGRTEST")
+
+    def test_migrate_trades_json(self):
+        trades_file = _db_module.DB_PATH.parent / "trades_log.json"
+        trades_file.write_text(json.dumps([
+            {"pair": "XRPEUR", "side": "long", "entry": 1.0, "exit": 1.1,
+             "size_eur": 45.0, "pnl_eur": 4.5, "pnl_pct": 10.0,
+             "fee_eur": 0.18, "gross_pnl_eur": 4.68, "exit_reason": "tp",
+             "opened_at": 100.0, "closed_at": 200.0},
+            {"pair": "DOGEEUR", "side": "long", "entry": 0.08, "exit": 0.075,
+             "size_eur": 45.0, "pnl_eur": -2.8, "pnl_pct": -6.25,
+             "fee_eur": 0.18, "gross_pnl_eur": -2.8, "exit_reason": "sl",
+             "opened_at": 300.0, "closed_at": 400.0},
+        ]), encoding="utf-8")
+        _db_module.migrate_from_json()
+        trades = _db_module.get_trades()
+        self.assertEqual(len(trades), 2)
+        self.assertEqual(trades[0]["pair"], "XRPEUR")
+        self.assertAlmostEqual(trades[1]["pnl_eur"], -2.8)
+        self.assertFalse(trades_file.exists())
+
+    def test_migrate_active_profile_json(self):
+        prof_file = _db_module.DB_PATH.parent / "active_profile.json"
+        prof_file.write_text(json.dumps({"profile": "moderate"}), encoding="utf-8")
+        _db_module.migrate_from_json()
+        self.assertEqual(_db_module.get_setting("active_profile"), "moderate")
+        self.assertFalse(prof_file.exists())
+
+    def test_migrate_idempotent(self):
+        """Running migrate_from_json twice on the same data should not duplicate rows."""
+        trades_file = _db_module.DB_PATH.parent / "trades_log.json"
+        trades_file.write_text(json.dumps([
+            {"pair": "XRPEUR", "side": "long", "entry": 1.0, "exit": 1.1,
+             "size_eur": 10.0, "pnl_eur": 1.0, "pnl_pct": 10.0,
+             "closed_at": 200.0},
+        ]), encoding="utf-8")
+        _db_module.migrate_from_json()   # first run — renames .bak
+        # Restore file to simulate a second attempt (file already gone → no-op)
+        self.assertEqual(len(_db_module.get_trades()), 1)
+        _db_module.migrate_from_json()   # second run — file gone, nothing added
+        self.assertEqual(len(_db_module.get_trades()), 1)
+
+    # ── import_logs ────────────────────────────────────────────────────────
+
+    def test_import_logs_parses_valid_lines(self):
+        log_dir = _db_module.DB_PATH.parent / "log da migrare"
+        log_dir.mkdir(exist_ok=True)
+        (log_dir / "bot.log").write_text(
+            "2026-06-01 12:00:00 [INFO] telegram_bot: Message one\n"
+            "2026-06-01 12:00:01 [ERROR] telegram_bot: Error message\n"
+            "this line has no valid format\n",
+            encoding="utf-8",
+        )
+        _db_module.import_logs()
+        import sqlite3
+        conn = sqlite3.connect(str(_db_module.DB_PATH))
+        count = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 2)
+
+    def test_import_logs_skips_duplicates(self):
+        log_dir = _db_module.DB_PATH.parent / "log da migrare"
+        log_dir.mkdir(exist_ok=True)
+        line = "2026-06-01 12:00:00 [INFO] telegram_bot: Duplicate message\n"
+        (log_dir / "bot.log").write_text(line * 5, encoding="utf-8")
+        _db_module.import_logs()
+        import sqlite3
+        conn = sqlite3.connect(str(_db_module.DB_PATH))
+        count = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1)   # UNIQUE(ts, module, message) deduplicates
+
+    def test_import_logs_no_dir_is_noop(self):
+        # No 'log da migrare' dir in tmpdir → should not raise
+        _db_module.import_logs()
+
+    # ── Resilience ─────────────────────────────────────────────────────────
+
+    def test_get_positions_returns_empty_if_db_missing(self):
+        _db_module.DB_PATH = self._tmpdir / "does_not_exist.db"
+        self.assertEqual(_db_module.get_positions(), {})
+        self.assertEqual(_db_module.get_trades(), [])
+        self.assertIsNone(_db_module.get_setting("x"))
+        self.assertEqual(_db_module.pop_commands(), [])
+        self.assertIsNone(_db_module.get_latest_discovery())
+        # Restore so tearDown can clean up
+        _db_module.DB_PATH = self._tmpdir / "test_trading.db"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # RUNNER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -645,6 +939,7 @@ if __name__ == "__main__":
         TestFearGreed, TestGroqEvaluator,
         TestKrakenStatus, TestLimitOrders,
         TestPersistence, TestConfig, TestPaperBalance,
+        TestDB,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

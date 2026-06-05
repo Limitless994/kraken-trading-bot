@@ -24,6 +24,7 @@ import asyncio
 import datetime
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -34,7 +35,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from core import config, kraken_client, market_data
+from core import config, db, kraken_client, market_data
 from core.analyzer import analyze
 from core.strategy import Signal, generate_signal, generate_short_signal, kelly_size_pct
 from services import discovery, groq_evaluator
@@ -42,57 +43,17 @@ from services import discovery, groq_evaluator
 logger = logging.getLogger(__name__)
 
 _DIR                = Path(__file__).parent.parent   # project root
-POSITIONS_FILE      = _DIR / "positions.json"
-TRADES_LOG_FILE     = _DIR / "trades_log.json"
-GROQ_LOG_FILE       = _DIR / "groq_log.json"
-DISCOVERY_FILE      = _DIR / "discovery_log.json"
 PENDING_ORDERS_FILE = _DIR / "pending_orders.json"
-BOT_COMMANDS_FILE   = _DIR / "bot_commands.json"
 DYNAMIC_PAIRS_FILE  = _DIR / "dynamic_pairs.json"
 
 
-# ── Persistence helpers ───────────────────────────────────────────────────────
-
-def _load_positions() -> dict:
-    if POSITIONS_FILE.exists():
-        try:
-            return json.loads(POSITIONS_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
+# ── Misc helpers (non-persistence) ────────────────────────────────────────────
 
 def _load_json(path: "Path", default):
     try:
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
     except Exception:
         return default
-
-
-def _save_positions(positions: dict) -> None:
-    POSITIONS_FILE.write_text(
-        json.dumps(positions, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-
-_GROQ_LOG_MAX = 500
-
-
-def _append_groq_log(entry: dict) -> None:
-    log = []
-    if GROQ_LOG_FILE.exists():
-        try:
-            log = json.loads(GROQ_LOG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            log = []
-    log.append(entry)
-    if len(log) > _GROQ_LOG_MAX:
-        log = log[-_GROQ_LOG_MAX:]
-    GROQ_LOG_FILE.write_text(
-        json.dumps(log, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
 
 
 def _margin_open_fee(pair: str) -> float:
@@ -180,26 +141,13 @@ def _calc_exit(pos: dict, exit_price: float, cfg, current_ts: float = None) -> d
     }
 
 
-def _append_trade_log(entry: dict) -> None:
-    log = []
-    if TRADES_LOG_FILE.exists():
-        try:
-            log = json.loads(TRADES_LOG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            log = []
-    log.append(entry)
-    TRADES_LOG_FILE.write_text(
-        json.dumps(log, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-
 # ── Bot ───────────────────────────────────────────────────────────────────────
 
 class TradingBot:
     def __init__(self) -> None:
         self.app = Application.builder().token(config.TELEGRAM_TOKEN).build()
-        self.positions: dict = _load_positions()
+        self.positions: dict = db.get_positions()
+        self._positions_lock = threading.Lock()   # guards in-memory dict + DB writes
         self._scanning   = False   # lock scan
         self._discovering = False  # lock discovery
         self._in_flight: set = set()  # per-scan idempotency guard
@@ -341,7 +289,6 @@ class TradingBot:
         else:
             vol_str = kraken_client.format_volume(pair, pos["size_crypto"])
             if side == "short":
-                # close short: buy back the crypto sold on margin
                 order = await asyncio.to_thread(
                     kraken_client.add_order, pair, "buy", "market", vol_str,
                     leverage=config.MARGIN_LEVERAGE,
@@ -361,18 +308,20 @@ class TradingBot:
         net_pnl_eur   = exit_data["net_pnl_eur"]
         net_pnl_pct   = exit_data["net_pnl_pct"]
 
-        del self.positions[pair]
-        _save_positions(self.positions)
-        _append_trade_log({
-            "pair": pair, "exit_reason": "manual",
+        with self._positions_lock:
+            del self.positions[pair]
+            db.delete_position(pair)
+
+        db.insert_trade({
+            "pair": pair, "side": side, "exit_reason": "manual",
             "entry": pos["entry"], "exit": current,
             "size_eur": pos["size_eur"],
             "gross_pnl_eur": round(gross_pnl_eur, 4),
             "fee_eur": round(fee_entry + fee_exit, 4),
-            "funding_cost_eur": round(funding_cost, 4),
             "pnl_eur": round(net_pnl_eur, 4),
             "pnl_pct": round(net_pnl_pct, 4),
-            "paper": config.PAPER_TRADING, "closed_at": time.time(),
+            "opened_at": pos.get("opened_at"),
+            "closed_at": time.time(),
         })
         funding_line = f"Funding cost: -{funding_cost:.4f}€\n" if funding_cost > 0 else ""
         return (
@@ -403,13 +352,10 @@ class TradingBot:
     async def _execute_signal(self, signal: Signal, groq_reason: str) -> None:
         is_short = signal.direction == "SELL"
         try:
-            # Short always uses market (no limit orders for margin)
             use_limit   = config.LIMIT_ORDERS_ENABLED and not config.PAPER_TRADING and not is_short
             fee_rate    = config.KRAKEN_MAKER_FEE if use_limit else config.KRAKEN_TAKER_FEE
-            # Short includes margin opening fee (rate depends on pair)
             extra_fee   = _margin_open_fee(signal.pair) if is_short else 0.0
             fee_entry   = round(signal.size_eur * (fee_rate + extra_fee), 4)
-            # For shorts, fee doesn't reduce the crypto volume sold — use full size
             if is_short:
                 size_crypto_net = signal.size_eur / signal.price
             else:
@@ -417,18 +363,15 @@ class TradingBot:
 
             if config.PAPER_TRADING:
                 if config.LIMIT_ORDERS_ENABLED and not is_short:
-                    # Simulate limit fill at a slightly better price (long only)
                     limit_price = round(signal.price * (1 - config.LIMIT_OFFSET_PCT), 8)
                     size_crypto_net = signal.size_eur * (1 - fee_rate) / limit_price
                     actual_price = limit_price
                 else:
                     actual_price = signal.price
-                    # size_crypto_net already set above (correct for both long and short)
                 txid  = "PAPER"
                 descr = ""
 
             elif is_short:
-                # Live SHORT: market sell with leverage
                 vol_str = kraken_client.format_volume(signal.pair, signal.size_crypto)
                 result  = await asyncio.to_thread(
                     kraken_client.add_order,
@@ -440,7 +383,6 @@ class TradingBot:
                 actual_price = signal.price
 
             elif use_limit:
-                # Live LONG: real limit order
                 limit_price = round(signal.price * (1 - config.LIMIT_OFFSET_PCT), 8)
                 vol_str     = kraken_client.format_volume(signal.pair, signal.size_crypto)
                 result      = await asyncio.to_thread(
@@ -452,7 +394,6 @@ class TradingBot:
                 txid  = txids[0] if txids else "unknown"
                 descr = result.get("descr", {}).get("order", "")
                 actual_price = limit_price
-                # Save to pending orders for fill monitoring
                 pending = _load_json(PENDING_ORDERS_FILE, {})
                 pending[signal.pair] = {
                     "txid": txid, "limit_price": limit_price,
@@ -473,10 +414,9 @@ class TradingBot:
                         f"Scade in {config.LIMIT_TIMEOUT_SEC//60} min se non eseguito"
                     ),
                 )
-                return   # position recorded when the limit is filled
+                return
 
             else:
-                # Live: market order
                 vol_str     = kraken_client.format_volume(signal.pair, signal.size_crypto)
                 result      = await asyncio.to_thread(
                     kraken_client.add_order,
@@ -486,9 +426,9 @@ class TradingBot:
                 txid  = txids[0] if txids else "unknown"
                 descr = result.get("descr", {}).get("order", "")
                 actual_price = signal.price
-                size_crypto_net = signal.size_crypto  # real exchange handles net internally
+                size_crypto_net = signal.size_crypto
 
-            self.positions[signal.pair] = {
+            pos_dict = {
                 "pair":          signal.pair,
                 "side":          "short" if is_short else "long",
                 "entry":         actual_price if config.PAPER_TRADING else signal.price,
@@ -503,7 +443,9 @@ class TradingBot:
                 "opened_at":     time.time(),
                 "order_type":    "limit" if (use_limit and not is_short) else "market",
             }
-            _save_positions(self.positions)
+            with self._positions_lock:
+                self.positions[signal.pair] = pos_dict
+                db.insert_position(signal.pair, pos_dict)
 
             mode  = "[PAPER] " if config.PAPER_TRADING else ""
             label = "SHORT" if is_short else "BUY"
@@ -569,7 +511,6 @@ class TradingBot:
                 logger.error("Cannot fetch balance: %s", exc)
                 return False
 
-        # Cap on deployed capital: do not exceed MAX_CAPITAL_DEPLOYED
         spent       = sum(p["size_eur"] for p in self.positions.values())
         max_allowed = config.BUDGET_EUR * config.MAX_CAPITAL_DEPLOYED
         if spent >= max_allowed:
@@ -588,7 +529,7 @@ class TradingBot:
 
         # ── Circuit breaker ───────────────────────────────────────────────────
         if config.CIRCUIT_BREAKER_ENABLED:
-            trades    = _load_json(TRADES_LOG_FILE, [])
+            trades    = db.get_trades()
             today_ts  = time.time() - 86400
             daily_loss = sum(
                 t["pnl_eur"] for t in trades
@@ -614,7 +555,7 @@ class TradingBot:
             logger.info("LONG BLOCKED: fear_greed=%d (%s)", fg_val, label)
 
         # ── Kelly sizing from trade history ───────────────────────────────────
-        trades_history = _load_json(TRADES_LOG_FILE, [])
+        trades_history = db.get_trades()
         kelly_pct = kelly_size_pct(trades_history)
 
         # ── BTC market filter — single fetch for the entire scan ──────────────
@@ -633,11 +574,16 @@ class TradingBot:
                     btc_analysis.adx,
                     " → bloccherà long non-BTC" if _btc_blocks else " → OK",
                 )
+                # Persist BTC filter state for the dashboard
+                db.set_setting("btc_filter_state", json.dumps({
+                    "rsi":   btc_analysis.rsi_1h,
+                    "ema50": "OK" if btc_analysis.price_above_ema50 else "SOTTO",
+                    "adx":   btc_analysis.adx,
+                }))
 
         dynamic = _load_json(DYNAMIC_PAIRS_FILE, [])
         scan_pairs = list(dict.fromkeys(config.PAIRS + dynamic))
 
-        # Cache analysis results to avoid double API calls in the short scan
         analysis_cache: dict = {}
 
         for pair in ([] if long_blocked_fg else scan_pairs):
@@ -662,7 +608,6 @@ class TradingBot:
             if not signal:
                 continue
 
-            # ── BTC-beta bucket ───────────────────────────────────────────────
             if config.MAX_BTC_BETA_EXPOSURE_PCT < 1.0:
                 _max_beta = config.BUDGET_EUR * config.MAX_BTC_BETA_EXPOSURE_PCT
                 _long_exp = sum(p["size_eur"] for p in self.positions.values() if p.get("side", "long") == "long")
@@ -679,10 +624,8 @@ class TradingBot:
                 groq_evaluator.evaluate, signal, mkt_ctx
             )
 
-            # Kelly sovrascrive la size se disponibile
             effective_size_pct = min(kelly_pct, size_pct) if kelly_pct else size_pct
 
-            # Ridimensiona la posizione
             if execute and effective_size_pct > 0:
                 ai_size = round(available_eur * effective_size_pct, 2)
                 ai_size = max(ai_size, 10.0)
@@ -690,7 +633,7 @@ class TradingBot:
                     signal.size_eur    = ai_size
                     signal.size_crypto = ai_size / signal.price
 
-            _append_groq_log({
+            db.insert_groq_decision({
                 "ts":           time.time(),
                 "pair":         signal.pair,
                 "decision":     "ESEGUI" if execute else "RIFIUTA",
@@ -763,7 +706,6 @@ class TradingBot:
             if not signal:
                 continue
 
-            # ── BTC-beta bucket ───────────────────────────────────────────────
             if config.MAX_BTC_BETA_EXPOSURE_PCT < 1.0:
                 _max_beta = config.BUDGET_EUR * config.MAX_BTC_BETA_EXPOSURE_PCT
                 _short_exp = sum(p["size_eur"] for p in self.positions.values() if p.get("side") == "short")
@@ -789,7 +731,7 @@ class TradingBot:
                     signal.size_eur    = ai_size
                     signal.size_crypto = ai_size / signal.price
 
-            _append_groq_log({
+            db.insert_groq_decision({
                 "ts":           time.time(),
                 "pair":         signal.pair,
                 "direction":    "SHORT",
@@ -851,8 +793,9 @@ class TradingBot:
                     atr_pos      = pos.get("atr", 0)
                     old_trailing = pos.get("trailing_stop", pos["stop_loss"])
                     if _update_trailing_stop(pos, current, atr_pos, config):
-                        self.positions[pair] = pos
-                        _save_positions(self.positions)
+                        with self._positions_lock:
+                            self.positions[pair] = pos
+                            db.update_position(pair, pos)
                         logger.info(
                             "Trailing stop %s %s: %.6f → %.6f",
                             side.upper(), pair, old_trailing, pos["trailing_stop"],
@@ -901,16 +844,17 @@ class TradingBot:
                         f"fee -{fee_entry+fee_exit:.4f}€{funding_str}  {suffix}"
                     ),
                 )
-                _append_trade_log({
-                    "pair": pair, "exit_reason": "tp" if hit_tp else "sl",
+                db.insert_trade({
+                    "pair": pair, "side": side,
+                    "exit_reason": "tp" if hit_tp else "sl",
                     "entry": pos["entry"], "exit": current,
                     "size_eur": pos["size_eur"],
                     "gross_pnl_eur": round(gross_pnl_eur, 4),
                     "fee_eur": round(fee_entry + fee_exit, 4),
-                    "funding_cost_eur": round(funding_cost, 4),
                     "pnl_eur": round(net_pnl_eur, 4),
                     "pnl_pct": round(net_pnl_pct, 4),
-                    "paper": config.PAPER_TRADING, "closed_at": time.time(),
+                    "opened_at": pos.get("opened_at"),
+                    "closed_at": time.time(),
                 })
                 to_close.append(pair)
 
@@ -918,24 +862,21 @@ class TradingBot:
                 logger.error("Position monitor error for %s: %s", pair, exc)
 
         for pair in to_close:
-            del self.positions[pair]
-
-        if to_close:
-            _save_positions(self.positions)
+            with self._positions_lock:
+                del self.positions[pair]
+                db.delete_position(pair)
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
     async def _job_daily_report(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         positions = self.positions
-        trades    = _load_json(TRADES_LOG_FILE, [])
+        trades    = db.get_trades()
         today_ts  = time.time() - 86400
         today_trades = [t for t in trades if t.get("closed_at", 0) > today_ts]
 
-        # Total P&L
         total_pnl = sum(t["pnl_eur"] for t in trades)
         today_pnl = sum(t["pnl_eur"] for t in today_trades)
 
-        # Open positions
         pos_lines = []
         for pair, pos in positions.items():
             try:
@@ -996,7 +937,6 @@ class TradingBot:
         for pair, po in list(pending.items()):
             txid = po["txid"]
             if txid not in open_txids:
-                # Verify fill status — order could be cancelled/expired, not filled
                 order_status = "unknown"
                 try:
                     info = await asyncio.to_thread(kraken_client.query_orders, [txid])
@@ -1011,7 +951,7 @@ class TradingBot:
                         text=f"LIMIT {order_status.upper()} {pair}  TX {txid} — nessuna posizione aperta",
                     )
                     continue
-                self.positions[pair] = {
+                pos_dict = {
                     "entry":         po["limit_price"],
                     "size_crypto":   po["size_crypto"],
                     "size_eur":      po["size_eur"],
@@ -1022,15 +962,17 @@ class TradingBot:
                     "txid":          txid,
                     "opened_at":     now,
                     "order_type":    "limit",
+                    "side":          "long",
                 }
-                _save_positions(self.positions)
+                with self._positions_lock:
+                    self.positions[pair] = pos_dict
+                    db.insert_position(pair, pos_dict)
                 to_remove.append(pair)
                 await self.app.bot.send_message(
                     chat_id=config.TELEGRAM_CHAT_ID,
                     text=f"LIMIT ESEGUITO {pair}  @{po['limit_price']:.6f}  TX {txid}",
                 )
             elif now > po["timeout_at"]:
-                # Timeout — cancel order
                 try:
                     await asyncio.to_thread(kraken_client.cancel_order, txid)
                 except Exception:
@@ -1049,7 +991,7 @@ class TradingBot:
 
     async def _cmd_ai(self, update, ctx) -> None:
         """Show the last N Groq AI decisions."""
-        groq_log = _load_json(GROQ_LOG_FILE, [])
+        groq_log = db.get_groq_decisions()
         if not groq_log:
             await update.message.reply_text("Nessuna valutazione Groq ancora.")
             return
@@ -1144,10 +1086,7 @@ class TradingBot:
             )
             return
 
-        DISCOVERY_FILE.write_text(
-            json.dumps(result, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        db.insert_discovery(result)
 
         top_pairs = [c["pair"] for c in result.get("candidates", [])[:5]]
         DYNAMIC_PAIRS_FILE.write_text(
@@ -1175,16 +1114,13 @@ class TradingBot:
         )
 
     async def _job_process_commands(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Process commands queued by the web dashboard (bot_commands.json)."""
-        if not BOT_COMMANDS_FILE.exists():
-            return
+        """Process commands queued by the web dashboard."""
         try:
-            commands = _load_json(BOT_COMMANDS_FILE, [])
-            if not commands:
-                return
-            BOT_COMMANDS_FILE.write_text("[]", encoding="utf-8")
+            commands = db.pop_commands()
         except Exception as exc:
-            logger.error("bot_commands.json read error: %s", exc)
+            logger.error("bot_commands DB read error: %s", exc)
+            return
+        if not commands:
             return
 
         for cmd in commands:
@@ -1228,7 +1164,6 @@ class TradingBot:
         if not candidates:
             return
 
-        # Capital check
         if config.PAPER_TRADING:
             spent = sum(p["size_eur"] for p in self.positions.values())
             available_eur = max(config.BUDGET_EUR - spent, 0.0)
@@ -1248,9 +1183,8 @@ class TradingBot:
         if available_eur < 10.0 or len(self.positions) >= config.MAX_OPEN_TRADES:
             return
 
-        # Circuit breaker
         if config.CIRCUIT_BREAKER_ENABLED:
-            trades = _load_json(TRADES_LOG_FILE, [])
+            trades = db.get_trades()
             daily_loss = sum(
                 t["pnl_eur"] for t in trades
                 if t.get("closed_at", 0) > time.time() - 86400 and t["pnl_eur"] < 0
@@ -1268,7 +1202,7 @@ class TradingBot:
         if config.BTC_FILTER_ENABLED:
             btc_analysis = await asyncio.to_thread(analyze, config.BTC_PAIR)
 
-        trades_history = _load_json(TRADES_LOG_FILE, [])
+        trades_history = db.get_trades()
         kelly_pct = kelly_size_pct(trades_history)
         already_open = set(self.positions.keys())
 
@@ -1307,7 +1241,7 @@ class TradingBot:
                     signal.size_eur    = ai_size
                     signal.size_crypto = ai_size / signal.price
 
-            _append_groq_log({
+            db.insert_groq_decision({
                 "ts":           time.time(),
                 "pair":         signal.pair,
                 "decision":     "ESEGUI" if execute else "RIFIUTA",

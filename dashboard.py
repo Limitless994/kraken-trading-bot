@@ -5,7 +5,6 @@ Run with:
     python3 dashboard.py
 """
 import json
-import re
 import time
 import uuid
 from datetime import datetime
@@ -14,28 +13,9 @@ from pathlib import Path
 import requests
 from flask import Flask, jsonify, redirect, render_template_string, request, url_for
 
-from core import config, market_data
+from core import config, db, market_data
 
 app = Flask(__name__)
-
-_DIR              = Path(__file__).parent
-TRADING_LOG_FILE  = _DIR / "logs" / "trading.log"
-POSITIONS_FILE    = _DIR / "positions.json"
-TRADES_LOG_FILE   = _DIR / "trades_log.json"
-GROQ_LOG_FILE     = _DIR / "groq_log.json"
-DISCOVERY_FILE    = _DIR / "discovery_log.json"
-BOT_COMMANDS_FILE = _DIR / "bot_commands.json"
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _load_json(path: Path, default):
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return default
 
 
 def _fetch_price(pair: str):
@@ -65,15 +45,11 @@ def _fmt_time(ts: float) -> str:
 
 
 def _parse_btc_filter() -> dict:
-    """Estrae RSI, EMA50, ADX di BTC dall'ultima riga del trading.log."""
-    if not TRADING_LOG_FILE.exists():
-        return {}
+    """Returns the last BTC filter state stored by the bot (RSI, EMA50, ADX)."""
     try:
-        lines = TRADING_LOG_FILE.read_text(encoding="utf-8").splitlines()
-        for line in reversed(lines[-300:]):
-            m = re.search(r'BTC filter: RSI=([\d.]+)\s+EMA50=(\w+)\s+ADX=([\d.]+)', line)
-            if m:
-                return {"rsi": float(m.group(1)), "ema50": m.group(2), "adx": float(m.group(3))}
+        raw = db.get_setting("btc_filter_state")
+        if raw:
+            return json.loads(raw)
     except Exception:
         pass
     return {}
@@ -82,15 +58,11 @@ def _parse_btc_filter() -> dict:
 # ── Command queue ────────────────────────────────────────────────────────────
 
 def _queue_command(cmd: dict) -> None:
-    """Append a command to bot_commands.json for the bot to process."""
+    """Enqueue a command for the bot to process via the DB commands table."""
     try:
-        existing = _load_json(BOT_COMMANDS_FILE, [])
         cmd.setdefault("id", str(uuid.uuid4())[:8])
         cmd.setdefault("ts", time.time())
-        existing.append(cmd)
-        BOT_COMMANDS_FILE.write_text(
-            json.dumps(existing, ensure_ascii=False), encoding="utf-8"
-        )
+        db.push_command(cmd)
     except Exception as exc:
         app.logger.error("queue_command error: %s", exc)
 
@@ -734,10 +706,10 @@ function loadBalance() {
 @app.route("/")
 def index():
     msg = request.args.get("msg", "")
-    positions_raw = _load_json(POSITIONS_FILE, {})
-    trades_log    = _load_json(TRADES_LOG_FILE, [])
-    groq_log      = _load_json(GROQ_LOG_FILE, [])
-    discovery_data = _load_json(DISCOVERY_FILE, None)
+    positions_raw  = db.get_positions()
+    trades_log     = db.get_trades()
+    groq_log       = db.get_groq_decisions(500)
+    discovery_data = db.get_latest_discovery()
     kraken_status  = _fetch_kraken_status()
     fear_greed     = market_data.get_fear_greed()
     news_headlines = market_data.get_crypto_news(5) if config.NEWS_ENABLED else []

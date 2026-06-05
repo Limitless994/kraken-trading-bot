@@ -280,17 +280,31 @@ def apply_profile(name: str) -> None:
     for key, val in PROFILES[name].items():
         setattr(module, key, val)
     setattr(module, "ACTIVE_PROFILE", name)
+    # Persist to DB first; fall back to JSON if DB not yet initialised
     try:
-        _ACTIVE_PROFILE_FILE.write_text(
-            _json.dumps({"profile": name}), encoding="utf-8"
-        )
+        from core import db as _db
+        _db.set_setting("active_profile", name)
     except Exception:
-        pass
+        try:
+            _ACTIVE_PROFILE_FILE.write_text(
+                _json.dumps({"profile": name}), encoding="utf-8"
+            )
+        except Exception:
+            pass
 
 
 def _load_active_profile() -> str:
     import json as _json
     default = os.getenv("TRADING_PROFILE", "conservative").lower()
+    # Try DB first (available after init_db())
+    try:
+        from core import db as _db
+        val = _db.get_setting("active_profile")
+        if val and val in PROFILES:
+            return val
+    except Exception:
+        pass
+    # Fall back to JSON (pre-migration or DB not yet initialised)
     try:
         if _ACTIVE_PROFILE_FILE.exists():
             data = _json.loads(_ACTIVE_PROFILE_FILE.read_text(encoding="utf-8"))
