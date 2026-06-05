@@ -318,6 +318,34 @@ def _load_active_profile() -> str:
 apply_profile(_load_active_profile())
 
 
+def apply_profile_params(params: dict) -> None:
+    """Apply form-editor params (PCT keys as int 0-100) to the running config."""
+    import sys
+    module = sys.modules[__name__]
+    _pct_map = {
+        "AI_SIZE_HIGH_PCT":        "AI_SIZE_HIGH",
+        "AI_SIZE_MED_PCT":         "AI_SIZE_MED",
+        "AI_SIZE_MIN_PCT":         "AI_SIZE_MIN",
+        "MAX_CAPITAL_DEPLOYED_PCT": "MAX_CAPITAL_DEPLOYED",
+    }
+    _int_fields = {
+        "MIN_SIGNAL_SCORE", "ADX_MIN", "GROQ_MIN_CONFIDENCE",
+        "MAX_OPEN_TRADES", "RSI_1H_BUY_MAX", "RSI_15M_BUY_MAX",
+        "BTC_RSI_MAX", "SCAN_INTERVAL_MINUTES",
+    }
+    for k, v in params.items():
+        try:
+            fv = float(v)
+            if k in _pct_map:
+                setattr(module, _pct_map[k], fv / 100.0)
+            elif k in _int_fields:
+                setattr(module, k, int(fv))
+            elif hasattr(module, k):
+                setattr(module, k, fv)
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+
 def validate():
     missing = []
     if not TELEGRAM_TOKEN:    missing.append("TELEGRAM_TOKEN")

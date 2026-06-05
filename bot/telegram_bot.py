@@ -1155,6 +1155,10 @@ class TradingBot:
                         )
                     except ValueError as exc:
                         logger.error("Profile change error: %s", exc)
+                elif c == "restart":
+                    logger.info("Restart richiesto dalla dashboard — uscita in corso")
+                    import sys
+                    sys.exit(0)
             except Exception as exc:
                 logger.error("Command error [%s]: %s", cmd, exc)
 
