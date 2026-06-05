@@ -1128,10 +1128,10 @@ class TestOHLCCache(unittest.TestCase):
 
 class TestAdaptiveSlippage(unittest.TestCase):
 
-    def test_large_atr_capped_at_1pct(self):
+    def test_large_atr_capped_at_02pct(self):
         from bot.telegram_bot import _adaptive_slippage
-        # ATR = 10% of price → atr_pct * 0.5 = 5% → capped at 1%
-        self.assertAlmostEqual(_adaptive_slippage(10.0, 100.0), 0.01, places=6)
+        # ATR = 10% of price → atr_pct * 0.5 = 5% → capped at 0.2% (realistic max for Kraken alts)
+        self.assertAlmostEqual(_adaptive_slippage(10.0, 100.0), 0.002, places=6)
 
     def test_small_atr_uses_config_floor(self):
         from bot.telegram_bot import _adaptive_slippage
@@ -1141,10 +1141,10 @@ class TestAdaptiveSlippage(unittest.TestCase):
 
     def test_moderate_atr_between_floor_and_cap(self):
         from bot.telegram_bot import _adaptive_slippage
-        # ATR 1% of price → atr_pct * 0.5 = 0.5% → between floor and 1%
+        # ATR 1% of price → atr_pct * 0.5 = 0.5% → between floor (0.1%) and cap (0.2%)
         result = _adaptive_slippage(1.0, 100.0)
         self.assertGreaterEqual(result, config.SLIPPAGE_PCT)
-        self.assertLessEqual(result, 0.01)
+        self.assertLessEqual(result, 0.002)
 
     def test_calc_exit_uses_adaptive_slippage(self):
         from bot.telegram_bot import _calc_exit, _adaptive_slippage
@@ -1168,6 +1168,61 @@ class TestAdaptiveSlippage(unittest.TestCase):
         }
         result = _calc_exit(pos, 110.0, config)
         self.assertAlmostEqual(result["slip_eur"], round(18.0 * config.SLIPPAGE_PCT * 2, 4), places=4)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 20. TRAILING STOP BREAK-EVEN CLAMP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTrailingStopBreakEven(unittest.TestCase):
+    """Trailing stop must never be set in loss territory (above entry for SHORT, below for LONG)."""
+
+    def _pos(self, side, entry, sl, atr=2.0):
+        return {"side": side, "entry": entry, "stop_loss": sl, "atr": atr, "size_eur": 30.0}
+
+    def test_short_trailing_clamped_to_entry_when_atr_wide(self):
+        """SHORT: wide ATR would put trailing above entry — must be clamped to entry."""
+        from bot.telegram_bot import _update_trailing_stop
+        pos = self._pos("short", entry=56.17, sl=58.08, atr=2.0)
+        # current = 53.73, activation = 56.17 - 1.0*2.0 = 54.17 → 53.73 < 54.17 → activates
+        # raw trailing = 53.73 + 1.5*2.0 = 56.73 > entry 56.17 → must clamp to 56.17
+        updated = _update_trailing_stop(pos, current=53.73, atr=2.0, cfg=config)
+        self.assertTrue(updated)
+        self.assertLessEqual(pos["trailing_stop"], 56.17, "Trailing stop must not exceed entry on SHORT")
+
+    def test_short_trailing_below_entry_when_atr_tight(self):
+        """SHORT: tight ATR puts trailing below entry — no clamping needed, keeps full value."""
+        from bot.telegram_bot import _update_trailing_stop
+        pos = self._pos("short", entry=0.072295, sl=0.074517, atr=0.001)
+        # activation = 0.072295 - 0.001 = 0.071295, current=0.068985 < 0.071295 → activates
+        # raw trailing = 0.068985 + 1.5*0.001 = 0.070485 < entry 0.072295 → no clamp
+        updated = _update_trailing_stop(pos, current=0.068985, atr=0.001, cfg=config)
+        self.assertTrue(updated)
+        self.assertAlmostEqual(pos["trailing_stop"], 0.068985 + 1.5 * 0.001, places=8)
+
+    def test_long_trailing_clamped_to_entry_when_atr_wide(self):
+        """LONG: wide ATR would put trailing below entry — must be clamped to entry."""
+        from bot.telegram_bot import _update_trailing_stop
+        pos = self._pos("long", entry=100.0, sl=95.0, atr=5.0)
+        # activation = 100.0 + 1.0*5.0 = 105.0, current=106.0 >= 105.0 → activates
+        # raw trailing = 106.0 - 1.5*5.0 = 98.5 < entry 100.0 → clamp to 100.0
+        updated = _update_trailing_stop(pos, current=106.0, atr=5.0, cfg=config)
+        self.assertTrue(updated)
+        self.assertGreaterEqual(pos["trailing_stop"], 100.0, "Trailing stop must not go below entry on LONG")
+
+    def test_short_trailing_never_causes_loss_on_immediate_reversal(self):
+        """If price reverses immediately after trailing activates, net PnL must be >= 0."""
+        from bot.telegram_bot import _update_trailing_stop, _calc_exit
+        pos = {
+            "side": "short", "entry": 56.17, "stop_loss": 58.08,
+            "atr": 2.0, "size_eur": 30.0, "size_crypto": 30.0 / 56.17,
+            "fee_entry_eur": 0.05,
+        }
+        _update_trailing_stop(pos, current=53.73, atr=2.0, cfg=config)
+        exit_price = pos.get("trailing_stop", pos["stop_loss"])
+        result = _calc_exit(pos, exit_price, config)
+        self.assertGreaterEqual(result["gross_pnl_eur"], 0.0,
+                                f"Gross P&L must be >= 0 when trailing fires at break-even; got {result['gross_pnl_eur']}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

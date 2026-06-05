@@ -129,6 +129,7 @@ def _collect_live_data() -> dict:
     enriched      = _enrich_positions(positions_raw)
 
     total_pnl    = sum(t["pnl_eur"] for t in trades_log)
+    total_gross  = sum(t.get("gross_pnl_eur", 0.0) for t in trades_log)
     total_fees   = sum(t.get("fee_eur", 0.0) for t in trades_log)
     wins         = sum(1 for t in trades_log if t["pnl_eur"] > 0)
     total_trades = len(trades_log)
@@ -147,6 +148,7 @@ def _collect_live_data() -> dict:
             "max_trades":    config.MAX_OPEN_TRADES,
             "total_trades":  total_trades,
             "total_pnl":     round(total_pnl, 4),
+            "total_gross":   round(total_gross, 4),
             "winrate":       round(winrate, 1),
             "groq_approved": groq_approved,
             "groq_rejected": groq_rejected,
@@ -514,8 +516,10 @@ TEMPLATE = """<!DOCTYPE html>
           <div class="metric-val {% if pnl0 >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}" id="m-pnl">{{ "%+.2f"|format(pnl0) }}&euro;</div>
         </div></div>
         <div class="col-6 col-md-2"><div class="card text-center p-2">
-          <div class="metric-label">Fee pagate</div>
-          <div class="metric-val pnl-neg" id="m-fees">-{{ "%.4f"|format(init_data.metrics.total_fees) }}&euro;</div>
+          <div class="metric-label">P&L lordo</div>
+          {% set gross0 = init_data.metrics.total_gross %}
+          <div class="metric-val {% if gross0 >= 0 %}pnl-pos{% else %}pnl-neg{% endif %}" id="m-gross">{{ "%+.2f"|format(gross0) }}&euro;</div>
+          <div style="font-size:.7rem;color:#888;" id="m-fees-sub">costi: -{{ "%.2f"|format(init_data.metrics.total_fees) }}&euro;</div>
         </div></div>
         <div class="col-6 col-md-2"><div class="card text-center p-2">
           <div class="metric-label">Groq &#x2705; / &#x274c;</div>
@@ -649,7 +653,7 @@ TEMPLATE = """<!DOCTYPE html>
               <th>Data</th><th>Coppia</th>
               <th class="col-hide-sm">Tipo</th><th>Esito</th>
               <th class="col-hide-sm">Entry</th><th class="col-hide-sm">Exit</th>
-              <th class="col-hide-sm">P&amp;L lordo</th><th class="col-hide-sm">Fee</th>
+              <th class="col-hide-sm">P&amp;L lordo</th><th class="col-hide-sm">Costi</th>
               <th>P&amp;L netto</th><th>%</th>
             </tr></thead>
             <tbody id="trades-tbody"></tbody>
@@ -1261,7 +1265,12 @@ function updateMetrics(m) {
     pnlEl.textContent = fmtSign(m.total_pnl) + '€';
     pnlEl.className   = 'metric-val ' + (m.total_pnl >= 0 ? 'pnl-pos' : 'pnl-neg');
   }
-  setEl('m-fees', '-' + m.total_fees.toFixed(4) + '€');
+  var grossEl = document.getElementById('m-gross');
+  if (grossEl) {
+    grossEl.textContent = fmtSign(m.total_gross) + '€';
+    grossEl.className   = 'metric-val ' + (m.total_gross >= 0 ? 'pnl-pos' : 'pnl-neg');
+  }
+  setEl('m-fees-sub', 'costi: -' + m.total_fees.toFixed(2) + '€');
   setEl('m-groq', m.groq_approved + ' / ' + m.groq_rejected);
   // header BTC RSI
   var hdrRsi = document.getElementById('hdr-btc-rsi');

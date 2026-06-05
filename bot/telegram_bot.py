@@ -94,6 +94,8 @@ def _update_trailing_stop(pos: dict, current: float, atr: float, cfg) -> bool:
         if current <= activation:
             new_trailing = (round(current + cfg.TRAILING_DISTANCE_ATR * atr, 8) if atr > 0
                             else round(current * (1 + cfg.TRAILING_STOP_PCT), 8))
+            # Never set trailing above entry — would guarantee a loss on reversal
+            new_trailing = min(new_trailing, entry)
             if new_trailing < old_trailing:
                 pos["trailing_stop"] = new_trailing
                 return True
@@ -102,6 +104,8 @@ def _update_trailing_stop(pos: dict, current: float, atr: float, cfg) -> bool:
         if current >= activation:
             new_trailing = (round(current - cfg.TRAILING_DISTANCE_ATR * atr, 8) if atr > 0
                             else round(current * (1 - cfg.TRAILING_STOP_PCT), 8))
+            # Never set trailing below entry — would guarantee a loss on reversal
+            new_trailing = max(new_trailing, entry)
             if new_trailing > old_trailing:
                 pos["trailing_stop"] = new_trailing
                 return True
@@ -118,9 +122,11 @@ def _check_exit_signals(pos: dict, current: float) -> tuple:
 
 
 def _adaptive_slippage(atr: float, price: float) -> float:
-    """Slippage estimate based on current ATR; capped at 1%, floored at config value."""
+    """Slippage estimate based on current ATR; capped at 0.2%, floored at config value.
+    Real Kraken slippage on liquid alts (SOL, DOGE) for <100€ orders is 0.01–0.15%.
+    The old 1% cap was 5-10× too high and was eating all profit on small-margin exits."""
     atr_pct = atr / price
-    return max(config.SLIPPAGE_PCT, min(atr_pct * 0.5, 0.01))
+    return max(config.SLIPPAGE_PCT, min(atr_pct * 0.5, 0.002))
 
 
 def _calc_exit(pos: dict, exit_price: float, cfg, current_ts: float = None) -> dict:
@@ -314,6 +320,7 @@ class TradingBot:
         gross_pnl_eur = exit_data["gross_pnl_eur"]
         fee_exit      = exit_data["fee_exit"]
         fee_entry     = exit_data["fee_entry"]
+        slip_eur      = exit_data["slip_eur"]
         funding_cost  = exit_data["funding_cost"]
         net_pnl_eur   = exit_data["net_pnl_eur"]
         net_pnl_pct   = exit_data["net_pnl_pct"]
@@ -327,7 +334,7 @@ class TradingBot:
             "entry": pos["entry"], "exit": current,
             "size_eur": pos["size_eur"],
             "gross_pnl_eur": round(gross_pnl_eur, 4),
-            "fee_eur": round(fee_entry + fee_exit, 4),
+            "fee_eur": round(fee_entry + fee_exit + slip_eur + funding_cost, 4),
             "pnl_eur": round(net_pnl_eur, 4),
             "pnl_pct": round(net_pnl_pct, 4),
             "opened_at": pos.get("opened_at"),
@@ -837,6 +844,7 @@ class TradingBot:
                 gross_pnl_eur = exit_data["gross_pnl_eur"]
                 fee_exit      = exit_data["fee_exit"]
                 fee_entry     = exit_data["fee_entry"]
+                slip_eur      = exit_data["slip_eur"]
                 funding_cost  = exit_data["funding_cost"]
                 net_pnl_eur   = exit_data["net_pnl_eur"]
                 net_pnl_pct   = exit_data["net_pnl_pct"]
@@ -877,7 +885,7 @@ class TradingBot:
                     "entry": pos["entry"], "exit": current,
                     "size_eur": pos["size_eur"],
                     "gross_pnl_eur": round(gross_pnl_eur, 4),
-                    "fee_eur": round(fee_entry + fee_exit, 4),
+                    "fee_eur": round(fee_entry + fee_exit + slip_eur + funding_cost, 4),
                     "pnl_eur": round(net_pnl_eur, 4),
                     "pnl_pct": round(net_pnl_pct, 4),
                     "opened_at": pos.get("opened_at"),
