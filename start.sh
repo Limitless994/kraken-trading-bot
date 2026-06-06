@@ -33,9 +33,7 @@ if [ -f "$DASH_PID_FILE" ]; then
     rm -f "$DASH_PID_FILE"
 fi
 
-# Kill any previous start.sh loop (bash process, excludes current script)
-pkill -9 -f "bash.*start.sh" 2>/dev/null
-# Kill bot Python processes (excludes start.sh itself)
+# Kill bot Python processes (the PID file already killed the loop above)
 pkill -9 -f "python.*kraken-trading-bot" 2>/dev/null
 # Wait and verify all old processes are gone (prevents deploy-with-old-code-in-memory bug)
 for i in 1 2 3 4 5; do

@@ -69,7 +69,7 @@ VOLUME_SPIKE_MULT = float(os.getenv("VOLUME_SPIKE_MULT", "1.15"))
 RSI_1H_BUY_MAX    = int(os.getenv("RSI_1H_BUY_MAX",   "65"))
 RSI_15M_BUY_MAX   = int(os.getenv("RSI_15M_BUY_MAX",  "62"))
 RSI_4H_BUY_MAX    = int(os.getenv("RSI_4H_BUY_MAX",   "70"))
-RSI_SHORT_MIN     = int(os.getenv("RSI_SHORT_MIN",     "35"))
+RSI_SHORT_MIN     = int(os.getenv("RSI_SHORT_MIN",     "40"))
 
 # ── ADX ───────────────────────────────────────────────────────────────────────
 ADX_MIN = int(os.getenv("ADX_MIN", "20"))
@@ -207,7 +207,7 @@ PROFILE_MODERATE: dict = {
     "TRAILING_STOP_PCT":      0.04,
     "KELLY_FRACTION":         0.35,
     "KELLY_MAX_SIZE_PCT":     0.35,
-    "RSI_SHORT_MIN":          36,
+    "RSI_SHORT_MIN":          40,
     "BTC_RSI_SHORT_MIN":      28,
     "ATR_TP_MULT_SHORT":      2.8,
     "ATR_SL_MULT_SHORT":      1.4,
@@ -255,7 +255,7 @@ PROFILE_AGGRESSIVE: dict = {
     # ── Kelly criterion ───────────────────────────────────────────────────────
     "KELLY_FRACTION":         0.50, # conservative=0.25: bets larger relative to edge
     "KELLY_MAX_SIZE_PCT":     0.45,
-    "RSI_SHORT_MIN":          30,
+    "RSI_SHORT_MIN":          40,
     "BTC_RSI_SHORT_MIN":      25,
 }
 
