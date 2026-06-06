@@ -243,6 +243,22 @@ def get_trades() -> list:
     return result
 
 
+def get_pairs_in_sl_cooldown(hours: float) -> set:
+    """Return pairs that hit a stop-loss exit within the last `hours` hours."""
+    if not DB_PATH.exists():
+        return set()
+    cutoff = time.time() - hours * 3600
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT pair FROM trades WHERE exit_reason='SL' AND closed_at >= ?",
+                (cutoff,),
+            ).fetchall()
+    except Exception:
+        return set()
+    return {r["pair"] for r in rows}
+
+
 # ── Groq decisions ────────────────────────────────────────────────────────────
 
 def insert_groq_decision(entry: dict) -> None:

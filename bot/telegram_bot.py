@@ -704,8 +704,15 @@ class TradingBot:
             label = mkt_ctx.get("fear_greed_label", "")
             logger.info("SHORT BLOCKED: fear_greed=%d (%s)", fg_val, label)
 
+        sl_cooldown_pairs = db.get_pairs_in_sl_cooldown(config.SL_COOLDOWN_HOURS)
+        if sl_cooldown_pairs:
+            logger.info("SL cooldown attivo per: %s (%.0fh)", ", ".join(sorted(sl_cooldown_pairs)), config.SL_COOLDOWN_HOURS)
+
         for pair in ([] if short_blocked_fg else scan_pairs):
             if pair in already_open:
+                continue
+            if pair in sl_cooldown_pairs:
+                logger.info("%s: SKIP — SL cooldown attivo (%.0fh)", pair, config.SL_COOLDOWN_HOURS)
                 continue
             if len(self.positions) >= config.MAX_OPEN_TRADES:
                 break

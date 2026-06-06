@@ -34,11 +34,33 @@ foreach ($f in $files) {
     if ($LASTEXITCODE -ne 0) { Write-Host "  ERRORE su $f" -ForegroundColor Red }
 }
 
-# Copia directory (ricorsivo)
+# Copia directory file per file (evita il bug scp -r silenzioso su Windows)
 foreach ($d in $dirs) {
-    Write-Host "  $d/" -ForegroundColor Gray
-    & scp -O -r -P $PORT -i $KEY "$SRC\$d" "${NAS}:${BOT_DIR}/"
-    if ($LASTEXITCODE -ne 0) { Write-Host "  ERRORE su $d/" -ForegroundColor Red }
+    $localDir = Join-Path $SRC $d
+    $pyFiles = Get-ChildItem -Path $localDir -Recurse -File
+    foreach ($file in $pyFiles) {
+        $relPath = $file.FullName.Substring($localDir.Length + 1).Replace('\', '/')
+        $remotePath = "${NAS}:${BOT_DIR}/${d}/${relPath}"
+        Write-Host "  ${d}/${relPath}" -ForegroundColor Gray
+        & scp -O -P $PORT -i $KEY $file.FullName $remotePath
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  ERRORE: ${d}/${relPath}" -ForegroundColor Red
+            exit 1
+        }
+    }
+}
+
+# Verifica che i file chiave siano arrivati correttamente
+Write-Host "Verifica integrità deploy..." -ForegroundColor Cyan
+$verifyFiles = @("core/config.py", "core/prompts.py", "bot/telegram_bot.py", "core/db.py")
+foreach ($vf in $verifyFiles) {
+    $localHash  = (Get-FileHash (Join-Path $SRC $vf.Replace('/', '\')) -Algorithm MD5).Hash.ToLower()
+    $remoteHash = (& ssh -p $PORT -i $KEY $NAS "md5sum '$BOT_DIR/$vf' 2>/dev/null | cut -d' ' -f1").Trim().ToLower()
+    if ($localHash -ne $remoteHash) {
+        Write-Host "  MISMATCH: $vf (locale=$localHash  NAS=$remoteHash)" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "  OK: $vf" -ForegroundColor Green
 }
 
 # ── Dipendenze Python ─────────────────────────────────────────────────────────

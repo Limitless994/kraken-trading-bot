@@ -108,10 +108,12 @@ NEWS_HEADLINES = int(os.getenv("NEWS_HEADLINES", "4"))
 ONCHAIN_ENABLED = os.getenv("ONCHAIN_ENABLED", "true").lower() == "true"
 
 # ── Groq confidence and sizing ───────────────────────────────────────────────
-GROQ_MIN_CONFIDENCE = int(os.getenv("GROQ_MIN_CONFIDENCE", "6"))
+GROQ_MIN_CONFIDENCE = int(os.getenv("GROQ_MIN_CONFIDENCE", "7"))
 AI_SIZE_HIGH        = float(os.getenv("AI_SIZE_HIGH", "0.25"))
 AI_SIZE_MED         = float(os.getenv("AI_SIZE_MED",  "0.18"))
 AI_SIZE_MIN         = float(os.getenv("AI_SIZE_MIN",  "0.12"))
+
+SL_COOLDOWN_HOURS   = float(os.getenv("SL_COOLDOWN_HOURS", "4.0"))
 
 # ── Kelly Criterion ───────────────────────────────────────────────────────────
 KELLY_ENABLED      = os.getenv("KELLY_ENABLED", "true").lower() == "true"
@@ -160,7 +162,7 @@ PROFILE_CONSERVATIVE: dict = {
     "AI_SIZE_HIGH":           0.25,
     "AI_SIZE_MED":            0.18,
     "AI_SIZE_MIN":            0.12,
-    "GROQ_MIN_CONFIDENCE":    6,
+    "GROQ_MIN_CONFIDENCE":    7,
     "MIN_SIGNAL_SCORE":       3,
     "CIRCUIT_BREAKER_LOSS_EUR": 15.0,
     "TRAILING_STOP_PCT":      0.03,
@@ -181,6 +183,7 @@ PROFILE_CONSERVATIVE: dict = {
     "TRAILING_ACTIVATION_ATR": 1.0,
     "TRAILING_DISTANCE_ATR":  1.5,
     "FEAR_GREED_SHORT_MIN":   20,
+    "SL_COOLDOWN_HOURS":      6.0,
 }
 
 PROFILE_MODERATE: dict = {
@@ -193,7 +196,7 @@ PROFILE_MODERATE: dict = {
     "BTC_RSI_MAX":            68,
     "FEAR_GREED_MIN":         15,
     "FEAR_GREED_MAX":         85,
-    "GROQ_MIN_CONFIDENCE":    6,
+    "GROQ_MIN_CONFIDENCE":    7,
     "MAX_OPEN_TRADES":        5,
     "MAX_CAPITAL_DEPLOYED":   0.87,
     "ATR_TP_MULT":            3.2,
@@ -214,6 +217,7 @@ PROFILE_MODERATE: dict = {
     "TRAILING_ACTIVATION_ATR": 0.8,
     "TRAILING_DISTANCE_ATR":  1.5,
     "FEAR_GREED_SHORT_MIN":   15,
+    "SL_COOLDOWN_HOURS":      4.0,
 }
 
 PROFILE_AGGRESSIVE: dict = {
@@ -231,7 +235,7 @@ PROFILE_AGGRESSIVE: dict = {
     "FEAR_GREED_MAX":         90,   # conservative=80: trades deeper into greed
     "FEAR_GREED_SHORT_MIN":   10,
     # ── AI quality gate ───────────────────────────────────────────────────────
-    "GROQ_MIN_CONFIDENCE":    5,    # conservative=6: accepts lower-conviction approvals
+    "GROQ_MIN_CONFIDENCE":    6,    # conservative=7: accepts lower-conviction approvals
     # ── Position limits — more simultaneous exposure ──────────────────────────
     "MAX_OPEN_TRADES":        6,    # conservative=4: more concurrent positions
     "MAX_CAPITAL_DEPLOYED":   0.95, # conservative=0.80: nearly full capital deployed
@@ -257,6 +261,7 @@ PROFILE_AGGRESSIVE: dict = {
     "KELLY_MAX_SIZE_PCT":     0.45,
     "RSI_SHORT_MIN":          40,
     "BTC_RSI_SHORT_MIN":      25,
+    "SL_COOLDOWN_HOURS":      2.0,
 }
 
 PROFILES: dict = {
