@@ -37,7 +37,15 @@ fi
 pkill -9 -f "bash.*start.sh" 2>/dev/null
 # Kill bot Python processes (excludes start.sh itself)
 pkill -9 -f "python.*kraken-trading-bot" 2>/dev/null
-sleep 2
+# Wait and verify all old processes are gone (prevents deploy-with-old-code-in-memory bug)
+for i in 1 2 3 4 5; do
+    sleep 1
+    pgrep -f "python.*kraken-trading-bot" > /dev/null 2>&1 || break
+    if [ "$i" -eq 5 ]; then
+        pkill -9 -f "python.*kraken-trading-bot" 2>/dev/null
+        sleep 2
+    fi
+done
 
 # Auto-restart loop with PID file
 (
