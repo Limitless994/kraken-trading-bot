@@ -181,7 +181,7 @@ PROFILE_CONSERVATIVE: dict = {
     "RSI_SHORT_MIN":          42,
     "BTC_RSI_SHORT_MIN":      32,
     "ATR_TP_MULT_SHORT":      2.5,
-    "ATR_SL_MULT_SHORT":      1.3,
+    "ATR_SL_MULT_SHORT":      1.1,
     "TRAILING_ACTIVATION_ATR": 1.0,
     "TRAILING_DISTANCE_ATR":  1.5,
     "FEAR_GREED_SHORT_MIN":   20,
@@ -304,13 +304,22 @@ def apply_profile(name: str) -> None:
 
 
 def _load_active_profile() -> str:
-    import json as _json
+    import json as _json, logging as _log
+    _logger = _log.getLogger(__name__)
     default = os.getenv("TRADING_PROFILE", "conservative").lower()
     # Try DB first (available after init_db())
     try:
         from core import db as _db
         val = _db.get_setting("active_profile")
         if val and val in PROFILES:
+            if val != default:
+                _logger.warning(
+                    "Profilo caricato da DB: '%s' (sovrascrive .env TRADING_PROFILE='%s'). "
+                    "Usa /profile %s da Telegram o aggiorna .env per allinearli.",
+                    val, default, default,
+                )
+            else:
+                _logger.info("Profilo caricato: '%s' (DB e .env allineati)", val)
             return val
     except Exception:
         pass
@@ -319,9 +328,12 @@ def _load_active_profile() -> str:
         if _ACTIVE_PROFILE_FILE.exists():
             data = _json.loads(_ACTIVE_PROFILE_FILE.read_text(encoding="utf-8"))
             candidate = data.get("profile", default)
-            return candidate if candidate in PROFILES else default
+            if candidate in PROFILES:
+                _logger.info("Profilo caricato da active_profile.json: '%s'", candidate)
+                return candidate
     except Exception:
         pass
+    _logger.info("Profilo caricato da .env: '%s'", default)
     return default
 
 
