@@ -167,6 +167,7 @@ class TradingBot:
         self._scanning   = False   # lock scan
         self._discovering = False  # lock discovery
         self._in_flight: set = set()  # per-scan idempotency guard
+        self._groq_rejected: dict = {}  # pair → timestamp of last Groq RIFIUTA
         self._register_handlers()
 
     # ── Handler registration ──────────────────────────────────────────────────
@@ -297,8 +298,8 @@ class TradingBot:
         """Execute market close for pair. Returns notification message."""
         pos = self.positions[pair]
         ticker  = await asyncio.to_thread(kraken_client.get_ticker, pair)
-        current = ticker["last"]
         side    = pos.get("side", "long")
+        current = float(ticker["ask"][0]) if side == "short" else float(ticker["bid"][0])
 
         if config.PAPER_TRADING:
             txid = "PAPER"
@@ -714,6 +715,10 @@ class TradingBot:
             if pair in sl_cooldown_pairs:
                 logger.info("%s: SKIP — SL cooldown attivo (%.0fh)", pair, config.SL_COOLDOWN_HOURS)
                 continue
+            sl_24h = db.get_sl_count_24h(pair)
+            if sl_24h >= config.MAX_SL_PER_PAIR_24H:
+                logger.info("%s: SKIP — %d SL nelle ultime 24h (max %d)", pair, sl_24h, config.MAX_SL_PER_PAIR_24H)
+                continue
             if len(self.positions) >= config.MAX_OPEN_TRADES:
                 break
 
@@ -745,6 +750,14 @@ class TradingBot:
                 if _short_exp + signal.size_eur > _max_beta:
                     logger.info("%s: SKIP BTC-beta short (%.0f€ + %.0f€ > %.0f€)", signal.pair, _short_exp, signal.size_eur, _max_beta)
                     continue
+
+            cooldown_secs = config.GROQ_REJECTION_COOLDOWN_MIN * 60
+            last_rejected = self._groq_rejected.get(signal.pair, 0)
+            elapsed_min   = (time.time() - last_rejected) / 60
+            if last_rejected and elapsed_min < config.GROQ_REJECTION_COOLDOWN_MIN:
+                logger.info("%s: SKIP Groq — rifiutato %.0f min fa (cooldown %d min)",
+                            signal.pair, elapsed_min, config.GROQ_REJECTION_COOLDOWN_MIN)
+                continue
 
             logger.info(
                 "SHORT Signal: %s  score=%d  ADX=%.1f  price=%.6f — asking Groq",
@@ -791,6 +804,7 @@ class TradingBot:
             })
 
             if execute:
+                self._groq_rejected.pop(signal.pair, None)
                 if signal.pair in self._in_flight:
                     logger.warning("Guard: %s già in-flight — skip", signal.pair)
                 else:
@@ -809,6 +823,7 @@ class TradingBot:
                     ),
                 )
                 logger.info("Groq rejected SHORT %s [%d/10]: %s", signal.pair, confidence, reason)
+                self._groq_rejected[signal.pair] = time.time()
 
             signal_found = True
             await asyncio.sleep(1)
@@ -825,9 +840,8 @@ class TradingBot:
         for pair, pos in list(self.positions.items()):
             try:
                 ticker  = await asyncio.to_thread(kraken_client.get_ticker, pair)
-                current = ticker["last"]
-
-                side = pos.get("side", "long")
+                side    = pos.get("side", "long")
+                current = float(ticker["ask"][0]) if side == "short" else float(ticker["bid"][0])
 
                 # ── Trailing stop update ──────────────────────────────────
                 if config.TRAILING_STOP_ENABLED:
@@ -874,7 +888,12 @@ class TradingBot:
                         txid   = txids[0] if txids else "unknown"
                         suffix = f"TX: {txid}"
                 except Exception as exc:
-                    suffix = f"ERRORE chiusura automatica — chiudi manualmente!\n{exc}"
+                    logger.error("Close order FAILED %s: %s — posizione mantenuta, riprovo", pair, exc)
+                    await ctx.bot.send_message(
+                        chat_id=config.TELEGRAM_CHAT_ID,
+                        text=f"🚨 Chiusura {pair} FALLITA — riprovo al prossimo ciclo\n{exc}",
+                    )
+                    continue
 
                 icon = "✅" if hit_tp else "🛑"
                 funding_str = f"  funding -{funding_cost:.4f}€" if funding_cost > 0 else ""

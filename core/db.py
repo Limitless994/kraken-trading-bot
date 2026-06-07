@@ -243,6 +243,22 @@ def get_trades() -> list:
     return result
 
 
+def get_sl_count_24h(pair: str) -> int:
+    """Return number of stop-loss exits for `pair` in the last 24 hours."""
+    if not DB_PATH.exists():
+        return 0
+    cutoff = time.time() - 86400
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM trades WHERE pair=? AND exit_reason='SL' AND closed_at >= ?",
+                (pair, cutoff),
+            ).fetchone()
+    except Exception:
+        return 0
+    return row[0] if row else 0
+
+
 def get_pairs_in_sl_cooldown(hours: float) -> set:
     """Return pairs that hit a stop-loss exit within the last `hours` hours."""
     if not DB_PATH.exists():

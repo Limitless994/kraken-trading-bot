@@ -113,7 +113,9 @@ AI_SIZE_HIGH        = float(os.getenv("AI_SIZE_HIGH", "0.25"))
 AI_SIZE_MED         = float(os.getenv("AI_SIZE_MED",  "0.18"))
 AI_SIZE_MIN         = float(os.getenv("AI_SIZE_MIN",  "0.12"))
 
-SL_COOLDOWN_HOURS   = float(os.getenv("SL_COOLDOWN_HOURS", "4.0"))
+SL_COOLDOWN_HOURS          = float(os.getenv("SL_COOLDOWN_HOURS",          "4.0"))
+MAX_SL_PER_PAIR_24H        = int(os.getenv("MAX_SL_PER_PAIR_24H",          "2"))
+GROQ_REJECTION_COOLDOWN_MIN = int(os.getenv("GROQ_REJECTION_COOLDOWN_MIN", "45"))
 
 # ── Kelly Criterion ───────────────────────────────────────────────────────────
 KELLY_ENABLED      = os.getenv("KELLY_ENABLED", "true").lower() == "true"
@@ -184,6 +186,7 @@ PROFILE_CONSERVATIVE: dict = {
     "TRAILING_DISTANCE_ATR":  1.5,
     "FEAR_GREED_SHORT_MIN":   20,
     "SL_COOLDOWN_HOURS":      6.0,
+    "MAX_SL_PER_PAIR_24H":    2,
 }
 
 PROFILE_MODERATE: dict = {
@@ -218,6 +221,7 @@ PROFILE_MODERATE: dict = {
     "TRAILING_DISTANCE_ATR":  1.5,
     "FEAR_GREED_SHORT_MIN":   15,
     "SL_COOLDOWN_HOURS":      4.0,
+    "MAX_SL_PER_PAIR_24H":    2,
 }
 
 PROFILE_AGGRESSIVE: dict = {
@@ -262,6 +266,7 @@ PROFILE_AGGRESSIVE: dict = {
     "RSI_SHORT_MIN":          40,
     "BTC_RSI_SHORT_MIN":      25,
     "SL_COOLDOWN_HOURS":      2.0,
+    "MAX_SL_PER_PAIR_24H":    3,
 }
 
 PROFILES: dict = {
