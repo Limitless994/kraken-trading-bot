@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 _DIR                = Path(__file__).parent.parent   # project root
 PENDING_ORDERS_FILE = _DIR / "pending_orders.json"
 DYNAMIC_PAIRS_FILE  = _DIR / "dynamic_pairs.json"
+DISCOVERY_LOG_FILE  = _DIR / "discovery_log.json"
 
 
 # ── Misc helpers (non-persistence) ────────────────────────────────────────────
@@ -55,6 +56,28 @@ def _load_json(path: "Path", default):
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
     except Exception:
         return default
+
+
+def _prioritize_discovery_candidates(pairs: list) -> list:
+    """Load discovery_log.json and move recent candidates to the front of pairs list."""
+    discovery_data = _load_json(DISCOVERY_LOG_FILE, {})
+    candidates = discovery_data.get("candidates", [])
+    ts_discovery = discovery_data.get("timestamp", 0)
+    now = time.time()
+
+    if not candidates or (now - ts_discovery) > 6 * 3600:  # discard if >6h old
+        return pairs
+
+    candidate_pairs = {c.get("pair") for c in candidates if c.get("pair")}
+    ordered = []
+    for pair in pairs:
+        if pair in candidate_pairs:
+            ordered.insert(0, pair)  # discovery candidates first
+        else:
+            ordered.append(pair)
+
+    logger.info("Discovery watchlist: %s", [p for p in ordered[:len(candidate_pairs)]])
+    return ordered
 
 
 def _margin_open_fee(pair: str) -> float:
@@ -166,6 +189,7 @@ class TradingBot:
         self._positions_lock = threading.Lock()   # guards in-memory dict + DB writes
         self._scanning   = False   # lock scan
         self._discovering = False  # lock discovery
+        self._scan_skip_counter: dict[str, int] = {}  # tracks scan skips for non-discovery pairs
         self._in_flight: set = set()  # per-scan idempotency guard
         self._groq_rejected: dict = {}  # pair → timestamp of last Groq RIFIUTA
         self._register_handlers()
@@ -573,6 +597,10 @@ class TradingBot:
             label = mkt_ctx.get("fear_greed_label", "")
             logger.info("LONG BLOCKED: fear_greed=%d (%s)", fg_val, label)
 
+        if fg_val and fg_val < 10:
+            label = mkt_ctx.get("fear_greed_label", "")
+            logger.warning("⚠️  MERCATO IN PANICO ESTREMO (FG=%d %s) — BOT APRE SHORT SOLO CON ANALISI GROQ RISTRETTA", fg_val, label)
+
         # ── Kelly sizing from trade history ───────────────────────────────────
         trades_history = db.get_trades()
         kelly_pct = kelly_size_pct(trades_history)
@@ -601,15 +629,28 @@ class TradingBot:
                 }))
 
         dynamic = _load_json(DYNAMIC_PAIRS_FILE, [])
+        discovery_data = _load_json(DISCOVERY_LOG_FILE, {})
+        discovery_candidates = {c.get("pair") for c in discovery_data.get("candidates", []) if c.get("pair")}
         scan_pairs = list(dict.fromkeys(config.PAIRS + dynamic))
+        scan_pairs = _prioritize_discovery_candidates(scan_pairs)
 
         analysis_cache: dict = {}
+        SKIP_THRESHOLD = 3  # non-discovery pairs scanned every 3-4 cycles
 
         for pair in ([] if long_blocked_fg else scan_pairs):
             if pair in already_open:
                 continue
             if len(self.positions) >= config.MAX_OPEN_TRADES:
                 break
+
+            is_discovery = pair in discovery_candidates or pair in config.PAIRS
+            is_open_position = pair in self.positions
+            if not is_discovery and not is_open_position:
+                self._scan_skip_counter[pair] = self._scan_skip_counter.get(pair, 0) + 1
+                if self._scan_skip_counter[pair] < SKIP_THRESHOLD:
+                    logger.info("Skip %s (low priority, counter=%d/%d)", pair, self._scan_skip_counter[pair], SKIP_THRESHOLD)
+                    continue
+                self._scan_skip_counter[pair] = 0
 
             logger.info("Scanning %s ...", pair)
             analysis = await asyncio.to_thread(analyze, pair)
@@ -633,6 +674,11 @@ class TradingBot:
                 if _long_exp + signal.size_eur > _max_beta:
                     logger.info("%s: SKIP BTC-beta long (%.0f€ + %.0f€ > %.0f€)", signal.pair, _long_exp, signal.size_eur, _max_beta)
                     continue
+
+            if signal.rsi_1h > 65:
+                logger.info("%s: SKIP Groq — RSI(1h)=%.1f overbought (opportunità migliori più tardi)", signal.pair, signal.rsi_1h)
+                self._groq_rejected[signal.pair] = time.time()
+                continue
 
             logger.info(
                 "Signal: %s  score=%d  ADX=%.1f  price=%.6f — asking Groq",
@@ -759,6 +805,18 @@ class TradingBot:
                             signal.pair, elapsed_min, config.GROQ_REJECTION_COOLDOWN_MIN)
                 continue
 
+            rsi_slope_1h = signal.rsi_1h - signal.rsi_1h_prev
+            if signal.score < 3 and rsi_slope_1h > 0:
+                logger.info("%s: SKIP Groq — score=%d e RSI slope=%.2f positivo (segnale debole in recovery)",
+                            signal.pair, signal.score, rsi_slope_1h)
+                self._groq_rejected[signal.pair] = time.time()
+                continue
+
+            if signal.rsi_1h < 35:
+                logger.info("%s: SKIP Groq — RSI(1h)=%.1f oversold (rimbalzo probabile)", signal.pair, signal.rsi_1h)
+                self._groq_rejected[signal.pair] = time.time()
+                continue
+
             logger.info(
                 "SHORT Signal: %s  score=%d  ADX=%.1f  price=%.6f — asking Groq",
                 signal.pair, signal.score, signal.adx, signal.price,
@@ -841,7 +899,9 @@ class TradingBot:
             try:
                 ticker  = await asyncio.to_thread(kraken_client.get_ticker, pair)
                 side    = pos.get("side", "long")
-                current = float(ticker["ask"][0]) if side == "short" else float(ticker["bid"][0])
+                ask_price = ticker["ask"] if isinstance(ticker["ask"], float) else ticker["ask"][0]
+                bid_price = ticker["bid"] if isinstance(ticker["bid"], float) else ticker["bid"][0]
+                current = float(ask_price) if side == "short" else float(bid_price)
 
                 # ── Trailing stop update ──────────────────────────────────
                 if config.TRAILING_STOP_ENABLED:
@@ -1152,6 +1212,11 @@ class TradingBot:
         top_pairs = [c["pair"] for c in result.get("candidates", [])[:5]]
         DYNAMIC_PAIRS_FILE.write_text(
             json.dumps(top_pairs, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        DISCOVERY_LOG_FILE.write_text(
+            json.dumps(result, ensure_ascii=False, default=str),
             encoding="utf-8",
         )
 

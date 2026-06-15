@@ -98,7 +98,7 @@ MAX_BTC_BETA_EXPOSURE_PCT = float(os.getenv("MAX_BTC_BETA_EXPOSURE_PCT", "0.60")
 FEAR_GREED_ENABLED   = os.getenv("FEAR_GREED_ENABLED", "true").lower() == "true"
 FEAR_GREED_MIN       = int(os.getenv("FEAR_GREED_MIN",       "20"))   # blocks longs (extreme fear)
 FEAR_GREED_MAX       = int(os.getenv("FEAR_GREED_MAX",       "80"))   # blocks both longs and shorts (extreme greed)
-FEAR_GREED_SHORT_MIN = int(os.getenv("FEAR_GREED_SHORT_MIN", "20"))   # blocks shorts (extreme fear = capitulation bounce risk)
+FEAR_GREED_SHORT_MIN = int(os.getenv("FEAR_GREED_SHORT_MIN", "5"))    # blocks shorts at extreme fear (default: 5, overridden by profiles)
 
 # ── News sentiment ────────────────────────────────────────────────────────────
 NEWS_ENABLED   = os.getenv("NEWS_ENABLED", "true").lower() == "true"
@@ -115,7 +115,7 @@ AI_SIZE_MIN         = float(os.getenv("AI_SIZE_MIN",  "0.12"))
 
 SL_COOLDOWN_HOURS          = float(os.getenv("SL_COOLDOWN_HOURS",          "4.0"))
 MAX_SL_PER_PAIR_24H        = int(os.getenv("MAX_SL_PER_PAIR_24H",          "2"))
-GROQ_REJECTION_COOLDOWN_MIN = int(os.getenv("GROQ_REJECTION_COOLDOWN_MIN", "45"))
+GROQ_REJECTION_COOLDOWN_MIN = int(os.getenv("GROQ_REJECTION_COOLDOWN_MIN", "90"))
 
 # ── Kelly Criterion ───────────────────────────────────────────────────────────
 KELLY_ENABLED      = os.getenv("KELLY_ENABLED", "true").lower() == "true"
@@ -125,7 +125,7 @@ KELLY_MIN_SIZE_PCT = float(os.getenv("KELLY_MIN_SIZE_PCT", "0.10"))
 KELLY_MAX_SIZE_PCT = float(os.getenv("KELLY_MAX_SIZE_PCT", "0.25"))
 
 # ── Scan timing ───────────────────────────────────────────────────────────────
-SCAN_INTERVAL_MINUTES  = int(os.getenv("SCAN_INTERVAL_MINUTES",  "15"))
+SCAN_INTERVAL_MINUTES  = int(os.getenv("SCAN_INTERVAL_MINUTES",  "30"))
 POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "60"))
 DAILY_REPORT_HOUR      = int(os.getenv("DAILY_REPORT_HOUR",      "8"))
 
@@ -184,7 +184,7 @@ PROFILE_CONSERVATIVE: dict = {
     "ATR_SL_MULT_SHORT":      1.1,
     "TRAILING_ACTIVATION_ATR": 1.0,
     "TRAILING_DISTANCE_ATR":  1.5,
-    "FEAR_GREED_SHORT_MIN":   20,
+    "FEAR_GREED_SHORT_MIN":   15,
     "SL_COOLDOWN_HOURS":      6.0,
     "MAX_SL_PER_PAIR_24H":    2,
 }
@@ -199,7 +199,7 @@ PROFILE_MODERATE: dict = {
     "BTC_RSI_MAX":            68,
     "FEAR_GREED_MIN":         15,
     "FEAR_GREED_MAX":         85,
-    "GROQ_MIN_CONFIDENCE":    7,
+    "GROQ_MIN_CONFIDENCE":    6,
     "MAX_OPEN_TRADES":        5,
     "MAX_CAPITAL_DEPLOYED":   0.87,
     "ATR_TP_MULT":            3.2,
@@ -219,7 +219,7 @@ PROFILE_MODERATE: dict = {
     "ATR_SL_MULT_SHORT":      1.4,
     "TRAILING_ACTIVATION_ATR": 0.8,
     "TRAILING_DISTANCE_ATR":  1.5,
-    "FEAR_GREED_SHORT_MIN":   15,
+    "FEAR_GREED_SHORT_MIN":   5,
     "SL_COOLDOWN_HOURS":      4.0,
     "MAX_SL_PER_PAIR_24H":    2,
 }
@@ -282,14 +282,19 @@ ACTIVE_PROFILE: str = "conservative"
 
 def apply_profile(name: str) -> None:
     """Switch trading profile at runtime and persist the choice."""
-    import sys, json as _json
+    import sys, json as _json, logging as _log
+    _logger = _log.getLogger(__name__)
     name = name.lower().strip()
     if name not in PROFILES:
         raise ValueError(f"Profilo '{name}' sconosciuto. Scegli: {list(PROFILES)}")
     module = sys.modules[__name__]
+    _logger.info("[APPLY_PROFILE] Applicando profilo '%s'", name)
     for key, val in PROFILES[name].items():
         setattr(module, key, val)
+        if key == "FEAR_GREED_SHORT_MIN":
+            _logger.info("[APPLY_PROFILE] Settiamo %s = %s", key, val)
     setattr(module, "ACTIVE_PROFILE", name)
+    _logger.info("[APPLY_PROFILE] Profilo '%s' applicato. FEAR_GREED_SHORT_MIN = %s", name, getattr(module, "FEAR_GREED_SHORT_MIN"))
     # Persist to DB first; fall back to JSON if DB not yet initialised
     try:
         from core import db as _db

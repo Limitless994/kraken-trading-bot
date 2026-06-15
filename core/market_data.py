@@ -211,7 +211,11 @@ def fear_greed_blocks_short(fg_value: Optional[int]) -> bool:
     """Blocks SHORT trades in extreme greed (overheating) and extreme fear (capitulation bounce risk)."""
     if fg_value is None:
         return False
-    return fg_value > config.FEAR_GREED_MAX or fg_value < config.FEAR_GREED_SHORT_MIN
+    blocks = fg_value > config.FEAR_GREED_MAX or fg_value < config.FEAR_GREED_SHORT_MIN
+    if fg_value < 15:
+        logger.debug("[FEAR_GREED_DEBUG] FG=%d, FEAR_GREED_MAX=%d, FEAR_GREED_SHORT_MIN=%d → blocks=%s",
+                     fg_value, config.FEAR_GREED_MAX, config.FEAR_GREED_SHORT_MIN, blocks)
+    return blocks
 
 
 def funding_rate_warning(btc_rate: Optional[float]) -> bool:

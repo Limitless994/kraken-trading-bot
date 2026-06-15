@@ -121,6 +121,9 @@ def main() -> None:
     db.init_db()
     db.migrate_from_json()   # no-op after first run (files renamed to .bak)
 
+    # Reload profile now that DB is initialized
+    config.apply_profile(config._load_active_profile())
+
     from bot.telegram_bot import TradingBot
     try:
         global _bot_instance
