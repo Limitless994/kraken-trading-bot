@@ -705,8 +705,8 @@ class TradingBot:
                     logger.info("%s: SKIP BTC-beta long (%.0f€ + %.0f€ > %.0f€)", signal.pair, _long_exp, signal.size_eur, _max_beta)
                     continue
 
-            if signal.rsi_1h > 65:
-                logger.info("%s: SKIP Groq — RSI(1h)=%.1f overbought (opportunità migliori più tardi)", signal.pair, signal.rsi_1h)
+            if signal.rsi_1h > config.RSI_1H_BUY_MAX:
+                logger.info("%s: SKIP Groq — RSI(1h)=%.1f > %d overbought (opportunità migliori più tardi)", signal.pair, signal.rsi_1h, config.RSI_1H_BUY_MAX)
                 self._groq_rejected[signal.pair] = time.time()
                 continue
 
@@ -854,9 +854,9 @@ class TradingBot:
                 continue
 
             rsi_slope_1h = signal.rsi_1h - signal.rsi_1h_prev
-            if signal.score < 3 and rsi_slope_1h > 0:
-                logger.info("%s: SKIP Groq — score=%d e RSI slope=%.2f positivo (segnale debole in recovery)",
-                            signal.pair, signal.score, rsi_slope_1h)
+            if signal.score < config.MIN_SIGNAL_SCORE and rsi_slope_1h > 0:
+                logger.info("%s: SKIP Groq — score=%d (< %d) e RSI slope=%.2f positivo (segnale debole in recovery)",
+                            signal.pair, signal.score, config.MIN_SIGNAL_SCORE, rsi_slope_1h)
                 self._groq_rejected[signal.pair] = time.time()
                 continue
 
