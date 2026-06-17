@@ -117,6 +117,14 @@ SL_COOLDOWN_HOURS          = float(os.getenv("SL_COOLDOWN_HOURS",          "4.0"
 MAX_SL_PER_PAIR_24H        = int(os.getenv("MAX_SL_PER_PAIR_24H",          "2"))
 GROQ_REJECTION_COOLDOWN_MIN = int(os.getenv("GROQ_REJECTION_COOLDOWN_MIN", "90"))
 
+# ── Groq rate-limit guard ────────────────────────────────────────────────────
+# Daily cap is a safety net against runaway loops, not a tight budget: observed
+# usage peaks ~80/day, free-tier RPD is ~1000. Spacing respects the RPM ceiling.
+GROQ_MAX_CALLS_PER_DAY         = int(os.getenv("GROQ_MAX_CALLS_PER_DAY",         "400"))
+GROQ_MIN_SECONDS_BETWEEN_CALLS = float(os.getenv("GROQ_MIN_SECONDS_BETWEEN_CALLS", "2.0"))
+# When Groq errors/rate-limits: false = skip the trade (safe), true = open blind.
+GROQ_FALLBACK_EXECUTE          = os.getenv("GROQ_FALLBACK_EXECUTE", "false").lower() == "true"
+
 # ── Kelly Criterion ───────────────────────────────────────────────────────────
 KELLY_ENABLED      = os.getenv("KELLY_ENABLED", "true").lower() == "true"
 KELLY_MIN_TRADES   = int(os.getenv("KELLY_MIN_TRADES",   "50"))

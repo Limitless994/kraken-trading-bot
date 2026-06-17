@@ -472,12 +472,12 @@ class TestGroqEvaluator(unittest.TestCase):
         self.assertEqual(size, 0.0)
 
     @patch("services.groq_evaluator._get_client")
-    def test_groq_offline_fallback(self, mock_gc):
+    def test_groq_offline_skips_by_default(self, mock_gc):
         mock_gc.side_effect = Exception("Connection refused")
         from services import groq_evaluator
         execute, conf, reason, size = groq_evaluator.evaluate(_make_signal())
-        self.assertTrue(execute)
-        self.assertEqual(size, config.AI_SIZE_MIN)
+        self.assertFalse(execute)           # safe default: no blind trade when Groq is down
+        self.assertEqual(size, 0.0)
 
     @patch("services.groq_evaluator._get_client")
     def test_market_context_included(self, mock_gc):
@@ -1032,29 +1032,54 @@ class TestGroqFallbackCounter(unittest.TestCase):
     def setUp(self):
         import services.groq_evaluator as ge
         ge._consecutive_fallbacks = 0
+        ge._calls_today = 0
+        ge._calls_date = ""
+        ge._last_call_ts = 0.0
+        config.GROQ_MIN_SECONDS_BETWEEN_CALLS = 0.0
+        config.GROQ_FALLBACK_EXECUTE = False
 
     def tearDown(self):
         import services.groq_evaluator as ge
         ge._consecutive_fallbacks = 0
 
     @patch("services.groq_evaluator._get_client")
-    def test_first_failure_returns_fallback(self, mock_gc):
+    def test_first_failure_skips_by_default(self, mock_gc):
         mock_gc.side_effect = Exception("offline")
         from services import groq_evaluator
         execute, conf, reason, size = groq_evaluator.evaluate(_make_signal())
-        self.assertTrue(execute)
-        self.assertEqual(size, config.AI_SIZE_MIN)
+        self.assertFalse(execute)           # safe default: no blind trade on error/429
+        self.assertEqual(size, 0.0)
         self.assertEqual(groq_evaluator._consecutive_fallbacks, 1)
 
     @patch("services.groq_evaluator._get_client")
-    def test_second_failure_still_fallback(self, mock_gc):
+    def test_second_failure_still_skips(self, mock_gc):
         mock_gc.side_effect = Exception("offline")
         from services import groq_evaluator
         groq_evaluator.evaluate(_make_signal())
         execute, _, _, size = groq_evaluator.evaluate(_make_signal())
-        self.assertTrue(execute)
-        self.assertEqual(size, config.AI_SIZE_MIN)
+        self.assertFalse(execute)
+        self.assertEqual(size, 0.0)
         self.assertEqual(groq_evaluator._consecutive_fallbacks, 2)
+
+    @patch("services.groq_evaluator._get_client")
+    def test_fallback_execute_flag_opens_trade(self, mock_gc):
+        mock_gc.side_effect = Exception("offline")
+        from services import groq_evaluator
+        config.GROQ_FALLBACK_EXECUTE = True
+        execute, conf, reason, size = groq_evaluator.evaluate(_make_signal())
+        self.assertTrue(execute)            # opt-in legacy behavior
+        self.assertEqual(size, config.AI_SIZE_MIN)
+        config.GROQ_FALLBACK_EXECUTE = False
+
+    @patch("services.groq_evaluator._get_client")
+    def test_budget_exhausted_skips_without_calling(self, mock_gc):
+        from services import groq_evaluator
+        config.GROQ_MAX_CALLS_PER_DAY = 0
+        execute, conf, reason, size = groq_evaluator.evaluate(_make_signal())
+        self.assertFalse(execute)
+        self.assertEqual(size, 0.0)
+        mock_gc.assert_not_called()         # must not hit the API when over budget
+        config.GROQ_MAX_CALLS_PER_DAY = 400
 
     @patch("services.groq_evaluator._get_client")
     def test_third_failure_raises_groq_unavailable(self, mock_gc):
@@ -1453,6 +1478,11 @@ _original_TestGroqEvaluator_tearDown = getattr(TestGroqEvaluator, "tearDown", No
 def _groq_evaluator_setUp(self):
     import services.groq_evaluator as ge
     ge._consecutive_fallbacks = 0
+    ge._calls_today = 0
+    ge._calls_date = ""
+    ge._last_call_ts = 0.0
+    config.GROQ_MIN_SECONDS_BETWEEN_CALLS = 0.0
+    config.GROQ_MAX_CALLS_PER_DAY = 400
     if _original_TestGroqEvaluator_setUp:
         _original_TestGroqEvaluator_setUp(self)
 
