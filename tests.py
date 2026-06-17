@@ -472,6 +472,19 @@ class TestGroqEvaluator(unittest.TestCase):
         self.assertEqual(size, 0.0)
 
     @patch("services.groq_evaluator._get_client")
+    def test_unexpected_format_skips_and_returns_4tuple(self, mock_gc):
+        # A garbled reply (neither ESEGUI nor RIFIUTA) must not open a trade and
+        # must still return the 4-value contract callers unpack.
+        mock_gc.return_value = self._mock_groq("Boh, non saprei dirti")
+        from services import groq_evaluator
+        config.GROQ_FALLBACK_EXECUTE = False
+        result = groq_evaluator.evaluate(_make_signal())
+        self.assertEqual(len(result), 4)
+        execute, conf, reason, size = result
+        self.assertFalse(execute)
+        self.assertEqual(size, 0.0)
+
+    @patch("services.groq_evaluator._get_client")
     def test_groq_offline_skips_by_default(self, mock_gc):
         mock_gc.side_effect = Exception("Connection refused")
         from services import groq_evaluator
@@ -1293,6 +1306,41 @@ class TestLimitOrderLock(unittest.TestCase):
             self.assertTrue(hasattr(lock, "acquire"))
             self.assertTrue(hasattr(lock, "release"))
             self.assertIn("lock", type(lock).__name__.lower())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 19b. PENDING ORDER — no phantom position on transient query failure
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPendingOrderNoPhantom(unittest.TestCase):
+    """A transient QueryOrders failure must NOT book a position that isn't held."""
+
+    def test_query_failure_leaves_pending_no_position(self):
+        import asyncio as _asyncio
+        from unittest.mock import AsyncMock
+        with patch("bot.telegram_bot.Application") as mock_app_cls:
+            mock_app_cls.builder.return_value.token.return_value.build.return_value = MagicMock()
+            import bot.telegram_bot as tb
+            bot = tb.TradingBot()
+            bot.app = MagicMock()
+            bot.app.bot.send_message = AsyncMock()
+
+            po = {"txid": "OXXXXX-1", "limit_price": 1.0, "size_eur": 20.0,
+                  "size_crypto": 20.0, "take_profit": 1.1, "stop_loss": 0.95,
+                  "trailing_stop": 0.95, "timeout_at": 9_999_999_999}
+            prev_paper = config.PAPER_TRADING
+            config.PAPER_TRADING = False
+            try:
+                with patch.object(tb.db, "get_pending_orders", return_value={"SOLEUR": po}), \
+                     patch.object(tb.kraken_client, "get_open_orders", return_value={"open": {}}), \
+                     patch.object(tb.kraken_client, "query_orders", side_effect=Exception("503")), \
+                     patch.object(tb.db, "insert_position") as mock_insert, \
+                     patch.object(tb.db, "delete_pending_order") as mock_delete:
+                    _asyncio.run(bot._job_check_pending_orders(MagicMock()))
+            finally:
+                config.PAPER_TRADING = prev_paper
+            mock_insert.assert_not_called()    # no phantom position booked
+            mock_delete.assert_not_called()    # order stays pending for retry
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

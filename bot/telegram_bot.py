@@ -335,7 +335,8 @@ class TradingBot:
         pos = self.positions[pair]
         ticker  = await asyncio.to_thread(kraken_client.get_ticker, pair)
         side    = pos.get("side", "long")
-        current = float(ticker["ask"][0]) if side == "short" else float(ticker["bid"][0])
+        # get_ticker returns ask/bid as floats; close a short at the ask, a long at the bid.
+        current = float(ticker["ask"]) if side == "short" else float(ticker["bid"])
 
         if config.PAPER_TRADING:
             txid = "PAPER"
@@ -1114,12 +1115,15 @@ class TradingBot:
         for pair, po in list(pending.items()):
             txid = po["txid"]
             if txid not in open_txids:
-                order_status = "unknown"
+                # Order left the open book: it either filled, or was canceled/expired.
+                # Never assume a fill — a transient query failure must not book a
+                # phantom position that isn't actually held on Kraken.
                 try:
                     info = await asyncio.to_thread(kraken_client.query_orders, [txid])
                     order_status = info.get(txid, {}).get("status", "unknown")
                 except Exception as exc:
-                    logger.warning("Cannot query order %s: %s — assuming filled", txid, exc)
+                    logger.warning("Cannot query order %s: %s — lascio pending, riprovo", txid, exc)
+                    continue
                 if order_status in ("canceled", "expired"):
                     logger.warning("Limit order %s was %s — no position created", txid, order_status)
                     to_remove.append(pair)
@@ -1127,6 +1131,11 @@ class TradingBot:
                         chat_id=config.TELEGRAM_CHAT_ID,
                         text=f"LIMIT {order_status.upper()} {pair}  TX {txid} — nessuna posizione aperta",
                     )
+                    continue
+                if order_status != "closed":
+                    # Not yet a confirmed fill (e.g. 'open'/'pending' on the next page,
+                    # or 'unknown') — leave it pending and re-check on the next cycle.
+                    logger.info("Limit order %s status=%s — non confermato, riprovo", txid, order_status)
                     continue
                 pos_dict = {
                     "entry":         po["limit_price"],
