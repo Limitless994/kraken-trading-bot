@@ -181,6 +181,8 @@ PROFILE_CONSERVATIVE: dict = {
     "BTC_RSI_MAX":            65,
     "VOLUME_SPIKE_MULT":      1.15,
     "ADX_MIN":                20,
+    "DAILY_EMA_FILTER":       True,   # block longs below daily EMA50 (trend protection)
+    "BTC_EMA_FILTER":         True,   # block non-BTC longs when BTC below its EMA50
     "RSI_1H_BUY_MAX":         65,
     "RSI_15M_BUY_MAX":        62,
     "RSI_4H_BUY_MAX":         70,
@@ -200,6 +202,8 @@ PROFILE_CONSERVATIVE: dict = {
 PROFILE_MODERATE: dict = {
     "MIN_SIGNAL_SCORE":       2,
     "ADX_MIN":                17,
+    "DAILY_EMA_FILTER":       True,   # moderate keeps trend protection
+    "BTC_EMA_FILTER":         True,
     "VOLUME_SPIKE_MULT":      1.08,
     "RSI_1H_BUY_MAX":         68,
     "RSI_15M_BUY_MAX":        65,
@@ -235,8 +239,11 @@ PROFILE_MODERATE: dict = {
 PROFILE_AGGRESSIVE: dict = {
     # ── Entry filters — lower = more trades, higher noise ratio ──────────────
     "MIN_SIGNAL_SCORE":       2,    # conservative=3: accepts weaker setups
-    "ADX_MIN":                15,   # conservative=20: enters ranging markets
+    "ADX_MIN":                12,   # conservative=20: enters even weak/ranging trends
     "VOLUME_SPIKE_MULT":      1.05, # conservative=1.15: lower bar for volume confirmation
+    # ── Structural trend filters OFF — this is what makes aggressive aggressive ─
+    "DAILY_EMA_FILTER":       False,# conservative=True: take longs even below daily EMA50
+    "BTC_EMA_FILTER":         False,# conservative=True: don't gate altcoin longs on BTC EMA
     # ── RSI thresholds — higher = buys more extended moves ───────────────────
     "RSI_1H_BUY_MAX":         72,
     "RSI_15M_BUY_MAX":        68,
@@ -271,7 +278,7 @@ PROFILE_AGGRESSIVE: dict = {
     # ── Kelly criterion ───────────────────────────────────────────────────────
     "KELLY_FRACTION":         0.50, # conservative=0.25: bets larger relative to edge
     "KELLY_MAX_SIZE_PCT":     0.45,
-    "RSI_SHORT_MIN":          40,
+    "RSI_SHORT_MIN":          36,   # conservative=42: shorts closer to oversold
     "BTC_RSI_SHORT_MIN":      25,
     "SL_COOLDOWN_HOURS":      2.0,
     "MAX_SL_PER_PAIR_24H":    3,
