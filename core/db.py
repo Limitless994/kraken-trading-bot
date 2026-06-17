@@ -111,6 +111,19 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+            CREATE TABLE IF NOT EXISTS pending_orders (
+                pair TEXT PRIMARY KEY,
+                txid TEXT NOT NULL,
+                limit_price REAL,
+                signal_id TEXT,
+                size_eur REAL,
+                size_crypto REAL,
+                placed_at REAL,
+                timeout_at REAL,
+                take_profit REAL,
+                stop_loss REAL,
+                trailing_stop REAL
+            );
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts TEXT,
@@ -194,6 +207,58 @@ def get_positions() -> dict:
         txid = d.pop("limit_txid", None)
         if txid is not None:
             d["txid"] = txid
+        result[pair] = d
+    return result
+
+
+# ── Pending limit orders ──────────────────────────────────────────────────────
+
+def insert_pending_order(pair: str, po: dict) -> None:
+    """Upsert a pending limit order keyed by pair."""
+    with _write_lock:
+        with get_conn() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO pending_orders
+                (pair, txid, limit_price, signal_id, size_eur, size_crypto,
+                 placed_at, timeout_at, take_profit, stop_loss, trailing_stop)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    pair,
+                    po.get("txid", ""),
+                    po.get("limit_price"),
+                    po.get("signal_id"),
+                    po.get("size_eur"),
+                    po.get("size_crypto"),
+                    po.get("placed_at"),
+                    po.get("timeout_at"),
+                    po.get("take_profit"),
+                    po.get("stop_loss"),
+                    po.get("trailing_stop"),
+                ),
+            )
+
+
+def delete_pending_order(pair: str) -> None:
+    with _write_lock:
+        with get_conn() as conn:
+            conn.execute("DELETE FROM pending_orders WHERE pair=?", (pair,))
+
+
+def get_pending_orders() -> dict:
+    """Return all pending orders as {pair: po_dict}."""
+    if not DB_PATH.exists():
+        return {}
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("SELECT * FROM pending_orders").fetchall()
+    except Exception:
+        return {}
+    result = {}
+    for row in rows:
+        d = dict(row)
+        pair = d.pop("pair")
         result[pair] = d
     return result
 
@@ -452,6 +517,9 @@ def migrate_from_json() -> None:
     # active_profile.json → settings table (key "active_profile")
     _migrate_profile(_root / "active_profile.json")
 
+    # pending_orders.json → pending_orders table
+    _migrate_pending_orders(_root / "pending_orders.json")
+
 
 def _bak(path: Path) -> None:
     bak = path.with_suffix(".json.bak")
@@ -637,6 +705,20 @@ def _migrate_profile(path: Path) -> None:
         _bak(path)
     except Exception as exc:
         _logger.error("Migrazione active_profile.json fallita: %s", exc)
+
+
+def _migrate_pending_orders(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data:
+            for pair, po in data.items():
+                insert_pending_order(pair, po)
+            _logger.info("Migrato pending_orders.json → %d ordini pendenti", len(data))
+        _bak(path)
+    except Exception as exc:
+        _logger.error("Migrazione pending_orders.json fallita: %s", exc)
 
 
 # ── Log import ────────────────────────────────────────────────────────────────

@@ -15,24 +15,31 @@ from . import config, kraken_client, market_data
 
 logger = logging.getLogger(__name__)
 
-# Bounded OHLC cache: max 200 entries, 16-minute TTL (slightly above default scan interval).
-# Purges expired entries on every access; evicts the oldest entry when at capacity.
-_CACHE_TTL_SEC  = 960   # 16 minutes
+# Bounded OHLC cache: max 200 entries, per-interval TTL.
+# Shorter timeframes need shorter TTLs so we don't act on stale candles, while
+# longer ones (4h/Daily) can be cached aggressively.
+_CACHE_TTL_BY_INTERVAL = {
+    15:   240,    # 4 minutes
+    60:   900,    # 15 minutes
+    240:  3600,   # 1 hour
+    1440: 14400,  # 4 hours
+}
+_CACHE_TTL_DEFAULT = 900
 _CACHE_MAX_SIZE = 200   # 10 pairs × 4 timeframes × 5 rotation slots
-_ohlc_cache: dict = {}  # {key: (data, insert_timestamp)}
+_ohlc_cache: dict = {}  # {key: (data, insert_timestamp, ttl)}
 
 
 def _get_ohlc(pair: str, interval: int) -> list:
     now = time.time()
     # Purge all expired entries before each access
-    expired = [k for k, (_, ts) in list(_ohlc_cache.items()) if now - ts >= _CACHE_TTL_SEC]
+    expired = [k for k, (_, ts, ttl) in list(_ohlc_cache.items()) if now - ts >= ttl]
     for k in expired:
         del _ohlc_cache[k]
 
     key = f"{pair}_{interval}"
     if key in _ohlc_cache:
-        data, ts = _ohlc_cache[key]
-        if now - ts < _CACHE_TTL_SEC:
+        data, ts, ttl = _ohlc_cache[key]
+        if now - ts < ttl:
             return data
 
     data = kraken_client.get_ohlc(pair, interval=interval)
@@ -42,7 +49,8 @@ def _get_ohlc(pair: str, interval: int) -> list:
         oldest_key = min(_ohlc_cache, key=lambda k: _ohlc_cache[k][1])
         del _ohlc_cache[oldest_key]
 
-    _ohlc_cache[key] = (data, time.time())
+    ttl = _CACHE_TTL_BY_INTERVAL.get(interval, _CACHE_TTL_DEFAULT)
+    _ohlc_cache[key] = (data, time.time(), ttl)
     return data
 
 
@@ -219,12 +227,8 @@ def _atr(highs: list, lows: list, closes: list, period: int = 14) -> float:
 def analyze(pair: str) -> Optional[Analysis]:
     try:
         ticker = kraken_client.get_ticker(pair)
-        time.sleep(0.6)
-
-        candles_1h = kraken_client.get_ohlc(pair, interval=60)
-        time.sleep(0.6)
-
-        candles_15m = kraken_client.get_ohlc(pair, interval=15)
+        candles_1h = _get_ohlc(pair, 60)
+        candles_15m = _get_ohlc(pair, 15)
 
         if len(candles_1h) < config.EMA_SLOW + config.MACD_SIGNAL + 5:
             logger.warning("%s: only %d 1h candles — skipping", pair, len(candles_1h))
