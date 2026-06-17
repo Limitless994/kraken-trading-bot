@@ -148,6 +148,8 @@ Il profilo attivo viene salvato in `active_profile.json` e ripristinato al riavv
 | `/profile <nome>` | Cambia profilo (conservative/moderate/aggressive) |
 | `/pause` / `/resume` | Sospende/riprende lo scan automatico |
 
+I comandi sono accettati solo dalla chat indicata in `TELEGRAM_CHAT_ID`. Messaggi da altri chat vengono ignorati: chiunque ottenga il token del bot non può comandarlo.
+
 ---
 
 ## Setup
@@ -280,17 +282,21 @@ Tutti i test usano mock — nessuna chiamata reale a Kraken, Groq o API esterne.
 
 ## File di stato (runtime)
 
-| File | Contenuto |
+Lo stato persistente vive in `trading.db` (SQLite, WAL mode). Al primo avvio i vecchi file JSON vengono importati e rinominati in `.bak`.
+
+| Storage | Contenuto |
 |---|---|
-| `positions.json` | Posizioni aperte |
-| `trades_log.json` | Storico trade chiusi |
-| `active_profile.json` | Profilo attivo |
+| `trading.db` → `positions` | Posizioni aperte |
+| `trading.db` → `trades` | Storico trade chiusi |
+| `trading.db` → `groq_decisions` | Decisioni AI (per `/ai` e dashboard) |
+| `trading.db` → `pending_orders` | Limit order in attesa di esecuzione |
+| `trading.db` → `settings` | Profilo attivo + flag vari |
 | `dynamic_pairs.json` | Coppie aggiornate dall'ultima discovery |
 | `logs/bot.log` | Log principale |
 | `logs/trading.log` | Scan e ordini |
 | `logs/groq.log` | Decisioni AI |
 | `logs/discovery.log` | Discovery giornaliera |
-| `logs/kraken.log` | Chiamate API Kraken |
+| `logs/kraken.log` | Chiamate API Kraken (incl. slippage di esecuzione su ordini market) |
 
 ---
 

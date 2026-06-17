@@ -1156,8 +1156,9 @@ class TestOHLCCache(unittest.TestCase):
     def test_cache_expires_after_ttl(self, mock_get):
         from core import analyzer as _az
         mock_get.return_value = []
+        ttl = _az._CACHE_TTL_BY_INTERVAL.get(240, _az._CACHE_TTL_DEFAULT)
         # Insert entry with timestamp in the past (past TTL)
-        _az._ohlc_cache["SOLEUR_240"] = ([], time.time() - _az._CACHE_TTL_SEC - 1)
+        _az._ohlc_cache["SOLEUR_240"] = ([], time.time() - ttl - 1, ttl)
         _az._get_ohlc("SOLEUR", 240)
         self.assertEqual(mock_get.call_count, 1)   # fetched fresh after expiry
 

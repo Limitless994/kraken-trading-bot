@@ -33,6 +33,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    filters,
 )
 
 from core import config, db, kraken_client, market_data
@@ -44,7 +45,6 @@ from services.groq_evaluator import GroqUnavailableError
 logger = logging.getLogger(__name__)
 
 _DIR                = Path(__file__).parent.parent   # project root
-PENDING_ORDERS_FILE = _DIR / "pending_orders.json"
 DYNAMIC_PAIRS_FILE  = _DIR / "dynamic_pairs.json"
 DISCOVERY_LOG_FILE  = _DIR / "discovery_log.json"
 
@@ -197,16 +197,28 @@ class TradingBot:
     # ── Handler registration ──────────────────────────────────────────────────
 
     def _register_handlers(self) -> None:
+        # Only accept commands from the configured chat — without this, anyone
+        # who guesses or steals the bot token can issue /close, /profile, etc.
+        try:
+            authorized_chat = int(config.TELEGRAM_CHAT_ID)
+            auth_filter = filters.Chat(chat_id=authorized_chat)
+        except (ValueError, TypeError):
+            logger.warning(
+                "TELEGRAM_CHAT_ID non valido (%r) — comandi accettati da chiunque",
+                config.TELEGRAM_CHAT_ID,
+            )
+            auth_filter = None
+
         add = self.app.add_handler
-        add(CommandHandler("start",     self._cmd_start))
-        add(CommandHandler("status",    self._cmd_status))
-        add(CommandHandler("positions", self._cmd_positions))
-        add(CommandHandler("balance",   self._cmd_balance))
-        add(CommandHandler("scan",      self._cmd_scan))
-        add(CommandHandler("close",     self._cmd_close))
-        add(CommandHandler("discover",  self._cmd_discover))
-        add(CommandHandler("ai",        self._cmd_ai))
-        add(CommandHandler("profile",   self._cmd_profile))
+        add(CommandHandler("start",     self._cmd_start,     filters=auth_filter))
+        add(CommandHandler("status",    self._cmd_status,    filters=auth_filter))
+        add(CommandHandler("positions", self._cmd_positions, filters=auth_filter))
+        add(CommandHandler("balance",   self._cmd_balance,   filters=auth_filter))
+        add(CommandHandler("scan",      self._cmd_scan,      filters=auth_filter))
+        add(CommandHandler("close",     self._cmd_close,     filters=auth_filter))
+        add(CommandHandler("discover",  self._cmd_discover,  filters=auth_filter))
+        add(CommandHandler("ai",        self._cmd_ai,        filters=auth_filter))
+        add(CommandHandler("profile",   self._cmd_profile,   filters=auth_filter))
 
     # ── Commands ──────────────────────────────────────────────────────────────
 
@@ -391,6 +403,29 @@ class TradingBot:
 
     # ── Signal execution ──────────────────────────────────────────────────────
 
+    async def _resolve_fill_price(self, txid: str, signal: Signal) -> float:
+        """For a live market order, query Kraken for the actual fill price.
+
+        Falls back to signal.price when the query doesn't return a closed order
+        in time. Logs slippage and emits a warning if it exceeds 0.5%.
+        """
+        if txid in ("PAPER", "unknown"):
+            return signal.price
+        fill = await asyncio.to_thread(kraken_client.get_executed_price, txid)
+        if not fill or fill <= 0:
+            logger.info(
+                "%s: fill price non disponibile per TX %s — uso signal.price=%.6f",
+                signal.pair, txid, signal.price,
+            )
+            return signal.price
+        slip_pct = (fill - signal.price) / signal.price * 100
+        log_fn = logger.warning if abs(slip_pct) > 0.5 else logger.info
+        log_fn(
+            "%s fill: TX=%s signal=%.6f → exec=%.6f (slip %+.3f%%)",
+            signal.pair, txid, signal.price, fill, slip_pct,
+        )
+        return fill
+
     async def _execute_signal(self, signal: Signal, groq_reason: str) -> None:
         is_short = signal.direction == "SELL"
         try:
@@ -398,15 +433,14 @@ class TradingBot:
             fee_rate    = config.KRAKEN_MAKER_FEE if use_limit else config.KRAKEN_TAKER_FEE
             extra_fee   = _margin_open_fee(signal.pair) if is_short else 0.0
             fee_entry   = round(signal.size_eur * (fee_rate + extra_fee), 4)
-            if is_short:
-                size_crypto_net = signal.size_eur / signal.price
-            else:
-                size_crypto_net = signal.size_eur * (1 - fee_rate) / signal.price
+            # size_crypto is stored GROSS (the volume placed on Kraken). The fee
+            # is tracked separately in fee_entry_eur and subtracted in _calc_exit,
+            # so applying (1 - fee_rate) here would double-count it.
+            size_crypto_net = signal.size_crypto
 
             if config.PAPER_TRADING:
                 if config.LIMIT_ORDERS_ENABLED and not is_short:
                     limit_price = round(signal.price * (1 - config.LIMIT_OFFSET_PCT), 8)
-                    size_crypto_net = signal.size_eur * (1 - fee_rate) / limit_price
                     actual_price = limit_price
                 else:
                     actual_price = signal.price
@@ -422,7 +456,7 @@ class TradingBot:
                 )
                 txids = result.get("txid", [])
                 txid  = txids[0] if txids else "unknown"
-                actual_price = signal.price
+                actual_price = await self._resolve_fill_price(txid, signal)
 
             elif use_limit:
                 limit_price = round(signal.price * (1 - config.LIMIT_OFFSET_PCT), 8)
@@ -437,18 +471,14 @@ class TradingBot:
                 descr = result.get("descr", {}).get("order", "")
                 actual_price = limit_price
                 with self._positions_lock:
-                    pending = _load_json(PENDING_ORDERS_FILE, {})
-                    pending[signal.pair] = {
+                    db.insert_pending_order(signal.pair, {
                         "txid": txid, "limit_price": limit_price,
                         "signal_id": signal.id, "size_eur": signal.size_eur,
                         "size_crypto": signal.size_crypto, "placed_at": time.time(),
                         "timeout_at": time.time() + config.LIMIT_TIMEOUT_SEC,
                         "take_profit": signal.take_profit, "stop_loss": signal.stop_loss,
                         "trailing_stop": signal.trailing_stop,
-                    }
-                    PENDING_ORDERS_FILE.write_text(
-                        json.dumps(pending, indent=2), encoding="utf-8"
-                    )
+                    })
                 await self.app.bot.send_message(
                     chat_id=config.TELEGRAM_CHAT_ID,
                     text=(
@@ -468,13 +498,12 @@ class TradingBot:
                 txids = result.get("txid", [])
                 txid  = txids[0] if txids else "unknown"
                 descr = result.get("descr", {}).get("order", "")
-                actual_price = signal.price
-                size_crypto_net = signal.size_crypto
+                actual_price = await self._resolve_fill_price(txid, signal)
 
             pos_dict = {
                 "pair":          signal.pair,
                 "side":          "short" if is_short else "long",
-                "entry":         actual_price if config.PAPER_TRADING else signal.price,
+                "entry":         actual_price,
                 "size_crypto":   size_crypto_net,
                 "size_eur":      signal.size_eur,
                 "fee_entry_eur": fee_entry,
@@ -740,8 +769,13 @@ class TradingBot:
                     logger.warning("Guard: %s già in-flight — skip", signal.pair)
                 else:
                     self._in_flight.add(signal.pair)
-                    await self._execute_signal(signal, f"{reason} [{confidence}/10, {size_pct*100:.0f}% capitale]")
-                    already_open.add(signal.pair)
+                    try:
+                        await self._execute_signal(signal, f"{reason} [{confidence}/10, {size_pct*100:.0f}% capitale]")
+                        already_open.add(signal.pair)
+                    except Exception as exc:
+                        logger.error("Errore esecuzione %s: %s", signal.pair, exc, exc_info=True)
+                    finally:
+                        self._in_flight.discard(signal.pair)
             else:
                 self._groq_rejected[signal.pair] = time.time()
                 reasons_text = "\n".join(f"  • {r}" for r in signal.reasons)
@@ -884,8 +918,13 @@ class TradingBot:
                     logger.warning("Guard: %s già in-flight — skip", signal.pair)
                 else:
                     self._in_flight.add(signal.pair)
-                    await self._execute_signal(signal, f"{reason} [{confidence}/10, {size_pct*100:.0f}% capitale]")
-                    already_open.add(signal.pair)
+                    try:
+                        await self._execute_signal(signal, f"{reason} [{confidence}/10, {size_pct*100:.0f}% capitale]")
+                        already_open.add(signal.pair)
+                    except Exception as exc:
+                        logger.error("Errore esecuzione SHORT %s: %s", signal.pair, exc, exc_info=True)
+                    finally:
+                        self._in_flight.discard(signal.pair)
             else:
                 reasons_text = "\n".join(f"  • {r}" for r in signal.reasons)
                 await self.app.bot.send_message(
@@ -1061,7 +1100,7 @@ class TradingBot:
         """Check whether live limit orders have been filled or have timed out."""
         if config.PAPER_TRADING:
             return
-        pending = _load_json(PENDING_ORDERS_FILE, {})
+        pending = db.get_pending_orders()
         if not pending:
             return
         now     = time.time()
@@ -1121,11 +1160,7 @@ class TradingBot:
                     text=f"LIMIT SCADUTO {pair}  TX {txid} — cancellato",
                 )
         for pair in to_remove:
-            pending.pop(pair, None)
-        if to_remove:
-            PENDING_ORDERS_FILE.write_text(
-                json.dumps(pending, indent=2), encoding="utf-8"
-            )
+            db.delete_pending_order(pair)
 
     async def _cmd_ai(self, update, ctx) -> None:
         """Show the last N Groq AI decisions."""

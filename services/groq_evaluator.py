@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import threading
 import time
 
 from groq import Groq
@@ -21,6 +22,10 @@ _client: Groq = None
 _consecutive_fallbacks: int = 0
 
 # ── Rate-limit guard (in-process) ────────────────────────────────────────────
+# evaluate() is called via asyncio.to_thread, which can run multiple invocations
+# concurrently on the default executor. All shared counters live behind a lock
+# to keep the daily cap and spacing honest.
+_state_lock = threading.Lock()
 _calls_today: int = 0
 _calls_date: str = ""
 _last_call_ts: float = 0.0
@@ -34,24 +39,30 @@ def budget_available() -> bool:
     """True if today's Groq call budget is not yet exhausted. Resets at midnight."""
     global _calls_today, _calls_date
     today = datetime.date.today().isoformat()
-    if today != _calls_date:
-        _calls_date = today
-        _calls_today = 0
-    return _calls_today < config.GROQ_MAX_CALLS_PER_DAY
+    with _state_lock:
+        if today != _calls_date:
+            _calls_date = today
+            _calls_today = 0
+        return _calls_today < config.GROQ_MAX_CALLS_PER_DAY
 
 
 def _record_call() -> None:
-    """Count one call and enforce minimum spacing to respect the RPM ceiling."""
+    """Count one call and enforce minimum spacing to respect the RPM ceiling.
+
+    The sleep happens while holding the lock so concurrent callers serialise
+    cleanly — exactly the behaviour the RPM ceiling needs.
+    """
     global _calls_today, _calls_date, _last_call_ts
     today = datetime.date.today().isoformat()
-    if today != _calls_date:
-        _calls_date = today
-        _calls_today = 0
-    gap = config.GROQ_MIN_SECONDS_BETWEEN_CALLS - (time.time() - _last_call_ts)
-    if gap > 0:
-        time.sleep(gap)
-    _calls_today += 1
-    _last_call_ts = time.time()
+    with _state_lock:
+        if today != _calls_date:
+            _calls_date = today
+            _calls_today = 0
+        gap = config.GROQ_MIN_SECONDS_BETWEEN_CALLS - (time.time() - _last_call_ts)
+        if gap > 0:
+            time.sleep(gap)
+        _calls_today += 1
+        _last_call_ts = time.time()
 
 
 def _get_client() -> Groq:
@@ -176,18 +187,21 @@ def evaluate(signal: Signal, market_ctx: dict = None) -> tuple:
             )
             return False, confidence, f"confidenza {confidence}/10 sotto soglia ({config.GROQ_MIN_CONFIDENCE})", 0.0
 
-        _consecutive_fallbacks = 0
+        with _state_lock:
+            _consecutive_fallbacks = 0
         return execute, confidence, reason, _size_pct(confidence) if execute else 0.0
 
     except Exception as exc:
-        _consecutive_fallbacks += 1
+        with _state_lock:
+            _consecutive_fallbacks += 1
+            fallback_count = _consecutive_fallbacks
         logger.error(
             "Groq non disponibile per %s: %s — fallback consecutivo %d",
-            signal.pair, exc, _consecutive_fallbacks,
+            signal.pair, exc, fallback_count,
         )
-        if _consecutive_fallbacks >= 3:
+        if fallback_count >= 3:
             raise GroqUnavailableError(
-                f"Groq non raggiungibile da {_consecutive_fallbacks} tentativi consecutivi"
+                f"Groq non raggiungibile da {fallback_count} tentativi consecutivi"
             ) from exc
         if config.GROQ_FALLBACK_EXECUTE:
             return True, 6, f"Groq offline — eseguito (score {signal.score}/6)", config.AI_SIZE_MIN

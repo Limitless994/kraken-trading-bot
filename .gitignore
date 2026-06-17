@@ -6,6 +6,8 @@ positions.json
 trades_log.json
 groq_log.json
 discovery_log.json
+pending_orders.json
+*.json.bak
 logs/
 *.pid
 

@@ -295,21 +295,27 @@ _ACTIVE_PROFILE_FILE = Path(__file__).parent.parent / "active_profile.json"
 ACTIVE_PROFILE: str = "conservative"
 
 
-def apply_profile(name: str) -> None:
-    """Switch trading profile at runtime and persist the choice."""
+def apply_profile(name: str, *, quiet: bool = False) -> None:
+    """Switch trading profile at runtime and persist the choice.
+
+    When called from the module-body bootstrap, `quiet=True` suppresses logging
+    so the only INFO line at startup comes from the explicit re-application in
+    main.py after the DB is initialised.
+    """
     import sys, json as _json, logging as _log
     _logger = _log.getLogger(__name__)
     name = name.lower().strip()
     if name not in PROFILES:
         raise ValueError(f"Profilo '{name}' sconosciuto. Scegli: {list(PROFILES)}")
     module = sys.modules[__name__]
-    _logger.info("[APPLY_PROFILE] Applicando profilo '%s'", name)
     for key, val in PROFILES[name].items():
         setattr(module, key, val)
-        if key == "FEAR_GREED_SHORT_MIN":
-            _logger.info("[APPLY_PROFILE] Settiamo %s = %s", key, val)
     setattr(module, "ACTIVE_PROFILE", name)
-    _logger.info("[APPLY_PROFILE] Profilo '%s' applicato. FEAR_GREED_SHORT_MIN = %s", name, getattr(module, "FEAR_GREED_SHORT_MIN"))
+    if not quiet:
+        _logger.info(
+            "Profilo '%s' applicato (FEAR_GREED_SHORT_MIN=%s)",
+            name, getattr(module, "FEAR_GREED_SHORT_MIN"),
+        )
     # Persist to DB first; fall back to JSON if DB not yet initialised
     try:
         from core import db as _db
@@ -323,7 +329,7 @@ def apply_profile(name: str) -> None:
             pass
 
 
-def _load_active_profile() -> str:
+def _load_active_profile(*, quiet: bool = False) -> str:
     import json as _json, logging as _log
     _logger = _log.getLogger(__name__)
     default = os.getenv("TRADING_PROFILE", "conservative").lower()
@@ -332,14 +338,15 @@ def _load_active_profile() -> str:
         from core import db as _db
         val = _db.get_setting("active_profile")
         if val and val in PROFILES:
-            if val != default:
-                _logger.warning(
-                    "Profilo caricato da DB: '%s' (sovrascrive .env TRADING_PROFILE='%s'). "
-                    "Usa /profile %s da Telegram o aggiorna .env per allinearli.",
-                    val, default, default,
-                )
-            else:
-                _logger.info("Profilo caricato: '%s' (DB e .env allineati)", val)
+            if not quiet:
+                if val != default:
+                    _logger.warning(
+                        "Profilo caricato da DB: '%s' (sovrascrive .env TRADING_PROFILE='%s'). "
+                        "Usa /profile %s da Telegram o aggiorna .env per allinearli.",
+                        val, default, default,
+                    )
+                else:
+                    _logger.info("Profilo caricato: '%s' (DB e .env allineati)", val)
             return val
     except Exception:
         pass
@@ -349,15 +356,20 @@ def _load_active_profile() -> str:
             data = _json.loads(_ACTIVE_PROFILE_FILE.read_text(encoding="utf-8"))
             candidate = data.get("profile", default)
             if candidate in PROFILES:
-                _logger.info("Profilo caricato da active_profile.json: '%s'", candidate)
+                if not quiet:
+                    _logger.info("Profilo caricato da active_profile.json: '%s'", candidate)
                 return candidate
     except Exception:
         pass
-    _logger.info("Profilo caricato da .env: '%s'", default)
+    if not quiet:
+        _logger.info("Profilo caricato da .env: '%s'", default)
     return default
 
 
-apply_profile(_load_active_profile())
+# Silent bootstrap: ensures config attributes reflect the active profile for
+# any module imported before main.py runs (e.g. dashboard.py). main.py then
+# re-applies explicitly after init_db(), which is the call that logs.
+apply_profile(_load_active_profile(quiet=True), quiet=True)
 
 
 def apply_profile_params(params: dict) -> None:

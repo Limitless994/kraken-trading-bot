@@ -11,6 +11,7 @@ import base64
 import functools
 import hashlib
 import hmac
+import threading
 import time
 import urllib.parse
 import requests
@@ -24,6 +25,34 @@ _SESSION.headers.update({"User-Agent": "KrakenTradingBot/1.0"})
 
 import logging as _logging
 _kc_logger = _logging.getLogger(__name__)
+
+# ── Global rate limiter ───────────────────────────────────────────────────────
+# Kraken public endpoints tolerate ~1 req/sec sustained for unauthenticated
+# clients. Centralising the throttle here removes the need for time.sleep in
+# call sites like analyze().
+_PUBLIC_MIN_INTERVAL = 0.35    # seconds between consecutive public calls
+_PRIVATE_MIN_INTERVAL = 0.20   # private endpoints have a separate counter
+_rate_lock = threading.Lock()
+_last_public_ts = 0.0
+_last_private_ts = 0.0
+
+
+def _throttle_public() -> None:
+    global _last_public_ts
+    with _rate_lock:
+        gap = _PUBLIC_MIN_INTERVAL - (time.monotonic() - _last_public_ts)
+        if gap > 0:
+            time.sleep(gap)
+        _last_public_ts = time.monotonic()
+
+
+def _throttle_private() -> None:
+    global _last_private_ts
+    with _rate_lock:
+        gap = _PRIVATE_MIN_INTERVAL - (time.monotonic() - _last_private_ts)
+        if gap > 0:
+            time.sleep(gap)
+        _last_private_ts = time.monotonic()
 
 
 def _with_retry(func):
@@ -60,6 +89,7 @@ def _with_retry(func):
 
 @_with_retry
 def _public(endpoint: str, params: dict | None = None) -> dict:
+    _throttle_public()
     url = f"{BASE_URL}/0/public/{endpoint}"
     resp = _SESSION.get(url, params=params or {}, timeout=10)
     resp.raise_for_status()
@@ -85,6 +115,7 @@ def _private(endpoint: str, params: dict | None = None) -> dict:
     if not config.KRAKEN_API_KEY or not config.KRAKEN_API_SECRET:
         raise RuntimeError("Kraken API credentials not set in .env")
 
+    _throttle_private()
     api_path = f"/0/private/{endpoint}"
     url = f"{BASE_URL}{api_path}"
     nonce = str(int(time.time() * 1000))
@@ -116,9 +147,36 @@ def _result_key(result: dict) -> str:
     raise KeyError(f"No data key in result. Keys: {list(result.keys())}")
 
 
+# Cache of lot_decimals per pair, populated lazily from Kraken AssetPairs.
+# Avoids hard-coded mappings that fall out of sync for discovery-found pairs
+# (where the wrong decimals trigger "Invalid arguments:volume" on AddOrder).
+_lot_decimals_cache: dict[str, int] = {}
+
+
+def _get_lot_decimals(pair: str) -> int:
+    if pair in _lot_decimals_cache:
+        return _lot_decimals_cache[pair]
+    # Try the static map first (it's authoritative for the bot's main pairs)
+    static = config.PAIR_VOLUME_DECIMALS.get(pair)
+    if static is not None:
+        _lot_decimals_cache[pair] = static
+        return static
+    try:
+        info = get_asset_pairs([pair])
+        # Kraken returns the pair under its internal key (e.g. XXBTZEUR for XBTEUR)
+        for _, meta in info.items():
+            if meta.get("altname") == pair or meta.get("wsname", "").replace("/", "") == pair:
+                decimals = int(meta.get("lot_decimals", 6))
+                _lot_decimals_cache[pair] = decimals
+                return decimals
+    except Exception as exc:
+        _kc_logger.warning("Cannot fetch lot_decimals for %s: %s — defaulting to 6", pair, exc)
+    _lot_decimals_cache[pair] = 6
+    return 6
+
+
 def format_volume(pair: str, volume: float) -> str:
-    decimals = config.PAIR_VOLUME_DECIMALS.get(pair, 6)
-    return f"{volume:.{decimals}f}"
+    return f"{volume:.{_get_lot_decimals(pair)}f}"
 
 
 # ── Public endpoints ──────────────────────────────────────────────────────────
@@ -259,3 +317,29 @@ def get_closed_orders() -> dict:
 
 def query_orders(txids: list[str]) -> dict:
     return _private("QueryOrders", {"txid": ",".join(txids), "trades": False})
+
+
+def get_executed_price(txid: str, max_wait_s: float = 2.0) -> float | None:
+    """Poll QueryOrders briefly to get the volume-weighted avg fill price.
+
+    Returns None if the order is not (yet) closed or if the query fails.
+    Kraken's `price` field on a closed order is the avg fill price.
+    """
+    deadline = time.time() + max_wait_s
+    poll_interval = 0.4
+    while time.time() < deadline:
+        try:
+            info = query_orders([txid])
+            order = info.get(txid, {})
+            status = order.get("status")
+            if status == "closed":
+                try:
+                    return float(order.get("price", 0)) or None
+                except (TypeError, ValueError):
+                    return None
+            if status in ("canceled", "expired"):
+                return None
+        except Exception as exc:
+            _kc_logger.debug("get_executed_price(%s) poll failed: %s", txid, exc)
+        time.sleep(poll_interval)
+    return None
