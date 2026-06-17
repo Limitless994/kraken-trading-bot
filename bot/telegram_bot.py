@@ -680,6 +680,17 @@ class TradingBot:
                 self._groq_rejected[signal.pair] = time.time()
                 continue
 
+            last_rejected = self._groq_rejected.get(signal.pair, 0)
+            elapsed_min   = (time.time() - last_rejected) / 60
+            if last_rejected and elapsed_min < config.GROQ_REJECTION_COOLDOWN_MIN:
+                logger.info("%s: SKIP Groq (long) — rifiutato %.0f min fa (cooldown %d min)",
+                            signal.pair, elapsed_min, config.GROQ_REJECTION_COOLDOWN_MIN)
+                continue
+
+            if not groq_evaluator.budget_available():
+                logger.warning("%s: SKIP Groq (long) — budget giornaliero esaurito", signal.pair)
+                continue
+
             logger.info(
                 "Signal: %s  score=%d  ADX=%.1f  price=%.6f — asking Groq",
                 signal.pair, signal.score, signal.adx, signal.price,
@@ -724,6 +735,7 @@ class TradingBot:
             })
 
             if execute:
+                self._groq_rejected.pop(signal.pair, None)
                 if signal.pair in self._in_flight:
                     logger.warning("Guard: %s già in-flight — skip", signal.pair)
                 else:
@@ -731,6 +743,7 @@ class TradingBot:
                     await self._execute_signal(signal, f"{reason} [{confidence}/10, {size_pct*100:.0f}% capitale]")
                     already_open.add(signal.pair)
             else:
+                self._groq_rejected[signal.pair] = time.time()
                 reasons_text = "\n".join(f"  • {r}" for r in signal.reasons)
                 await self.app.bot.send_message(
                     chat_id=config.TELEGRAM_CHAT_ID,
@@ -815,6 +828,10 @@ class TradingBot:
             if signal.rsi_1h < 35:
                 logger.info("%s: SKIP Groq — RSI(1h)=%.1f oversold (rimbalzo probabile)", signal.pair, signal.rsi_1h)
                 self._groq_rejected[signal.pair] = time.time()
+                continue
+
+            if not groq_evaluator.budget_available():
+                logger.warning("%s: SKIP Groq (short) — budget giornaliero esaurito", signal.pair)
                 continue
 
             logger.info(
@@ -1391,6 +1408,11 @@ class TradingBot:
             )
             if not signal:
                 evaluated.append(f"• {pair}: gate live non superati")
+                continue
+
+            if not groq_evaluator.budget_available():
+                logger.warning("Discovery %s: SKIP Groq — budget giornaliero esaurito", pair)
+                evaluated.append(f"• {pair}: budget Groq esaurito")
                 continue
 
             try:

@@ -6,7 +6,9 @@ Only executes if confidence >= config.GROQ_MIN_CONFIDENCE.
 """
 from __future__ import annotations
 
+import datetime
 import logging
+import time
 
 from groq import Groq
 
@@ -18,9 +20,38 @@ logger = logging.getLogger(__name__)
 _client: Groq = None
 _consecutive_fallbacks: int = 0
 
+# ── Rate-limit guard (in-process) ────────────────────────────────────────────
+_calls_today: int = 0
+_calls_date: str = ""
+_last_call_ts: float = 0.0
+
 
 class GroqUnavailableError(Exception):
     """Raised when Groq fails 3 or more consecutive times."""
+
+
+def budget_available() -> bool:
+    """True if today's Groq call budget is not yet exhausted. Resets at midnight."""
+    global _calls_today, _calls_date
+    today = datetime.date.today().isoformat()
+    if today != _calls_date:
+        _calls_date = today
+        _calls_today = 0
+    return _calls_today < config.GROQ_MAX_CALLS_PER_DAY
+
+
+def _record_call() -> None:
+    """Count one call and enforce minimum spacing to respect the RPM ceiling."""
+    global _calls_today, _calls_date, _last_call_ts
+    today = datetime.date.today().isoformat()
+    if today != _calls_date:
+        _calls_date = today
+        _calls_today = 0
+    gap = config.GROQ_MIN_SECONDS_BETWEEN_CALLS - (time.time() - _last_call_ts)
+    if gap > 0:
+        time.sleep(gap)
+    _calls_today += 1
+    _last_call_ts = time.time()
 
 
 def _get_client() -> Groq:
@@ -43,6 +74,12 @@ def evaluate(signal: Signal, market_ctx: dict = None) -> tuple:
     Raises GroqUnavailableError after 3 consecutive failures.
     """
     global _consecutive_fallbacks
+    if not budget_available():
+        logger.warning(
+            "Groq budget giornaliero esaurito (%d/%d) — segnale %s skippato",
+            _calls_today, config.GROQ_MAX_CALLS_PER_DAY, signal.pair,
+        )
+        return False, 0, "budget Groq giornaliero esaurito — segnale skippato", 0.0
     is_short = signal.direction == "SELL"
     if is_short:
         tp_pct = (1 - signal.take_profit / signal.price) * 100 if signal.price > 0 else config.TAKE_PROFIT_PCT * 100
@@ -97,6 +134,7 @@ def evaluate(signal: Signal, market_ctx: dict = None) -> tuple:
             user_msg += f"\nUltimi titoli crypto: {headlines}"
 
     try:
+        _record_call()
         reply = (
             _get_client()
             .chat.completions.create(
@@ -151,4 +189,7 @@ def evaluate(signal: Signal, market_ctx: dict = None) -> tuple:
             raise GroqUnavailableError(
                 f"Groq non raggiungibile da {_consecutive_fallbacks} tentativi consecutivi"
             ) from exc
-        return True, 6, f"Groq offline — eseguito (score {signal.score}/6)", config.AI_SIZE_MIN
+        if config.GROQ_FALLBACK_EXECUTE:
+            return True, 6, f"Groq offline — eseguito (score {signal.score}/6)", config.AI_SIZE_MIN
+        # Safe default: do NOT open a trade without AI validation (e.g. on 429).
+        return False, 0, f"Groq offline — segnale skippato (errore: {exc})", 0.0
