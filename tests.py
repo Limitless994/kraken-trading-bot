@@ -203,6 +203,7 @@ class TestStrategy(unittest.TestCase):
             macd_hist=0.01, macd_hist_prev=-0.01,
             volume_ratio=2.0, ema50=95.0, adx=28.0,
             daily_above_ema50=True,
+            atr=2.0,   # TP = 100 + 2.5×2 = 105 (5%) > min-profit gate (1.56%)
         )
         sig = generate_signal(a, 100.0)
         self.assertIsNotNone(sig)
