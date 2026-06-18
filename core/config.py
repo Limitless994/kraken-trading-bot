@@ -60,8 +60,11 @@ TRAILING_DISTANCE_ATR   = float(os.getenv("TRAILING_DISTANCE_ATR",   "1.5"))  # 
 TRAILING_STOP_PCT       = float(os.getenv("TRAILING_STOP_PCT", "0.03"))       # fallback when ATR unavailable
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
-CIRCUIT_BREAKER_ENABLED  = os.getenv("CIRCUIT_BREAKER_ENABLED", "true").lower() == "true"
-CIRCUIT_BREAKER_LOSS_EUR = float(os.getenv("CIRCUIT_BREAKER_LOSS_EUR", "15"))
+CIRCUIT_BREAKER_ENABLED   = os.getenv("CIRCUIT_BREAKER_ENABLED", "true").lower() == "true"
+CIRCUIT_BREAKER_LOSS_EUR  = float(os.getenv("CIRCUIT_BREAKER_LOSS_EUR", "15"))
+# Consecutive-loss breaker: blocks new entries after N back-to-back losing trades.
+# Streak resets the first time a trade closes in profit. Set 0 to disable.
+MAX_CONSECUTIVE_LOSSES    = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
 
 # ── Signal scoring ────────────────────────────────────────────────────────────
 MIN_SIGNAL_SCORE  = int(os.getenv("MIN_SIGNAL_SCORE",  "3"))
@@ -197,6 +200,7 @@ PROFILE_CONSERVATIVE: dict = {
     "FEAR_GREED_SHORT_MIN":   15,
     "SL_COOLDOWN_HOURS":      6.0,
     "MAX_SL_PER_PAIR_24H":    2,
+    "MAX_CONSECUTIVE_LOSSES": 3,
 }
 
 PROFILE_MODERATE: dict = {
@@ -234,6 +238,7 @@ PROFILE_MODERATE: dict = {
     "FEAR_GREED_SHORT_MIN":   5,
     "SL_COOLDOWN_HOURS":      4.0,
     "MAX_SL_PER_PAIR_24H":    2,
+    "MAX_CONSECUTIVE_LOSSES": 4,
 }
 
 PROFILE_AGGRESSIVE: dict = {
@@ -282,6 +287,7 @@ PROFILE_AGGRESSIVE: dict = {
     "BTC_RSI_SHORT_MIN":      25,
     "SL_COOLDOWN_HOURS":      2.0,
     "MAX_SL_PER_PAIR_24H":    3,
+    "MAX_CONSECUTIVE_LOSSES": 5,
 }
 
 PROFILES: dict = {
@@ -295,12 +301,13 @@ _ACTIVE_PROFILE_FILE = Path(__file__).parent.parent / "active_profile.json"
 ACTIVE_PROFILE: str = "conservative"
 
 
-def apply_profile(name: str, *, quiet: bool = False) -> None:
-    """Switch trading profile at runtime and persist the choice.
+def apply_profile(name: str, *, quiet: bool = False, persist: bool = True) -> None:
+    """Switch trading profile at runtime, optionally persisting the choice.
 
-    When called from the module-body bootstrap, `quiet=True` suppresses logging
-    so the only INFO line at startup comes from the explicit re-application in
-    main.py after the DB is initialised.
+    `quiet=True` suppresses logging (used by the import-time bootstrap so we
+    don't double-log at startup). `persist=False` only mutates the in-process
+    config without writing to DB/JSON — used by the /profile preview backtest
+    so a dry-run never overwrites the active profile.
     """
     import sys, json as _json, logging as _log
     _logger = _log.getLogger(__name__)
@@ -316,6 +323,8 @@ def apply_profile(name: str, *, quiet: bool = False) -> None:
             "Profilo '%s' applicato (FEAR_GREED_SHORT_MIN=%s)",
             name, getattr(module, "FEAR_GREED_SHORT_MIN"),
         )
+    if not persist:
+        return
     # Persist to DB first; fall back to JSON if DB not yet initialised
     try:
         from core import db as _db
