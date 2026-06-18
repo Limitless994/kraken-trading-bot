@@ -206,6 +206,21 @@ def generate_signal(
         take_profit = round(analysis.price * (1 + config.TAKE_PROFIT_PCT), 8)
         stop_loss   = round(analysis.price * (1 - config.STOP_LOSS_PCT),   8)
 
+    # Gate: minimum profit check — TP gross must exceed round-trip costs with 30% margin.
+    # Spot long round-trip: 2× taker fee + 2× slippage estimate (no margin fee on spot).
+    # Mirrors the identical gate already present in generate_short_signal: without it
+    # the bot opens longs whose TP is too tight to cover fees+slippage — gross-positive
+    # trades that close net-negative (death by fees).
+    _SLIP_EST = 0.002
+    _min_cost_pct = 2 * config.KRAKEN_TAKER_FEE + 2 * _SLIP_EST
+    _tp_gross_pct = (take_profit - analysis.price) / analysis.price
+    if _tp_gross_pct < _min_cost_pct * 1.3:
+        logger.info(
+            "%s: SKIP gate=tp_stretto (TP gross=%.2f%% < min=%.2f%%, ATR=%.6f)",
+            analysis.pair, _tp_gross_pct * 100, _min_cost_pct * 1.3 * 100, atr,
+        )
+        return None
+
     return Signal(
         id=str(uuid.uuid4())[:8],
         pair=analysis.pair,
