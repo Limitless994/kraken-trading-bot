@@ -369,6 +369,7 @@ class TradingBot:
         db.insert_trade({
             "pair": pair, "side": side, "exit_reason": "manual",
             "entry": pos["entry"], "exit": current,
+            "entry_signal": pos.get("entry_signal"),
             "size_eur": pos["size_eur"],
             "gross_pnl_eur": round(gross_pnl_eur, 4),
             "fee_eur": round(fee_entry + fee_exit + slip_eur + funding_cost, 4),
@@ -504,6 +505,7 @@ class TradingBot:
                 "pair":          signal.pair,
                 "side":          "short" if is_short else "long",
                 "entry":         actual_price,
+                "entry_signal":  signal.price,   # planned price — used for slippage analytics
                 "size_crypto":   size_crypto_net,
                 "size_eur":      signal.size_eur,
                 "fee_entry_eur": fee_entry,
@@ -614,6 +616,32 @@ class TradingBot:
                     text=f"CIRCUIT BREAKER — perdita {abs(daily_loss):.2f}€ nelle ultime 24h. Trading sospeso.",
                 )
                 return False
+
+        # ── Consecutive losses circuit breaker ────────────────────────────────
+        # Streak resets the next time a trade closes in profit — so the bot
+        # can self-recover once an open position takes a TP. To keep Telegram
+        # quiet, only alert on the transition from below → at-or-above threshold.
+        max_streak = config.MAX_CONSECUTIVE_LOSSES
+        if max_streak > 0:
+            streak = db.consecutive_losses()
+            alerted = db.get_setting("cb_consecutive_alerted") == "1"
+            if streak >= max_streak:
+                if not alerted:
+                    db.set_setting("cb_consecutive_alerted", "1")
+                    await self.app.bot.send_message(
+                        chat_id=config.TELEGRAM_CHAT_ID,
+                        text=(
+                            f"CIRCUIT BREAKER — {streak} perdite consecutive "
+                            f"(soglia {max_streak}). Nuove entrate sospese fino al "
+                            f"prossimo TP."
+                        ),
+                    )
+                logger.info(
+                    "SCAN BLOCKED: %d perdite consecutive >= %d", streak, max_streak,
+                )
+                return False
+            if alerted:   # streak just broke — clear the latch
+                db.set_setting("cb_consecutive_alerted", "0")
 
         # ── Market context (Fear & Greed, funding rates) ──────────────────────
         mkt_ctx = await asyncio.to_thread(market_data.get_market_context)
@@ -1025,6 +1053,7 @@ class TradingBot:
                     "pair": pair, "side": side,
                     "exit_reason": "tp" if hit_tp else "sl",
                     "entry": pos["entry"], "exit": current,
+                    "entry_signal": pos.get("entry_signal"),
                     "size_eur": pos["size_eur"],
                     "gross_pnl_eur": round(gross_pnl_eur, 4),
                     "fee_eur": round(fee_entry + fee_exit + slip_eur + funding_cost, 4),
@@ -1053,6 +1082,8 @@ class TradingBot:
 
         total_pnl = sum(t["pnl_eur"] for t in trades)
         today_pnl = sum(t["pnl_eur"] for t in today_trades)
+        today_tp  = sum(1 for t in today_trades if str(t.get("exit_reason", "")).lower() == "tp")
+        today_sl  = sum(1 for t in today_trades if str(t.get("exit_reason", "")).lower() == "sl")
 
         pos_lines = []
         for pair, pos in positions.items():
@@ -1078,18 +1109,30 @@ class TradingBot:
         except Exception:
             pass
 
+        groq_used, groq_cap = groq_evaluator.budget_usage()
+        slip = db.get_slippage_summary_24h()
+        streak = db.consecutive_losses()
+
         lines = [
             f"REPORT {time.strftime('%d/%m %H:%M')}",
-            f"Kraken: {kraken_status.upper()}  |  {'PAPER' if config.PAPER_TRADING else 'LIVE'}",
+            f"Kraken: {kraken_status.upper()}  |  {'PAPER' if config.PAPER_TRADING else 'LIVE'}  |  {config.ACTIVE_PROFILE.upper()}",
             f"Capitale deployato: {spent:.2f}€ / {config.BUDGET_EUR * config.MAX_CAPITAL_DEPLOYED:.0f}€ max",
             f"Posizioni aperte: {len(positions)} / {config.MAX_OPEN_TRADES}",
         ]
         if pos_lines:
             lines += pos_lines
         lines += [
-            f"Trade ultimi 24h: {len(today_trades)}  P&L: {today_pnl:+.2f}€",
+            f"Trade 24h: {len(today_trades)}  (TP {today_tp}, SL {today_sl})  P&L: {today_pnl:+.2f}€",
             f"P&L totale: {total_pnl:+.2f}€",
+            f"Groq: {groq_used}/{groq_cap} chiamate oggi",
         ]
+        if slip["count"]:
+            lines.append(
+                f"Slippage 24h: avg {slip['avg_pct']:.3f}%  max {slip['max_pct']:.3f}%  "
+                f"({slip['count']} trade)"
+            )
+        if streak >= 3:
+            lines.append(f"⚠️ {streak} perdite consecutive")
 
         await self.app.bot.send_message(
             chat_id=config.TELEGRAM_CHAT_ID,
@@ -1182,8 +1225,70 @@ class TradingBot:
             )
         await update.message.reply_text("\n\n".join(lines))
 
+    async def _run_profile_preview(self, update, target: str) -> None:
+        """Run a sandboxed backtest with `target` profile params and report."""
+        if target not in config.PROFILES:
+            await update.message.reply_text(
+                f"Profilo '{target}' sconosciuto. Scegli tra: {list(config.PROFILES)}"
+            )
+            return
+        if self._scanning:
+            await update.message.reply_text(
+                "Scansione in corso — riprova tra qualche minuto."
+            )
+            return
+
+        await update.message.reply_text(
+            f"Backtest preview '{target}' su 30 giorni... (15-60s)"
+        )
+        # Hold the scan flag so a concurrent scan doesn't see a swapped profile.
+        self._scanning = True
+        original_profile = config.ACTIVE_PROFILE
+        try:
+            from backtest import preview_profile  # imported lazily to avoid heavy startup cost
+            metrics = await asyncio.to_thread(
+                preview_profile, target, 30, config.BUDGET_EUR
+            )
+        finally:
+            # Always restore the previous profile in-memory (no persist).
+            try:
+                config.apply_profile(original_profile, persist=False, quiet=True)
+            except Exception as exc:
+                logger.error("Impossibile ripristinare profilo %s: %s", original_profile, exc)
+            self._scanning = False
+
+        if metrics.get("error"):
+            await update.message.reply_text(f"Preview fallita: {metrics['error']}")
+            return
+
+        wr  = metrics["win_rate"] * 100
+        ret = metrics["net_return_pct"]
+        await update.message.reply_text(
+            f"PREVIEW {target.upper()} — {metrics['start']} → {metrics['end']} "
+            f"({metrics['days']}gg)\n"
+            f"Trade: {metrics['n']}  |  Win rate: {wr:.1f}%\n"
+            f"Avg win: {metrics['avg_win']:+.2f}€  |  Avg loss: {metrics['avg_loss']:+.2f}€\n"
+            f"Expectancy: {metrics['expectancy']:+.3f}€/trade\n"
+            f"P&L netto: {metrics['total_net']:+.2f}€  ({ret:+.2f}% su {config.BUDGET_EUR:.0f}€)\n\n"
+            f"Confermi con /profile {target}\n"
+            f"Profilo attivo invariato: {original_profile.upper()}"
+        )
+
     async def _cmd_profile(self, update, ctx) -> None:
-        """Show active profile or switch (/profile aggressive|conservative)."""
+        """Show active profile or switch (/profile aggressive|conservative).
+
+        New subcommand: /profile preview <name>  — runs a 30-day backtest on
+        cached data with the target profile, without persisting any change.
+        """
+        if ctx.args and ctx.args[0].lower() == "preview":
+            if len(ctx.args) < 2:
+                await update.message.reply_text(
+                    "Uso: /profile preview <conservative|moderate|aggressive>"
+                )
+                return
+            await self._run_profile_preview(update, ctx.args[1].lower())
+            return
+
         if ctx.args:
             name = ctx.args[0].lower()
             try:
@@ -1198,7 +1303,8 @@ class TradingBot:
                     f"Confidenza min Groq: {p['GROQ_MIN_CONFIDENCE']}/10  |  Score min: {p['MIN_SIGNAL_SCORE']}/6\n"
                     f"Circuit breaker: -{p['CIRCUIT_BREAKER_LOSS_EUR']:.0f}€/giorno\n"
                     f"Trailing stop: {p['TRAILING_STOP_PCT']*100:.0f}%  |  ADX min: {p['ADX_MIN']}\n"
-                    f"Fear&Greed: {p['FEAR_GREED_MIN']}–{p['FEAR_GREED_MAX']}  |  BTC RSI max: {p['BTC_RSI_MAX']}"
+                    f"Fear&Greed: {p['FEAR_GREED_MIN']}–{p['FEAR_GREED_MAX']}  |  BTC RSI max: {p['BTC_RSI_MAX']}\n\n"
+                    f"Tip: /profile preview <nome> per simulare prima di cambiare."
                 )
             except ValueError as exc:
                 await update.message.reply_text(str(exc))

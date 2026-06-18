@@ -126,11 +126,16 @@ Cambio a runtime: `/profile aggressive`
 | GROQ_MIN_CONFIDENCE | 6/10 | 6/10 | 5/10 |
 | MIN_SIGNAL_SCORE | 3/6 | 2/6 | 2/6 |
 | CIRCUIT_BREAKER | €15 | €22 | €30 |
+| MAX_CONSECUTIVE_LOSSES | 3 | 4 | 5 |
 | FEAR_GREED long | 20–80 | 15–85 | 10–90 |
 | FEAR_GREED_SHORT_MIN | 20 | 15 | 10 |
 | TRAILING_ACTIVATION_ATR | 1.0× | 0.8× | 0.7× |
 
-Il profilo attivo viene salvato in `active_profile.json` e ripristinato al riavvio.
+Il profilo attivo viene salvato in `trading.db` (chiave `active_profile`) e ripristinato al riavvio. Si può fare una preview prima di committarlo con `/profile preview <nome>` da Telegram.
+
+I due circuit breaker sono indipendenti:
+- **`CIRCUIT_BREAKER_LOSS_EUR`**: blocca lo scan se la perdita cumulata 24h supera la soglia in €
+- **`MAX_CONSECUTIVE_LOSSES`**: blocca lo scan dopo N stop loss consecutivi (segnale di regime change). Lo streak si resetta al primo TP, così il bot si auto-recupera quando un trade aperto raggiunge il take profit. Telegram notifica una volta sola alla transizione di stato.
 
 ---
 
@@ -146,6 +151,7 @@ Il profilo attivo viene salvato in `active_profile.json` e ripristinato al riavv
 | `/close <ID>` | Chiude una posizione manualmente |
 | `/profile` | Mostra profilo attivo |
 | `/profile <nome>` | Cambia profilo (conservative/moderate/aggressive) |
+| `/profile preview <nome>` | Backtest dry-run di 30 giorni con i parametri del profilo target — **non** cambia il profilo attivo |
 | `/pause` / `/resume` | Sospende/riprende lo scan automatico |
 
 I comandi sono accettati solo dalla chat indicata in `TELEGRAM_CHAT_ID`. Messaggi da altri chat vengono ignorati: chiunque ottenga il token del bot non può comandarlo.
@@ -206,6 +212,7 @@ TRAILING_ACTIVATION_ATR=1.0
 TRAILING_DISTANCE_ATR=1.5
 FEAR_GREED_SHORT_MIN=20
 MAX_BTC_BETA_EXPOSURE_PCT=0.60
+MAX_CONSECUTIVE_LOSSES=4    # 0 = disabilita il CB consecutivo
 
 # Solo per deploy su NAS/server remoto (non committare)
 BOT_DIR=/volume1/homes/youruser/kraken-trading-bot

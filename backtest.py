@@ -415,7 +415,9 @@ def run_backtest(
     profile_name:   str,
 ) -> dict:
     """Run the full simulation for one profile. Returns a result dict."""
-    cfg.apply_profile(profile_name)
+    # persist=False so calling run_backtest from a live bot (e.g. /profile
+    # preview) doesn't overwrite the user's active profile in the DB.
+    cfg.apply_profile(profile_name, persist=False)
     print(f"\n  Profile: {profile_name.upper()}")
 
     # ── State ──────────────────────────────────────────────────────────────────
@@ -846,6 +848,86 @@ def print_report(
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. MAIN
 # ─────────────────────────────────────────────────────────────────────────────
+
+def preview_profile(profile_name: str, days: int = 30, budget: float = 100.0) -> dict:
+    """Run a quick backtest using only cached data for the bot's main pairs.
+
+    Designed to be called from the bot (via asyncio.to_thread) when the user
+    types /profile preview <name>. Does NOT touch the active profile in DB —
+    the caller is responsible for restoring whatever was active before.
+
+    Returns a metrics dict (count, win_rate, total_net, expectancy, ...) or
+    {"error": "<reason>"} when the cached data isn't sufficient.
+    """
+    if profile_name.lower() not in cfg.PROFILES:
+        return {"error": f"profilo '{profile_name}' sconosciuto"}
+
+    end_dt = date.today()
+    start_dt = date.fromtimestamp(_ts(end_dt) - days * 86400)
+    start_ts = _ts(start_dt)
+    end_ts   = _ts(end_dt)
+
+    pairs = list(cfg.PAIRS)
+    if cfg.BTC_PAIR not in pairs:
+        pairs = [cfg.BTC_PAIR] + pairs
+
+    candles_map: dict = {}
+    for pair in pairs:
+        candles_map[pair] = {}
+        missing = False
+        for interval in INTERVALS:
+            cache_file = _cache_path(pair, interval)
+            if not cache_file.exists():
+                missing = True
+                break
+            try:
+                cached = json.loads(cache_file.read_text(encoding="utf-8"))
+                candles_map[pair][interval] = [
+                    c for c in cached if start_ts <= c["time"] < end_ts
+                ]
+            except Exception:
+                missing = True
+                break
+        if missing:
+            return {"error": f"dati storici mancanti per {pair} — esegui 'python backtest.py' una volta"}
+
+    fg_history: dict = {}
+    fg_cache = CACHE_DIR / "fear_greed.json"
+    if fg_cache.exists():
+        try:
+            raw = json.loads(fg_cache.read_text(encoding="utf-8"))
+            fg_history = {date.fromisoformat(k): v for k, v in raw.items()}
+        except Exception:
+            pass
+
+    analyses_map: dict = {}
+    times_1h_map: dict = {}
+    for pair in pairs:
+        times_1h_map[pair] = [c["time"] for c in candles_map[pair][60]]
+        analyses_map[pair] = precompute_analyses(pair, candles_map)
+
+    try:
+        result = run_backtest(
+            pairs=pairs,
+            candles_map=candles_map,
+            analyses_map=analyses_map,
+            times_1h_map=times_1h_map,
+            fg_history=fg_history,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            budget=budget,
+            profile_name=profile_name,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    metrics = _metrics(result["trades"], budget)
+    metrics["start"] = start_dt.isoformat()
+    metrics["end"]   = end_dt.isoformat()
+    metrics["days"]  = days
+    metrics["profile"] = profile_name
+    return metrics
+
 
 def main():
     p = argparse.ArgumentParser(description="Kraken bot backtest")

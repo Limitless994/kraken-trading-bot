@@ -46,6 +46,17 @@ def budget_available() -> bool:
         return _calls_today < config.GROQ_MAX_CALLS_PER_DAY
 
 
+def budget_usage() -> tuple[int, int]:
+    """Return (calls_made_today, daily_cap). Date-aware: resets at midnight."""
+    global _calls_today, _calls_date
+    today = datetime.date.today().isoformat()
+    with _state_lock:
+        if today != _calls_date:
+            _calls_date = today
+            _calls_today = 0
+        return _calls_today, config.GROQ_MAX_CALLS_PER_DAY
+
+
 def _record_call() -> None:
     """Count one call and enforce minimum spacing to respect the RPM ceiling.
 

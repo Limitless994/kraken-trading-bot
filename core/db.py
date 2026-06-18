@@ -69,6 +69,8 @@ def init_db() -> None:
                 pair TEXT NOT NULL,
                 side TEXT NOT NULL,
                 entry REAL,
+                entry_signal REAL,
+                slip_entry_pct REAL,
                 exit_price REAL,
                 size_eur REAL,
                 pnl_eur REAL,
@@ -133,6 +135,16 @@ def init_db() -> None:
                 UNIQUE(ts, module, message)
             );
         """)
+        # Forward-compat ALTERs for DBs created before these columns existed.
+        # Silently skipped when the columns are already in place.
+        for sql in (
+            "ALTER TABLE trades ADD COLUMN entry_signal REAL",
+            "ALTER TABLE trades ADD COLUMN slip_entry_pct REAL",
+        ):
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError:
+                pass
     _logger.info("DB inizializzato: %s", DB_PATH)
 
 
@@ -266,18 +278,30 @@ def get_pending_orders() -> dict:
 # ── Trades ────────────────────────────────────────────────────────────────────
 
 def insert_trade(trade: dict) -> None:
+    # Derive entry slippage when the caller didn't pre-compute it.
+    entry        = trade.get("entry")
+    entry_signal = trade.get("entry_signal")
+    slip_pct     = trade.get("slip_entry_pct")
+    if slip_pct is None and entry and entry_signal:
+        try:
+            slip_pct = (entry - entry_signal) / entry_signal * 100
+        except ZeroDivisionError:
+            slip_pct = None
     with get_conn() as conn:
         conn.execute(
             """
             INSERT INTO trades
-            (pair, side, entry, exit_price, size_eur, pnl_eur, pnl_pct,
-             fee_eur, gross_pnl_eur, exit_reason, opened_at, closed_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            (pair, side, entry, entry_signal, slip_entry_pct, exit_price,
+             size_eur, pnl_eur, pnl_pct, fee_eur, gross_pnl_eur,
+             exit_reason, opened_at, closed_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 trade.get("pair", ""),
                 trade.get("side", "long"),
-                trade.get("entry"),
+                entry,
+                entry_signal,
+                slip_pct,
                 trade.get("exit"),        # JSON used "exit", DB column is exit_price
                 trade.get("size_eur"),
                 trade.get("pnl_eur"),
@@ -316,7 +340,8 @@ def get_sl_count_24h(pair: str) -> int:
     try:
         with get_conn() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) FROM trades WHERE pair=? AND exit_reason='SL' AND closed_at >= ?",
+                "SELECT COUNT(*) FROM trades "
+                "WHERE pair=? AND LOWER(exit_reason)='sl' AND closed_at >= ?",
                 (pair, cutoff),
             ).fetchone()
     except Exception:
@@ -332,12 +357,70 @@ def get_pairs_in_sl_cooldown(hours: float) -> set:
     try:
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT DISTINCT pair FROM trades WHERE exit_reason='SL' AND closed_at >= ?",
+                "SELECT DISTINCT pair FROM trades "
+                "WHERE LOWER(exit_reason)='sl' AND closed_at >= ?",
                 (cutoff,),
             ).fetchall()
     except Exception:
         return set()
     return {r["pair"] for r in rows}
+
+
+def consecutive_losses() -> int:
+    """Count consecutive losing trades from the most recent backwards.
+
+    A losing trade is one with pnl_eur <= 0. The streak ends as soon as we
+    encounter a winning trade. Returns 0 if no trades exist.
+    """
+    if not DB_PATH.exists():
+        return 0
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT pnl_eur FROM trades ORDER BY closed_at DESC LIMIT 50"
+            ).fetchall()
+    except Exception:
+        return 0
+    streak = 0
+    for r in rows:
+        pnl = r["pnl_eur"] or 0.0
+        if pnl <= 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def get_slippage_summary_24h() -> dict:
+    """Average and max entry slippage % over trades closed in the last 24h.
+
+    Returns {"count": int, "avg_pct": float, "max_pct": float}.
+    """
+    empty = {"count": 0, "avg_pct": 0.0, "max_pct": 0.0}
+    if not DB_PATH.exists():
+        return empty
+    cutoff = time.time() - 86400
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(slip_entry_pct) AS n,
+                       AVG(ABS(slip_entry_pct)) AS avg_abs,
+                       MAX(ABS(slip_entry_pct)) AS max_abs
+                FROM trades
+                WHERE closed_at >= ? AND slip_entry_pct IS NOT NULL
+                """,
+                (cutoff,),
+            ).fetchone()
+    except Exception:
+        return empty
+    if not row or not row["n"]:
+        return empty
+    return {
+        "count":  int(row["n"]),
+        "avg_pct": float(row["avg_abs"] or 0.0),
+        "max_pct": float(row["max_abs"] or 0.0),
+    }
 
 
 # ── Groq decisions ────────────────────────────────────────────────────────────
