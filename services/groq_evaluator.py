@@ -92,7 +92,8 @@ def _size_pct(confidence: int) -> float:
 def evaluate(signal: Signal, market_ctx: dict = None) -> tuple:
     """
     Returns (execute: bool, confidence: int, reason: str, size_pct: float).
-    Falls back to (True, 6, reason, AI_SIZE_MIN) if Groq is unavailable (<3 consecutive).
+    On Groq error/429 the safe default is to skip (execute=False); set
+    config.GROQ_FALLBACK_EXECUTE=true to open blind at AI_SIZE_MIN instead.
     Raises GroqUnavailableError after 3 consecutive failures.
     """
     global _consecutive_fallbacks
@@ -189,7 +190,10 @@ def evaluate(signal: Signal, market_ctx: dict = None) -> tuple:
 
         if not upper.startswith("ESEGUI") and not upper.startswith("RIFIUTA"):
             logger.warning("Groq formato inatteso per %s: %s", signal.pair, reply)
-            return True, config.GROQ_MIN_CONFIDENCE, "risposta inattesa — eseguito per default"
+            if config.GROQ_FALLBACK_EXECUTE:
+                return True, config.GROQ_MIN_CONFIDENCE, "risposta inattesa — eseguito per default", config.AI_SIZE_MIN
+            # Safe default: a garbled reply must not open a trade.
+            return False, 0, f"Groq formato inatteso — skippato: {reply[:60]}", 0.0
 
         if execute and confidence < config.GROQ_MIN_CONFIDENCE:
             logger.info(

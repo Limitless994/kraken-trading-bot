@@ -168,6 +168,7 @@ ATR_PERIOD  = 14
 PROFILE_CONSERVATIVE: dict = {
     "MAX_OPEN_TRADES":        4,
     "MAX_CAPITAL_DEPLOYED":   0.80,
+    "MAX_BTC_BETA_EXPOSURE_PCT": 0.50,
     "ATR_TP_MULT":            2.5,
     "ATR_SL_MULT":            1.0,
     "TAKE_PROFIT_PCT":        0.10,
@@ -218,6 +219,7 @@ PROFILE_MODERATE: dict = {
     "GROQ_MIN_CONFIDENCE":    6,
     "MAX_OPEN_TRADES":        5,
     "MAX_CAPITAL_DEPLOYED":   0.87,
+    "MAX_BTC_BETA_EXPOSURE_PCT": 0.65,
     "ATR_TP_MULT":            3.2,
     "ATR_SL_MULT":            1.2,
     "TAKE_PROFIT_PCT":        0.14,
@@ -263,6 +265,7 @@ PROFILE_AGGRESSIVE: dict = {
     # ── Position limits — more simultaneous exposure ──────────────────────────
     "MAX_OPEN_TRADES":        6,    # conservative=4: more concurrent positions
     "MAX_CAPITAL_DEPLOYED":   0.95, # conservative=0.80: nearly full capital deployed
+    "MAX_BTC_BETA_EXPOSURE_PCT": 0.85, # conservative=0.50: allows far more directional exposure
     # ── R:R — wider TP and SL, larger target but survives more noise ──────────
     "ATR_TP_MULT":            4.0,  # conservative=2.5: larger profit target
     "ATR_SL_MULT":            1.5,  # conservative=1.0: wider stop

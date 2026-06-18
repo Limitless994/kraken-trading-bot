@@ -335,7 +335,8 @@ class TradingBot:
         pos = self.positions[pair]
         ticker  = await asyncio.to_thread(kraken_client.get_ticker, pair)
         side    = pos.get("side", "long")
-        current = float(ticker["ask"][0]) if side == "short" else float(ticker["bid"][0])
+        # get_ticker returns ask/bid as floats; close a short at the ask, a long at the bid.
+        current = float(ticker["ask"]) if side == "short" else float(ticker["bid"])
 
         if config.PAPER_TRADING:
             txid = "PAPER"
@@ -732,8 +733,8 @@ class TradingBot:
                     logger.info("%s: SKIP BTC-beta long (%.0f€ + %.0f€ > %.0f€)", signal.pair, _long_exp, signal.size_eur, _max_beta)
                     continue
 
-            if signal.rsi_1h > 65:
-                logger.info("%s: SKIP Groq — RSI(1h)=%.1f overbought (opportunità migliori più tardi)", signal.pair, signal.rsi_1h)
+            if signal.rsi_1h > config.RSI_1H_BUY_MAX:
+                logger.info("%s: SKIP Groq — RSI(1h)=%.1f > %d overbought (opportunità migliori più tardi)", signal.pair, signal.rsi_1h, config.RSI_1H_BUY_MAX)
                 self._groq_rejected[signal.pair] = time.time()
                 continue
 
@@ -881,9 +882,9 @@ class TradingBot:
                 continue
 
             rsi_slope_1h = signal.rsi_1h - signal.rsi_1h_prev
-            if signal.score < 3 and rsi_slope_1h > 0:
-                logger.info("%s: SKIP Groq — score=%d e RSI slope=%.2f positivo (segnale debole in recovery)",
-                            signal.pair, signal.score, rsi_slope_1h)
+            if signal.score < config.MIN_SIGNAL_SCORE and rsi_slope_1h > 0:
+                logger.info("%s: SKIP Groq — score=%d (< %d) e RSI slope=%.2f positivo (segnale debole in recovery)",
+                            signal.pair, signal.score, config.MIN_SIGNAL_SCORE, rsi_slope_1h)
                 self._groq_rejected[signal.pair] = time.time()
                 continue
 
@@ -1157,12 +1158,15 @@ class TradingBot:
         for pair, po in list(pending.items()):
             txid = po["txid"]
             if txid not in open_txids:
-                order_status = "unknown"
+                # Order left the open book: it either filled, or was canceled/expired.
+                # Never assume a fill — a transient query failure must not book a
+                # phantom position that isn't actually held on Kraken.
                 try:
                     info = await asyncio.to_thread(kraken_client.query_orders, [txid])
                     order_status = info.get(txid, {}).get("status", "unknown")
                 except Exception as exc:
-                    logger.warning("Cannot query order %s: %s — assuming filled", txid, exc)
+                    logger.warning("Cannot query order %s: %s — lascio pending, riprovo", txid, exc)
+                    continue
                 if order_status in ("canceled", "expired"):
                     logger.warning("Limit order %s was %s — no position created", txid, order_status)
                     to_remove.append(pair)
@@ -1170,6 +1174,11 @@ class TradingBot:
                         chat_id=config.TELEGRAM_CHAT_ID,
                         text=f"LIMIT {order_status.upper()} {pair}  TX {txid} — nessuna posizione aperta",
                     )
+                    continue
+                if order_status != "closed":
+                    # Not yet a confirmed fill (e.g. 'open'/'pending' on the next page,
+                    # or 'unknown') — leave it pending and re-check on the next cycle.
+                    logger.info("Limit order %s status=%s — non confermato, riprovo", txid, order_status)
                     continue
                 pos_dict = {
                     "entry":         po["limit_price"],
