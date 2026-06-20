@@ -774,6 +774,35 @@ class TestDB(unittest.TestCase):
     def test_get_trades_empty_on_fresh_db(self):
         self.assertEqual(_db_module.get_trades(), [])
 
+    # ── Consecutive-loss breaker helpers ─────────────────────────────────────
+
+    def _loss(self, closed_at, pnl=-0.5):
+        _db_module.insert_trade({
+            "pair": "XRPEUR", "side": "long", "entry": 1.0, "exit": 0.99,
+            "size_eur": 10.0, "pnl_eur": pnl, "pnl_pct": pnl * 10,
+            "closed_at": closed_at,
+        })
+
+    def test_consecutive_losses_counts_streak(self):
+        for i in range(3):
+            self._loss(closed_at=float(i))
+        self.assertEqual(_db_module.consecutive_losses(), 3)
+
+    def test_consecutive_losses_resets_on_recent_win(self):
+        self._loss(closed_at=1.0)
+        self._loss(closed_at=2.0)
+        self._loss(closed_at=3.0, pnl=1.0)   # most recent is a win
+        self.assertEqual(_db_module.consecutive_losses(), 0)
+
+    def test_seconds_since_last_trade_none_when_empty(self):
+        self.assertIsNone(_db_module.seconds_since_last_trade())
+
+    def test_seconds_since_last_trade_after_insert(self):
+        self._loss(closed_at=time.time() - 7200)   # 2h ago
+        age = _db_module.seconds_since_last_trade()
+        self.assertIsNotNone(age)
+        self.assertAlmostEqual(age, 7200, delta=120)
+
     # ── Groq decisions ─────────────────────────────────────────────────────
 
     def test_insert_and_get_groq_decision(self):
@@ -1288,6 +1317,48 @@ class TestTrailingStopBreakEven(unittest.TestCase):
                                 f"Gross P&L must be >= 0 when trailing fires at break-even; got {result['gross_pnl_eur']}")
 
 
+class TestTrailingCostBuffer(unittest.TestCase):
+    """Trailing stop must lock in at least round-trip-cost coverage (not just
+    break-even), and must never be placed at/above current price."""
+
+    _SLIP_EST = 0.002
+
+    def _cost_pct(self):
+        return 2 * config.KRAKEN_TAKER_FEE + 2 * self._SLIP_EST
+
+    def _pos(self, side, entry, sl):
+        return {"side": side, "entry": entry, "stop_loss": sl, "size_eur": 30.0}
+
+    def test_long_trailing_clears_cost_buffer(self):
+        from bot.telegram_bot import _update_trailing_stop
+        pos = self._pos("long", entry=100.0, sl=95.0)
+        updated = _update_trailing_stop(pos, current=110.0, atr=3.0, cfg=config)
+        self.assertTrue(updated)
+        self.assertGreaterEqual(pos["trailing_stop"], round(100.0 * (1 + self._cost_pct()), 8))
+
+    def test_short_trailing_clears_cost_buffer(self):
+        from bot.telegram_bot import _update_trailing_stop
+        pos = self._pos("short", entry=100.0, sl=105.0)
+        updated = _update_trailing_stop(pos, current=90.0, atr=3.0, cfg=config)
+        self.assertTrue(updated)
+        self.assertLessEqual(pos["trailing_stop"], round(100.0 * (1 - self._cost_pct()), 8))
+
+    def test_long_no_update_when_move_too_small(self):
+        from bot.telegram_bot import _update_trailing_stop
+        # activation reached but the cost floor sits above current → keep original SL
+        pos = self._pos("long", entry=100.0, sl=95.0)
+        updated = _update_trailing_stop(pos, current=100.5, atr=0.5, cfg=config)
+        self.assertFalse(updated)
+        self.assertNotIn("trailing_stop", pos)
+
+    def test_short_no_update_when_move_too_small(self):
+        from bot.telegram_bot import _update_trailing_stop
+        pos = self._pos("short", entry=100.0, sl=105.0)
+        updated = _update_trailing_stop(pos, current=99.5, atr=0.5, cfg=config)
+        self.assertFalse(updated)
+        self.assertNotIn("trailing_stop", pos)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 19. FIX 1 — LIMIT ORDER LOCK
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1570,6 +1641,7 @@ if __name__ == "__main__":
         TestOHLCCache, TestAdaptiveSlippage,
         TestLimitOrderLock, TestShutdownHandler, TestReconcileOrders,
         TestMinProfitGate, TestRSISlopeFilter,
+        TestTrailingStopBreakEven, TestTrailingCostBuffer,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

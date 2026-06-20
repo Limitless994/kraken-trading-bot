@@ -391,6 +391,25 @@ def consecutive_losses() -> int:
     return streak
 
 
+def seconds_since_last_trade():
+    """Seconds elapsed since the most recent trade closed, or None if no trades.
+
+    Used by the consecutive-loss circuit breaker to auto-recover: a loss streak
+    that never sees a new winning trade would otherwise latch the breaker forever
+    once the bot stops opening positions. After a quiet period we let it probe.
+    """
+    if not DB_PATH.exists():
+        return None
+    try:
+        with get_conn() as conn:
+            row = conn.execute("SELECT MAX(closed_at) AS last FROM trades").fetchone()
+    except Exception:
+        return None
+    if not row or row["last"] is None:
+        return None
+    return max(0.0, time.time() - float(row["last"]))
+
+
 def get_slippage_summary_24h() -> dict:
     """Average and max entry slippage % over trades closed in the last 24h.
 

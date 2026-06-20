@@ -112,14 +112,23 @@ def _update_trailing_stop(pos: dict, current: float, atr: float, cfg) -> bool:
     old_trailing = pos.get("trailing_stop", pos["stop_loss"])
     entry = pos["entry"]
     side  = pos.get("side", "long")
+    # Clamp the trailing floor to cover the round-trip cost, not just to entry.
+    # Anchoring at entry meant a tiny pullback after activation closed the trade at
+    # ~breakeven gross — i.e. a net loss equal to fees+slippage (the trailing-churn
+    # that produced ~half of all losing trades). Keep at least cost_pct of buffer.
+    # _SLIP_EST mirrors the slippage cap used in _calc_exit / strategy's profit gate.
+    _SLIP_EST = 0.002
+    cost_pct = 2 * cfg.KRAKEN_TAKER_FEE + 2 * _SLIP_EST
     if side == "short":
         activation = (entry - cfg.TRAILING_ACTIVATION_ATR * atr) if atr > 0 else entry * (1 - cfg.TRAILING_STOP_PCT)
         if current <= activation:
             new_trailing = (round(current + cfg.TRAILING_DISTANCE_ATR * atr, 8) if atr > 0
                             else round(current * (1 + cfg.TRAILING_STOP_PCT), 8))
-            # Never set trailing above entry — would guarantee a loss on reversal
-            new_trailing = min(new_trailing, entry)
-            if new_trailing < old_trailing:
+            # Never set trailing above entry-minus-costs — would lock in a net loss on reversal
+            new_trailing = min(new_trailing, round(entry * (1 - cost_pct), 8))
+            # Guard: don't place the stop at/above current price (would exit instantly).
+            # If the move is too small to clear the cost buffer, keep the original SL.
+            if new_trailing > current and new_trailing < old_trailing:
                 pos["trailing_stop"] = new_trailing
                 return True
     else:
@@ -127,9 +136,11 @@ def _update_trailing_stop(pos: dict, current: float, atr: float, cfg) -> bool:
         if current >= activation:
             new_trailing = (round(current - cfg.TRAILING_DISTANCE_ATR * atr, 8) if atr > 0
                             else round(current * (1 - cfg.TRAILING_STOP_PCT), 8))
-            # Never set trailing below entry — would guarantee a loss on reversal
-            new_trailing = max(new_trailing, entry)
-            if new_trailing > old_trailing:
+            # Never set trailing below entry-plus-costs — would lock in a net loss on reversal
+            new_trailing = max(new_trailing, round(entry * (1 + cost_pct), 8))
+            # Guard: don't place the stop at/above current price (would exit instantly).
+            # If the move is too small to clear the cost buffer, keep the original SL.
+            if new_trailing < current and new_trailing > old_trailing:
                 pos["trailing_stop"] = new_trailing
                 return True
     return False
@@ -622,11 +633,23 @@ class TradingBot:
         # Streak resets the next time a trade closes in profit — so the bot
         # can self-recover once an open position takes a TP. To keep Telegram
         # quiet, only alert on the transition from below → at-or-above threshold.
+        # Time-decay recovery: if no trade has closed for SL_COOLDOWN_HOURS the
+        # streak is stale (the bot stopped trading) — lift the block and let it
+        # probe again, otherwise the breaker would latch forever with no new TP.
         max_streak = config.MAX_CONSECUTIVE_LOSSES
         if max_streak > 0:
             streak = db.consecutive_losses()
             alerted = db.get_setting("cb_consecutive_alerted") == "1"
-            if streak >= max_streak:
+            age = db.seconds_since_last_trade()
+            stale = age is not None and age > config.SL_COOLDOWN_HOURS * 3600
+            if streak >= max_streak and stale:
+                logger.info(
+                    "Consecutive-loss CB scaduto (ultimo trade %.1fh fa > %.1fh) — probe consentito",
+                    age / 3600, config.SL_COOLDOWN_HOURS,
+                )
+                if alerted:
+                    db.set_setting("cb_consecutive_alerted", "0")
+            elif streak >= max_streak:
                 if not alerted:
                     db.set_setting("cb_consecutive_alerted", "1")
                     await self.app.bot.send_message(
@@ -685,6 +708,13 @@ class TradingBot:
                     "ema50": "OK" if btc_analysis.price_above_ema50 else "SOTTO",
                     "adx":   btc_analysis.adx,
                 }))
+            else:
+                # Fail-safe: BTC filter is on but we couldn't fetch BTC data, so we
+                # cannot assess the regime. generate_signal skips the BTC gate when
+                # btc_analysis is None (fail-open), which previously let longs through
+                # in a downtrend on a transient fetch failure. Skip the whole cycle.
+                logger.warning("BTC filter ON ma dati BTC non disponibili — scan saltato (fail-safe)")
+                return False
 
         dynamic = _load_json(DYNAMIC_PAIRS_FILE, [])
         discovery_data = _load_json(DISCOVERY_LOG_FILE, {})
@@ -1531,6 +1561,10 @@ class TradingBot:
         btc_analysis = None
         if config.BTC_FILTER_ENABLED:
             btc_analysis = await asyncio.to_thread(analyze, config.BTC_PAIR)
+            if btc_analysis is None:
+                # Fail-safe: no BTC regime data → don't auto-trade discovery candidates.
+                logger.warning("Discovery: dati BTC non disponibili — auto-trade saltato (fail-safe)")
+                return
 
         trades_history = db.get_trades()
         kelly_pct = kelly_size_pct(trades_history)
