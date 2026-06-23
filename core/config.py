@@ -248,9 +248,12 @@ PROFILE_AGGRESSIVE: dict = {
     "MIN_SIGNAL_SCORE":       2,    # conservative=3: accepts weaker setups
     "ADX_MIN":                12,   # conservative=20: enters even weak/ranging trends
     "VOLUME_SPIKE_MULT":      1.05, # conservative=1.15: lower bar for volume confirmation
-    # ── Structural trend filters OFF — this is what makes aggressive aggressive ─
-    "DAILY_EMA_FILTER":       False,# conservative=True: take longs even below daily EMA50
-    "BTC_EMA_FILTER":         False,# conservative=True: don't gate altcoin longs on BTC EMA
+    # ── Structural trend filters STAY ON — buying below the daily/BTC EMA in a
+    #    downtrend just bleeds via stop-loss (12 long SL vs 1 TP observed in the
+    #    bear regime). Aggressive stays aggressive on size/positions/RSI, not by
+    #    fighting the structural trend.
+    "DAILY_EMA_FILTER":       True,
+    "BTC_EMA_FILTER":         True,
     # ── RSI thresholds — higher = buys more extended moves ───────────────────
     "RSI_1H_BUY_MAX":         72,
     "RSI_15M_BUY_MAX":        68,
