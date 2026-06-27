@@ -35,6 +35,11 @@ fi
 
 # Kill bot Python processes (the PID file already killed the loop above)
 pkill -9 -f "python.*kraken-trading-bot" 2>/dev/null
+# Also kill a dashboard started OUTSIDE this script (e.g. a relative-path launch
+# or DSM task): its cmdline is "…/venv_trading/bin/python dashboard.py" with no
+# bot-dir in it, so the pattern above misses it — which left a stale dashboard
+# (old code + stale in-memory profile) running across deploys.
+pkill -9 -f "venv_trading/bin/python.*dashboard.py" 2>/dev/null
 # Wait and verify all old processes are gone (prevents deploy-with-old-code-in-memory bug)
 for i in 1 2 3 4 5; do
     sleep 1
