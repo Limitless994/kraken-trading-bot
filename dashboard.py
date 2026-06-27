@@ -1573,6 +1573,18 @@ function validateWithGemini() {
 def index():
     msg = request.args.get("msg", "")
 
+    # Keep this process's in-memory config in sync with the DB (the source of
+    # truth). The dashboard is a separate process and otherwise only updates its
+    # profile when a profile button is clicked *here* — so changes made via
+    # Telegram, a redeploy, or a direct DB write left it showing a stale profile
+    # name AND stale params (min_score, adx_min, ...). Re-apply per render.
+    try:
+        _db_profile = db.get_setting("active_profile")
+        if _db_profile in config.PROFILES and _db_profile != config.ACTIVE_PROFILE:
+            config.apply_profile(_db_profile, persist=False, quiet=True)
+    except Exception:
+        pass
+
     trades_log = db.get_trades()
     groq_log   = db.get_groq_decisions(500)
     discovery  = db.get_latest_discovery()
