@@ -205,18 +205,21 @@ PROFILE_CONSERVATIVE: dict = {
 }
 
 PROFILE_MODERATE: dict = {
-    "MIN_SIGNAL_SCORE":       2,
-    "ADX_MIN":                17,
+    # Selectivity raised after a 69-trade review: gross edge was +8.10€ but fees
+    # (16.17€, ~1.2%/round-trip) were 2× the edge — death by overtrading a thin
+    # edge, worst in low-ADX chop. Fewer/higher-conviction trades cut the fee drag.
+    "MIN_SIGNAL_SCORE":       3,    # was 2: require a stronger multi-factor setup
+    "ADX_MIN":                23,   # was 17: skip ranging/chop (where it bled)
     "DAILY_EMA_FILTER":       True,   # moderate keeps trend protection
     "BTC_EMA_FILTER":         True,
-    "VOLUME_SPIKE_MULT":      1.08,
+    "VOLUME_SPIKE_MULT":      1.20,  # was 1.08: demand real volume confirmation
     "RSI_1H_BUY_MAX":         68,
     "RSI_15M_BUY_MAX":        65,
     "RSI_4H_BUY_MAX":         73,
     "BTC_RSI_MAX":            68,
     "FEAR_GREED_MIN":         15,
     "FEAR_GREED_MAX":         85,
-    "GROQ_MIN_CONFIDENCE":    6,
+    "GROQ_MIN_CONFIDENCE":    7,    # was 6: let the AI veto lower-conviction setups
     "MAX_OPEN_TRADES":        5,
     "MAX_CAPITAL_DEPLOYED":   0.87,
     "MAX_BTC_BETA_EXPOSURE_PCT": 0.65,
