@@ -269,6 +269,7 @@ def add_order(
     price: str | None = None,
     validate: bool = False,
     leverage: int | None = None,   # per margin orders (short)
+    oflags: str | None = None,     # e.g. "post" for post-only maker limit orders
 ) -> dict:
     """
     Place a new order. Set validate=True to dry-run without executing.
@@ -286,6 +287,8 @@ def add_order(
         params["validate"] = "true"
     if leverage:
         params["leverage"] = str(leverage)
+    if oflags:
+        params["oflags"] = oflags
     try:
         return _private("AddOrder", params)
     except Exception as exc:

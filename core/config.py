@@ -47,6 +47,20 @@ LIMIT_ORDERS_ENABLED = os.getenv("LIMIT_ORDERS_ENABLED", "true").lower() == "tru
 LIMIT_OFFSET_PCT     = float(os.getenv("LIMIT_OFFSET_PCT", "0.001"))
 LIMIT_TIMEOUT_SEC    = int(os.getenv("LIMIT_TIMEOUT_SEC", "300"))
 
+# ── Entry execution (Mod 1) ───────────────────────────────────────────────────
+# Post-only maker limit entries for BOTH sides (paper + live): the order rests in
+# the book at the best maker price (bid for long, ask for short). If it doesn't
+# fill within ENTRY_FILL_TIMEOUT_SEC it is cancelled and the signal is DISCARDED
+# (no price chasing). "market" falls back to taker market entries.
+ENTRY_ORDER_TYPE       = os.getenv("ENTRY_ORDER_TYPE", "limit_post_only")  # limit_post_only | market
+ENTRY_FILL_TIMEOUT_SEC = int(os.getenv("ENTRY_FILL_TIMEOUT_SEC", "180"))
+# Round-trip cost for the min-profit gate. With a post-only entry there is NO
+# entry slippage (fill at the limit price or not at all), so: maker entry +
+# taker exit + one-sided exit slippage. Shorts add estimated funding separately.
+SLIP_EXIT_PCT          = float(os.getenv("SLIP_EXIT_PCT", "0.002"))   # 1-sided exit slippage
+FUNDING_EST_PCT        = float(os.getenv("FUNDING_EST_PCT", "0.0004"))# est. short funding component
+ROUND_TRIP_COST_PCT    = KRAKEN_MAKER_FEE + KRAKEN_TAKER_FEE + SLIP_EXIT_PCT
+
 # ── ATR-based TP/SL ───────────────────────────────────────────────────────────
 ATR_TP_MULT       = float(os.getenv("ATR_TP_MULT",       "2.5"))
 ATR_SL_MULT       = float(os.getenv("ATR_SL_MULT",       "1.0"))
@@ -66,6 +80,20 @@ CIRCUIT_BREAKER_LOSS_EUR  = float(os.getenv("CIRCUIT_BREAKER_LOSS_EUR", "15"))
 # Streak resets the first time a trade closes in profit. Set 0 to disable.
 MAX_CONSECUTIVE_LOSSES    = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
 
+# ── Protections (Mod 2, Freqtrade-style, per-side) ────────────────────────────
+# StoplossGuard: N stop-losses on the SAME side within the window blocks only
+# that side for BLOCK_H hours (shorts keep trading while longs are blocked).
+STOPLOSS_GUARD_N        = int(os.getenv("STOPLOSS_GUARD_N",        "4"))
+STOPLOSS_GUARD_WINDOW_H = float(os.getenv("STOPLOSS_GUARD_WINDOW_H", "24"))
+STOPLOSS_GUARD_BLOCK_H  = float(os.getenv("STOPLOSS_GUARD_BLOCK_H",  "4"))
+# CooldownPerPair: no new entry on a pair for N minutes after any trade on it closes.
+COOLDOWN_PER_PAIR_MIN   = int(os.getenv("COOLDOWN_PER_PAIR_MIN",   "60"))
+# MaxDrawdownGuard: peak-to-trough drawdown over the window > MAX_DD_PCT of BUDGET
+# blocks ALL entries for BLOCK_H hours. Set MAX_DD_PCT=0 to disable.
+MAX_DD_PCT       = float(os.getenv("MAX_DD_PCT",       "0.05"))
+MAX_DD_WINDOW_H  = float(os.getenv("MAX_DD_WINDOW_H",  "48"))
+MAX_DD_BLOCK_H   = float(os.getenv("MAX_DD_BLOCK_H",   "12"))
+
 # ── Signal scoring ────────────────────────────────────────────────────────────
 MIN_SIGNAL_SCORE  = int(os.getenv("MIN_SIGNAL_SCORE",  "3"))
 VOLUME_SPIKE_MULT = float(os.getenv("VOLUME_SPIKE_MULT", "1.15"))
@@ -76,6 +104,16 @@ RSI_SHORT_MIN     = int(os.getenv("RSI_SHORT_MIN",     "40"))
 
 # ── ADX ───────────────────────────────────────────────────────────────────────
 ADX_MIN = int(os.getenv("ADX_MIN", "20"))
+
+# ── Per-side entry thresholds (Mod 3) ─────────────────────────────────────────
+# Longs bled historically while shorts were profitable, so longs get a stricter
+# bar. These default to the single-value base above (full retrocompatibility);
+# each profile may override them, and apply_profile() mirrors the base value onto
+# any per-side key a profile omits.
+MIN_SIGNAL_SCORE_LONG  = int(os.getenv("MIN_SIGNAL_SCORE_LONG",  str(MIN_SIGNAL_SCORE)))
+MIN_SIGNAL_SCORE_SHORT = int(os.getenv("MIN_SIGNAL_SCORE_SHORT", str(MIN_SIGNAL_SCORE)))
+ADX_MIN_LONG  = int(os.getenv("ADX_MIN_LONG",  str(ADX_MIN)))
+ADX_MIN_SHORT = int(os.getenv("ADX_MIN_SHORT", str(ADX_MIN)))
 
 # ── Multi-timeframe ───────────────────────────────────────────────────────────
 DAILY_EMA_FILTER = os.getenv("DAILY_EMA_FILTER", "true").lower() == "true"
@@ -178,6 +216,8 @@ PROFILE_CONSERVATIVE: dict = {
     "AI_SIZE_MIN":            0.12,
     "GROQ_MIN_CONFIDENCE":    7,
     "MIN_SIGNAL_SCORE":       3,
+    "MIN_SIGNAL_SCORE_LONG":  4,    # Mod 3: longs need a stronger setup than shorts
+    "MIN_SIGNAL_SCORE_SHORT": 3,
     "CIRCUIT_BREAKER_LOSS_EUR": 15.0,
     "TRAILING_STOP_PCT":      0.03,
     "FEAR_GREED_MIN":         20,
@@ -185,6 +225,8 @@ PROFILE_CONSERVATIVE: dict = {
     "BTC_RSI_MAX":            65,
     "VOLUME_SPIKE_MULT":      1.15,
     "ADX_MIN":                20,
+    "ADX_MIN_LONG":           22,   # Mod 3: longs demand a stronger trend
+    "ADX_MIN_SHORT":          20,
     "DAILY_EMA_FILTER":       True,   # block longs below daily EMA50 (trend protection)
     "BTC_EMA_FILTER":         True,   # block non-BTC longs when BTC below its EMA50
     "RSI_1H_BUY_MAX":         65,
@@ -209,7 +251,11 @@ PROFILE_MODERATE: dict = {
     # (16.17€, ~1.2%/round-trip) were 2× the edge — death by overtrading a thin
     # edge, worst in low-ADX chop. Fewer/higher-conviction trades cut the fee drag.
     "MIN_SIGNAL_SCORE":       3,    # was 2: require a stronger multi-factor setup
+    "MIN_SIGNAL_SCORE_LONG":  4,    # Mod 3: longs need a stronger setup than shorts
+    "MIN_SIGNAL_SCORE_SHORT": 3,
     "ADX_MIN":                23,   # was 17: skip ranging/chop (where it bled)
+    "ADX_MIN_LONG":           25,   # Mod 3: longs demand a stronger trend
+    "ADX_MIN_SHORT":          23,
     "DAILY_EMA_FILTER":       True,   # moderate keeps trend protection
     "BTC_EMA_FILTER":         True,
     "VOLUME_SPIKE_MULT":      1.20,  # was 1.08: demand real volume confirmation
@@ -249,7 +295,11 @@ PROFILE_MODERATE: dict = {
 PROFILE_AGGRESSIVE: dict = {
     # ── Entry filters — lower = more trades, higher noise ratio ──────────────
     "MIN_SIGNAL_SCORE":       2,    # conservative=3: accepts weaker setups
+    "MIN_SIGNAL_SCORE_LONG":  3,    # Mod 3: longs need a stronger setup than shorts
+    "MIN_SIGNAL_SCORE_SHORT": 2,
     "ADX_MIN":                12,   # conservative=20: enters even weak/ranging trends
+    "ADX_MIN_LONG":           14,   # Mod 3: longs demand a stronger trend
+    "ADX_MIN_SHORT":          12,
     "VOLUME_SPIKE_MULT":      1.05, # conservative=1.15: lower bar for volume confirmation
     # ── Structural trend filters STAY ON — buying below the daily/BTC EMA in a
     #    downtrend just bleeds via stop-loss (12 long SL vs 1 TP observed in the
@@ -326,6 +376,13 @@ def apply_profile(name: str, *, quiet: bool = False, persist: bool = True) -> No
     module = sys.modules[__name__]
     for key, val in PROFILES[name].items():
         setattr(module, key, val)
+    # Per-side gate fallback (Mod 3): mirror the base value onto any per-side key
+    # the profile omits, so switching profiles never leaves a stale override.
+    for base_key in ("MIN_SIGNAL_SCORE", "ADX_MIN"):
+        for side in ("LONG", "SHORT"):
+            side_key = f"{base_key}_{side}"
+            if side_key not in PROFILES[name]:
+                setattr(module, side_key, getattr(module, base_key))
     setattr(module, "ACTIVE_PROFILE", name)
     if not quiet:
         _logger.info(

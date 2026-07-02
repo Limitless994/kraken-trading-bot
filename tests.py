@@ -1360,6 +1360,210 @@ class TestTrailingCostBuffer(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# MOD 3 — Per-side entry thresholds
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPerSideThresholds(unittest.TestCase):
+    """Longs get a stricter score/ADX bar than shorts (asymmetry), with fallback."""
+
+    def setUp(self):
+        config.apply_profile("moderate")
+
+    def tearDown(self):
+        config.apply_profile("conservative")
+
+    def test_profiles_define_per_side(self):
+        self.assertEqual(config.MIN_SIGNAL_SCORE_LONG, 4)
+        self.assertEqual(config.MIN_SIGNAL_SCORE_SHORT, 3)
+        self.assertEqual(config.ADX_MIN_LONG, 25)
+        self.assertEqual(config.ADX_MIN_SHORT, 23)
+
+    def test_fallback_mirrors_base_when_absent(self):
+        # aggressive omits nothing now, but the fallback must keep per-side == base
+        # for any profile that does not override (proven via apply_profile invariant).
+        config.apply_profile("aggressive")
+        self.assertGreaterEqual(config.MIN_SIGNAL_SCORE_LONG, config.MIN_SIGNAL_SCORE)
+        self.assertGreaterEqual(config.ADX_MIN_LONG, config.ADX_MIN)
+
+    def test_adx_between_thresholds_blocks_long_not_short(self):
+        # ADX 24: long needs 25 (blocked by gate), short needs 23 (allowed)
+        a_long = _make_analysis(adx=24.0, atr=2.0, rsi_1h=25.0, volume_ratio=2.0)
+        self.assertIsNone(generate_signal(a_long, 100.0))
+        a_short = _make_short_analysis(adx=24.0, atr=0.001)
+        self.assertIsNotNone(generate_short_signal(a_short, 100.0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MOD 1 — Post-only limit entries (fill / timeout / partial / paper simulation)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestLimitEntry(unittest.TestCase):
+    """Entry lifecycle: conservative paper fill (cross not touch), timeout discard,
+    live partial fill, and the no-entry-slippage cost accounting."""
+
+    def _po(self, side="long", limit=1.0, timeout=9_999_999_999):
+        return {"txid": "OTEST-1", "limit_price": limit, "size_eur": 20.0,
+                "size_crypto": 20.0, "take_profit": 1.1, "stop_loss": 0.95,
+                "trailing_stop": 0.95, "timeout_at": timeout, "side": side,
+                "atr": 0.02, "fee_entry_eur": 0.05, "entry_signal": limit}
+
+    def _run_check(self, pending, *, paper, ticker=None, open_orders=None, order_info=None):
+        import asyncio as _asyncio
+        from unittest.mock import AsyncMock
+        import bot.telegram_bot as tb
+        with patch("bot.telegram_bot.Application") as mock_app_cls:
+            mock_app_cls.builder.return_value.token.return_value.build.return_value = MagicMock()
+            bot = tb.TradingBot()
+            bot.app = MagicMock()
+            bot.app.bot.send_message = AsyncMock()
+            inserted, deleted = {}, []
+            prev = config.PAPER_TRADING
+            config.PAPER_TRADING = paper
+            patches = [
+                patch.object(tb.db, "get_pending_orders", return_value=pending),
+                patch.object(tb.db, "insert_position", side_effect=lambda p, d: inserted.__setitem__(p, d)),
+                patch.object(tb.db, "delete_pending_order", side_effect=lambda p: deleted.append(p)),
+            ]
+            if ticker is not None:
+                patches.append(patch.object(tb.kraken_client, "get_ticker", return_value=ticker))
+            if open_orders is not None:
+                patches.append(patch.object(tb.kraken_client, "get_open_orders", return_value=open_orders))
+            if order_info is not None:
+                patches.append(patch.object(tb.kraken_client, "query_orders", return_value=order_info))
+            patches.append(patch.object(tb.kraken_client, "cancel_order", return_value={}))
+            try:
+                for p in patches:
+                    p.start()
+                _asyncio.run(bot._job_check_pending_orders(MagicMock()))
+            finally:
+                for p in patches:
+                    p.stop()
+                config.PAPER_TRADING = prev
+            return inserted, deleted
+
+    def test_pos_from_pending_partial_sizing(self):
+        import bot.telegram_bot as tb
+        po = self._po(side="long", limit=2.0)
+        pos = tb.TradingBot._pos_from_pending(None, "SOLEUR", po, filled_crypto=6.0, entry_price=2.0, now=1000.0)
+        self.assertEqual(pos["order_type"], "limit")
+        self.assertEqual(pos["side"], "long")
+        self.assertAlmostEqual(pos["size_crypto"], 6.0)
+        self.assertAlmostEqual(pos["size_eur"], 12.0)   # 6 × 2.0, proportioned
+        self.assertEqual(pos["take_profit"], 1.1)       # price levels preserved
+        self.assertEqual(pos["stop_loss"], 0.95)
+
+    def test_paper_fill_on_cross(self):
+        inserted, deleted = self._run_check(
+            {"SOLEUR": self._po("long", limit=1.0)}, paper=True,
+            ticker={"bid": 0.95, "ask": 0.96, "last": 0.95})
+        self.assertIn("SOLEUR", inserted)              # crossed below → filled
+        self.assertEqual(deleted, ["SOLEUR"])
+
+    def test_paper_no_fill_on_touch(self):
+        inserted, deleted = self._run_check(
+            {"SOLEUR": self._po("long", limit=1.0)}, paper=True,
+            ticker={"bid": 1.0, "ask": 1.01, "last": 1.0})
+        self.assertNotIn("SOLEUR", inserted)           # only touched, not crossed
+        self.assertEqual(deleted, [])                  # stays pending
+
+    def test_paper_timeout_discards_signal(self):
+        inserted, deleted = self._run_check(
+            {"SOLEUR": self._po("long", limit=1.0, timeout=1.0)}, paper=True,
+            ticker={"bid": 1.0, "ask": 1.01, "last": 1.0})
+        self.assertNotIn("SOLEUR", inserted)           # never filled
+        self.assertEqual(deleted, ["SOLEUR"])          # discarded on timeout (no chase)
+
+    def test_live_partial_fill_on_timeout(self):
+        inserted, deleted = self._run_check(
+            {"SOLEUR": self._po("long", limit=2.0, timeout=1.0)}, paper=False,
+            open_orders={"open": {"OTEST-1": {}}},      # still resting at timeout
+            order_info={"OTEST-1": {"status": "open", "vol_exec": 5.0}})
+        self.assertIn("SOLEUR", inserted)
+        self.assertAlmostEqual(inserted["SOLEUR"]["size_crypto"], 5.0)  # partial volume
+        self.assertAlmostEqual(inserted["SOLEUR"]["size_eur"], 10.0)    # 5 × 2.0
+        self.assertEqual(deleted, ["SOLEUR"])
+
+    def test_calc_exit_limit_has_half_slippage(self):
+        from bot.telegram_bot import _calc_exit
+        base = dict(entry=100.0, size_crypto=0.3, size_eur=30.0, atr=3.0,
+                    side="long", fee_entry_eur=0.0)
+        market = _calc_exit({**base, "order_type": "market"}, 103.0, config)
+        limit  = _calc_exit({**base, "order_type": "limit"},  103.0, config)
+        self.assertAlmostEqual(limit["slip_eur"], market["slip_eur"] / 2, places=6)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MOD 2 — Protections (StoplossGuard per-side, cooldown, MaxDrawdown)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestProtections(unittest.TestCase):
+
+    def setUp(self):
+        self._tmpdir = Path(tempfile.mkdtemp())
+        self._orig = _db_module.DB_PATH
+        _db_module.DB_PATH = self._tmpdir / "prot_test.db"
+        _db_module.init_db()
+
+    def tearDown(self):
+        _db_module.DB_PATH = self._orig
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _sl(self, side, closed_at):
+        _db_module.insert_trade({
+            "pair": "SOLEUR", "side": side, "entry": 1.0, "exit": 0.99,
+            "size_eur": 10.0, "pnl_eur": -0.3, "pnl_pct": -3.0,
+            "exit_reason": "sl", "closed_at": closed_at,
+        })
+
+    def test_add_is_and_expire_protection(self):
+        now = time.time()
+        _db_module.add_protection("long", "stoploss_guard", now + 3600)
+        self.assertTrue(_db_module.is_protected("long", now))
+        self.assertFalse(_db_module.is_protected("short", now))     # per-side isolation
+        self.assertEqual(len(_db_module.get_active_protections(now)), 1)
+        # After expiry it is neither active nor returned.
+        self.assertFalse(_db_module.is_protected("long", now + 3601))
+        _db_module.clear_expired_protections(now + 3601)
+        self.assertEqual(_db_module.get_active_protections(now + 3601), [])
+
+    def test_sl_count_per_side(self):
+        now = time.time()
+        for i in range(4):
+            self._sl("long", now - i * 100)
+        self._sl("short", now - 50)
+        self.assertEqual(_db_module.get_sl_count_side_24h("long", 24), 4)
+        self.assertEqual(_db_module.get_sl_count_side_24h("short", 24), 1)
+
+    def test_seconds_since_pair_close(self):
+        self._sl("long", time.time() - 1800)   # 30 min ago
+        secs = _db_module.seconds_since_pair_close("SOLEUR")
+        self.assertIsNotNone(secs)
+        self.assertAlmostEqual(secs, 1800, delta=120)
+        self.assertIsNone(_db_module.seconds_since_pair_close("NONEUR"))
+
+    def test_compute_drawdown_peak_trough(self):
+        from bot.telegram_bot import _compute_drawdown
+        now = time.time()
+        # equity: 100 → 105 (peak) → 98 (trough) → 101
+        trades = [
+            {"pnl_eur": +5.0, "closed_at": now - 3000},
+            {"pnl_eur": -7.0, "closed_at": now - 2000},
+            {"pnl_eur": +3.0, "closed_at": now - 1000},
+        ]
+        dd, peak, trough = _compute_drawdown(trades, budget=100.0, window_sec=48 * 3600, now=now)
+        self.assertAlmostEqual(peak, 105.0)
+        self.assertAlmostEqual(trough, 98.0)
+        self.assertAlmostEqual(dd, 7.0)
+
+    def test_compute_drawdown_ignores_old_trades(self):
+        from bot.telegram_bot import _compute_drawdown
+        now = time.time()
+        trades = [{"pnl_eur": -50.0, "closed_at": now - 200000}]  # older than window
+        dd, peak, trough = _compute_drawdown(trades, budget=100.0, window_sec=48 * 3600, now=now)
+        self.assertEqual(dd, 0.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 19. FIX 1 — LIMIT ORDER LOCK
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1496,37 +1700,41 @@ class TestReconcileOrders(unittest.TestCase):
 class TestMinProfitGate(unittest.TestCase):
     """generate_short_signal must reject signals where TP gross < round-trip costs × 1.3."""
 
+    # Post-only entries (Mod 1): round-trip = maker + taker + 1-sided exit slippage,
+    # plus estimated funding for shorts. Thresholds derived from config so these
+    # stay correct if the cost model changes.
+    def _threshold_pct(self):
+        return (config.ROUND_TRIP_COST_PCT + config.FUNDING_EST_PCT) * 1.3
+
+    def _atr_for_tp_pct(self, price, tp_pct):
+        # short TP distance% = ATR_TP_MULT_SHORT × atr / price  →  invert for atr
+        return tp_pct * price / config.ATR_TP_MULT_SHORT
+
     def test_blocked_when_atr_too_tight(self):
-        # ATR=0.00025 → TP distance = 2.5×0.00025/0.07 = 0.89% < min 1.59% → SKIP
-        a = _make_short_analysis(price=0.07, atr=0.00025)
-        self.assertIsNone(generate_short_signal(a, 100.0))
+        price = 0.07
+        atr = self._atr_for_tp_pct(price, self._threshold_pct() * 0.6)  # well below
+        self.assertIsNone(generate_short_signal(_make_short_analysis(price=price, atr=atr), 100.0))
 
     def test_passes_with_adequate_atr(self):
-        # ATR=0.001 → TP distance = 2.5×0.001/0.07 = 3.57% > min 1.59% → OK
-        a = _make_short_analysis(price=0.07, atr=0.001)
-        sig = generate_short_signal(a, 100.0)
-        self.assertIsNotNone(sig, "Signal with adequate ATR should not be blocked by profit gate")
+        a = _make_short_analysis(price=0.07, atr=0.001)  # ~3.6% TP >> threshold
+        self.assertIsNotNone(generate_short_signal(a, 100.0),
+                             "Signal with adequate ATR should not be blocked by profit gate")
 
     def test_tp_gross_pct_calculation(self):
-        # Verify the gate threshold formula: 2×taker + 2×slip_cap + margin_open = 1.22%, ×1.3 = 1.586%
-        _SLIP_EST = 0.002
-        min_cost = 2 * config.KRAKEN_TAKER_FEE + 2 * _SLIP_EST + config.MARGIN_OPEN_FEE_ALT
-        self.assertAlmostEqual(min_cost * 100, 1.22, places=1)
-        self.assertAlmostEqual(min_cost * 1.3 * 100, 1.586, places=2)
+        # maker 0.25 + taker 0.40 + slip_exit 0.20 + funding 0.04 = 0.89%, ×1.3 = 1.157%
+        min_cost = config.ROUND_TRIP_COST_PCT + config.FUNDING_EST_PCT
+        self.assertAlmostEqual(min_cost * 100, 0.89, places=2)
+        self.assertAlmostEqual(min_cost * 1.3 * 100, 1.157, places=2)
 
     def test_blocked_at_boundary_atr(self):
-        # ATR exactly at boundary where TP% ≈ 1.59%: atr = 0.07 × 0.01586 / 2.5 = 0.000444
-        # Slightly below: 0.000440 → blocked
-        a = _make_short_analysis(price=0.07, atr=0.000440)
-        self.assertIsNone(generate_short_signal(a, 100.0))
+        price = 0.07
+        atr = self._atr_for_tp_pct(price, self._threshold_pct() * 0.95)  # just below → blocked
+        self.assertIsNone(generate_short_signal(_make_short_analysis(price=price, atr=atr), 100.0))
 
     def test_passes_at_boundary_atr(self):
-        # Slightly above boundary: 0.000460 → passes profit gate
-        a = _make_short_analysis(price=0.07, atr=0.000460)
-        sig = generate_short_signal(a, 100.0)
-        # Should not be blocked by profit gate; other gates may block, but not profit gate
-        # Check it's not None (all other conditions in _make_short_analysis are valid)
-        self.assertIsNotNone(sig)
+        price = 0.07
+        atr = self._atr_for_tp_pct(price, self._threshold_pct() * 1.10)  # just above → passes
+        self.assertIsNotNone(generate_short_signal(_make_short_analysis(price=price, atr=atr), 100.0))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1642,6 +1850,7 @@ if __name__ == "__main__":
         TestLimitOrderLock, TestShutdownHandler, TestReconcileOrders,
         TestMinProfitGate, TestRSISlopeFilter,
         TestTrailingStopBreakEven, TestTrailingCostBuffer,
+        TestPerSideThresholds, TestLimitEntry, TestProtections,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
