@@ -176,7 +176,10 @@ def _calc_exit(pos: dict, exit_price: float, cfg, current_ts: float = None) -> d
     atr          = pos.get("atr", 0.0)
     entry        = pos.get("entry", 0.0)
     slip_pct     = _adaptive_slippage(atr, entry) if atr > 0 and entry > 0 else cfg.SLIPPAGE_PCT
-    slip_eur     = round(pos["size_eur"] * slip_pct * 2, 4)
+    # Post-only limit entries fill exactly at the limit price → no entry slippage;
+    # only the market exit slips (1 side). Market entries slip on both sides (2).
+    _slip_sides  = 1 if pos.get("order_type") == "limit" else 2
+    slip_eur     = round(pos["size_eur"] * slip_pct * _slip_sides, 4)
     funding_cost = _funding_cost_eur_pure(pos, current_ts)
     net_pnl_eur  = gross_pnl_eur - fee_entry - fee_exit - slip_eur - funding_cost
     size_eur     = pos["size_eur"]
@@ -189,6 +192,35 @@ def _calc_exit(pos: dict, exit_price: float, cfg, current_ts: float = None) -> d
         "net_pnl_eur":   round(net_pnl_eur, 4),
         "net_pnl_pct":   round(net_pnl_eur / size_eur * 100 if size_eur > 0 else 0.0, 4),
     }
+
+
+def _compute_drawdown(trades: list, budget: float, window_sec: float, now: float = None) -> tuple:
+    """Peak-to-trough drawdown of the equity curve over the trailing window (Mod 2).
+
+    Equity starts at `budget` and accrues each trade's pnl in close order. The
+    peak reference includes the equity level entering the window, so a drawdown
+    that began earlier and continued into the window is still captured.
+    Returns (drawdown_eur, peak_equity, trough_equity).
+    """
+    if now is None:
+        now = time.time()
+    cutoff = now - window_sec
+    ordered = sorted(trades, key=lambda t: t.get("closed_at", 0) or 0)
+    equity = budget
+    pre_window = budget          # equity just before the window opens
+    in_window: list[float] = []
+    for t in ordered:
+        equity += t.get("pnl_eur", 0) or 0.0
+        if (t.get("closed_at", 0) or 0) >= cutoff:
+            in_window.append(equity)
+        else:
+            pre_window = equity
+    if not in_window:
+        return 0.0, pre_window, pre_window
+    levels = [pre_window] + in_window
+    peak   = max(levels)
+    trough = min(levels)
+    return round(peak - trough, 4), round(peak, 4), round(trough, 4)
 
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
@@ -230,6 +262,7 @@ class TradingBot:
         add(CommandHandler("discover",  self._cmd_discover,  filters=auth_filter))
         add(CommandHandler("ai",        self._cmd_ai,        filters=auth_filter))
         add(CommandHandler("profile",   self._cmd_profile,   filters=auth_filter))
+        add(CommandHandler("protections", self._cmd_protections, filters=auth_filter))
 
     # ── Commands ──────────────────────────────────────────────────────────────
 
@@ -442,83 +475,94 @@ class TradingBot:
     async def _execute_signal(self, signal: Signal, groq_reason: str) -> None:
         is_short = signal.direction == "SELL"
         try:
-            use_limit   = config.LIMIT_ORDERS_ENABLED and not config.PAPER_TRADING and not is_short
-            fee_rate    = config.KRAKEN_MAKER_FEE if use_limit else config.KRAKEN_TAKER_FEE
-            extra_fee   = _margin_open_fee(signal.pair) if is_short else 0.0
-            fee_entry   = round(signal.size_eur * (fee_rate + extra_fee), 4)
-            # size_crypto is stored GROSS (the volume placed on Kraken). The fee
-            # is tracked separately in fee_entry_eur and subtracted in _calc_exit,
-            # so applying (1 - fee_rate) here would double-count it.
-            size_crypto_net = signal.size_crypto
+            use_limit = config.ENTRY_ORDER_TYPE == "limit_post_only"
+            fee_rate  = config.KRAKEN_MAKER_FEE if use_limit else config.KRAKEN_TAKER_FEE
+            extra_fee = _margin_open_fee(signal.pair) if is_short else 0.0
+            # size_crypto is stored GROSS (volume placed on Kraken); the fee is
+            # tracked separately in fee_entry_eur and subtracted in _calc_exit.
+            fee_entry = round(signal.size_eur * (fee_rate + extra_fee), 4)
 
-            if config.PAPER_TRADING:
-                if config.LIMIT_ORDERS_ENABLED and not is_short:
-                    limit_price = round(signal.price * (1 - config.LIMIT_OFFSET_PCT), 8)
-                    actual_price = limit_price
+            # ── Post-only limit entry (both sides, paper + live) ──────────────
+            # Rests at the best maker price (bid for a long buy, ask for a short
+            # sell) so it never crosses → maker fee. Fill / timeout-cancel /
+            # partial-fill / paper simulation all live in _job_check_pending_orders,
+            # so the two modes share one path and the signal is dropped (no chase)
+            # if it doesn't fill within ENTRY_FILL_TIMEOUT_SEC.
+            if use_limit:
+                if config.PAPER_TRADING:
+                    off = (1 + config.LIMIT_OFFSET_PCT) if is_short else (1 - config.LIMIT_OFFSET_PCT)
+                    limit_price = round(signal.price * off, 8)
+                    txid = "PAPER"
                 else:
-                    actual_price = signal.price
-                txid  = "PAPER"
-                descr = ""
-
-            elif is_short:
-                vol_str = kraken_client.format_volume(signal.pair, signal.size_crypto)
-                result  = await asyncio.to_thread(
-                    kraken_client.add_order,
-                    signal.pair, "sell", "market", vol_str,
-                    leverage=config.MARGIN_LEVERAGE,
-                )
-                txids = result.get("txid", [])
-                txid  = txids[0] if txids else "unknown"
-                actual_price = await self._resolve_fill_price(txid, signal)
-
-            elif use_limit:
-                limit_price = round(signal.price * (1 - config.LIMIT_OFFSET_PCT), 8)
-                vol_str     = kraken_client.format_volume(signal.pair, signal.size_crypto)
-                result      = await asyncio.to_thread(
-                    kraken_client.add_order,
-                    signal.pair, "buy", "limit", vol_str,
-                    price=str(limit_price),
-                )
-                txids = result.get("txid", [])
-                txid  = txids[0] if txids else "unknown"
-                descr = result.get("descr", {}).get("order", "")
-                actual_price = limit_price
+                    ticker = await asyncio.to_thread(kraken_client.get_ticker, signal.pair)
+                    limit_price = round(float(ticker["ask"]) if is_short else float(ticker["bid"]), 8)
+                    vol_str = kraken_client.format_volume(signal.pair, signal.size_crypto)
+                    kw = {"price": str(limit_price), "oflags": "post"}
+                    if is_short:
+                        kw["leverage"] = config.MARGIN_LEVERAGE
+                    result = await asyncio.to_thread(
+                        kraken_client.add_order,
+                        signal.pair, "sell" if is_short else "buy", "limit", vol_str, **kw,
+                    )
+                    txids = result.get("txid", [])
+                    txid  = txids[0] if txids else "unknown"
                 with self._positions_lock:
                     db.insert_pending_order(signal.pair, {
                         "txid": txid, "limit_price": limit_price,
                         "signal_id": signal.id, "size_eur": signal.size_eur,
                         "size_crypto": signal.size_crypto, "placed_at": time.time(),
-                        "timeout_at": time.time() + config.LIMIT_TIMEOUT_SEC,
+                        "timeout_at": time.time() + config.ENTRY_FILL_TIMEOUT_SEC,
                         "take_profit": signal.take_profit, "stop_loss": signal.stop_loss,
                         "trailing_stop": signal.trailing_stop,
+                        "side": "short" if is_short else "long",
+                        "atr": signal.atr, "fee_entry_eur": fee_entry,
+                        "entry_signal": signal.price,
                     })
+                mode  = "[PAPER] " if config.PAPER_TRADING else ""
+                label = "SHORT LIMIT" if is_short else "LIMIT"
                 await self.app.bot.send_message(
                     chat_id=config.TELEGRAM_CHAT_ID,
                     text=(
-                        f"LIMIT ORDER {signal.pair}  {signal.size_eur:.2f}€  "
-                        f"@{limit_price:.6f}  TX {txid}\n"
-                        f"Scade in {config.LIMIT_TIMEOUT_SEC//60} min se non eseguito"
+                        f"{mode}{label} {signal.pair}  {signal.size_eur:.2f}€  @{limit_price:.6f}  TX {txid}\n"
+                        f"Groq {groq_reason}\n"
+                        f"Scade in {config.ENTRY_FILL_TIMEOUT_SEC//60} min se non fillato (no chase)"
                     ),
+                )
+                logger.info(
+                    "Limit entry placed: %s %s TX=%s @%.6f fee=%.4f paper=%s",
+                    signal.pair, "SHORT" if is_short else "LONG", txid,
+                    limit_price, fee_entry, config.PAPER_TRADING,
                 )
                 return
 
-            else:
-                vol_str     = kraken_client.format_volume(signal.pair, signal.size_crypto)
-                result      = await asyncio.to_thread(
-                    kraken_client.add_order,
-                    signal.pair, "buy", "market", vol_str,
+            # ── Market entry fallback (ENTRY_ORDER_TYPE=market) ───────────────
+            if config.PAPER_TRADING:
+                actual_price = signal.price
+                txid = "PAPER"
+            elif is_short:
+                vol_str = kraken_client.format_volume(signal.pair, signal.size_crypto)
+                result  = await asyncio.to_thread(
+                    kraken_client.add_order, signal.pair, "sell", "market", vol_str,
+                    leverage=config.MARGIN_LEVERAGE,
                 )
                 txids = result.get("txid", [])
                 txid  = txids[0] if txids else "unknown"
-                descr = result.get("descr", {}).get("order", "")
+                actual_price = await self._resolve_fill_price(txid, signal)
+            else:
+                vol_str = kraken_client.format_volume(signal.pair, signal.size_crypto)
+                result  = await asyncio.to_thread(
+                    kraken_client.add_order, signal.pair, "buy", "market", vol_str,
+                )
+                txids = result.get("txid", [])
+                txid  = txids[0] if txids else "unknown"
                 actual_price = await self._resolve_fill_price(txid, signal)
 
             pos_dict = {
                 "pair":          signal.pair,
                 "side":          "short" if is_short else "long",
                 "entry":         actual_price,
-                "entry_signal":  signal.price,   # planned price — used for slippage analytics
-                "size_crypto":   size_crypto_net,
+                "entry_signal":  signal.price,
+                "size_crypto":   signal.size_crypto,
                 "size_eur":      signal.size_eur,
                 "fee_entry_eur": fee_entry,
                 "take_profit":   signal.take_profit,
@@ -527,7 +571,7 @@ class TradingBot:
                 "atr":           signal.atr,
                 "txid":          txid,
                 "opened_at":     time.time(),
-                "order_type":    "limit" if (use_limit and not is_short) else "market",
+                "order_type":    "market",
             }
             with self._positions_lock:
                 self.positions[signal.pair] = pos_dict
@@ -538,7 +582,7 @@ class TradingBot:
             await self.app.bot.send_message(
                 chat_id=config.TELEGRAM_CHAT_ID,
                 text=(
-                    f"{mode}{label} {signal.pair}  {signal.size_eur:.2f}€  @{signal.price:.6f}\n"
+                    f"{mode}{label} {signal.pair}  {signal.size_eur:.2f}€  @{actual_price:.6f}\n"
                     f"TP {signal.take_profit:.6f}  SL {signal.stop_loss:.6f}\n"
                     f"Groq {groq_reason}\n"
                     f"Score {signal.score}/6  ADX {signal.adx:.1f}  TX {txid}"
@@ -667,6 +711,62 @@ class TradingBot:
             if alerted:   # streak just broke — clear the latch
                 db.set_setting("cb_consecutive_alerted", "0")
 
+        # ── Protections (Mod 2) ───────────────────────────────────────────────
+        now_p = time.time()
+        db.clear_expired_protections(now_p)
+
+        # MaxDrawdownGuard (global): peak-to-trough over the window > MAX_DD_PCT×BUDGET.
+        if config.MAX_DD_PCT > 0:
+            dd, dd_peak, dd_trough = _compute_drawdown(
+                db.get_trades(), config.BUDGET_EUR, config.MAX_DD_WINDOW_H * 3600, now_p
+            )
+            dd_limit = config.MAX_DD_PCT * config.BUDGET_EUR
+            if dd >= dd_limit and not db.is_protected("global", now_p):
+                until = now_p + config.MAX_DD_BLOCK_H * 3600
+                db.add_protection(
+                    "global",
+                    f"max_drawdown {dd:.2f}€ (peak {dd_peak:.2f}€ → trough {dd_trough:.2f}€)",
+                    until,
+                )
+                logger.warning(
+                    "PROTECTION max_drawdown: DD=%.2f€ (peak=%.2f€ trough=%.2f€) >= %.2f€ "
+                    "→ blocco TUTTO per %.0fh",
+                    dd, dd_peak, dd_trough, dd_limit, config.MAX_DD_BLOCK_H,
+                )
+                await self.app.bot.send_message(
+                    chat_id=config.TELEGRAM_CHAT_ID,
+                    text=(
+                        f"PROTECTION — MAX DRAWDOWN {dd:.2f}€ in {config.MAX_DD_WINDOW_H:.0f}h "
+                        f"(peak {dd_peak:.2f}€ → trough {dd_trough:.2f}€, soglia {dd_limit:.2f}€).\n"
+                        f"Trading sospeso per {config.MAX_DD_BLOCK_H:.0f}h."
+                    ),
+                )
+
+        # StoplossGuard (per-side): N SL on a side within window → block that side.
+        for _side in ("long", "short"):
+            if (config.STOPLOSS_GUARD_N > 0
+                    and db.get_sl_count_side_24h(_side, config.STOPLOSS_GUARD_WINDOW_H) >= config.STOPLOSS_GUARD_N
+                    and not db.is_protected(_side, now_p)):
+                until = now_p + config.STOPLOSS_GUARD_BLOCK_H * 3600
+                reason = f"stoploss_guard {config.STOPLOSS_GUARD_N}+ SL/{config.STOPLOSS_GUARD_WINDOW_H:.0f}h"
+                db.add_protection(_side, reason, until)
+                logger.info("PROTECTION stoploss_guard %s → blocco %.0fh", _side, config.STOPLOSS_GUARD_BLOCK_H)
+                await self.app.bot.send_message(
+                    chat_id=config.TELEGRAM_CHAT_ID,
+                    text=(
+                        f"PROTECTION — STOPLOSS GUARD {_side.upper()}: {config.STOPLOSS_GUARD_N}+ SL "
+                        f"in {config.STOPLOSS_GUARD_WINDOW_H:.0f}h. Lato {_side} sospeso "
+                        f"per {config.STOPLOSS_GUARD_BLOCK_H:.0f}h."
+                    ),
+                )
+
+        if db.is_protected("global", now_p):
+            logger.info("SCAN BLOCKED (all pairs): protection global attiva")
+            return False
+        long_protected  = db.is_protected("long", now_p)
+        short_protected = db.is_protected("short", now_p)
+        cooldown_secs_pair = config.COOLDOWN_PER_PAIR_MIN * 60
+
         # ── Market context (Fear & Greed, funding rates) ──────────────────────
         mkt_ctx = await asyncio.to_thread(market_data.get_market_context)
         fg_val  = mkt_ctx.get("fear_greed_value")
@@ -725,11 +825,17 @@ class TradingBot:
         analysis_cache: dict = {}
         SKIP_THRESHOLD = 3  # non-discovery pairs scanned every 3-4 cycles
 
-        for pair in ([] if long_blocked_fg else scan_pairs):
+        for pair in ([] if (long_blocked_fg or long_protected) else scan_pairs):
             if pair in already_open:
                 continue
             if len(self.positions) >= config.MAX_OPEN_TRADES:
                 break
+
+            # CooldownPerPair (Mod 2): no new entry on a pair right after it closed.
+            _since = db.seconds_since_pair_close(pair)
+            if _since is not None and _since < cooldown_secs_pair:
+                logger.info("%s: SKIP — cooldown coppia (%.0f/%d min)", pair, _since / 60, config.COOLDOWN_PER_PAIR_MIN)
+                continue
 
             is_discovery = pair in discovery_candidates or pair in config.PAIRS
             is_open_position = pair in self.positions
@@ -861,8 +967,13 @@ class TradingBot:
         if sl_cooldown_pairs:
             logger.info("SL cooldown attivo per: %s (%.0fh)", ", ".join(sorted(sl_cooldown_pairs)), config.SL_COOLDOWN_HOURS)
 
-        for pair in ([] if short_blocked_fg else scan_pairs):
+        for pair in ([] if (short_blocked_fg or short_protected) else scan_pairs):
             if pair in already_open:
+                continue
+            # CooldownPerPair (Mod 2): no new entry on a pair right after it closed.
+            _since = db.seconds_since_pair_close(pair)
+            if _since is not None and _since < cooldown_secs_pair:
+                logger.info("%s: SHORT SKIP — cooldown coppia (%.0f/%d min)", pair, _since / 60, config.COOLDOWN_PER_PAIR_MIN)
                 continue
             if pair in sl_cooldown_pairs:
                 logger.info("%s: SKIP — SL cooldown attivo (%.0fh)", pair, config.SL_COOLDOWN_HOURS)
@@ -912,9 +1023,10 @@ class TradingBot:
                 continue
 
             rsi_slope_1h = signal.rsi_1h - signal.rsi_1h_prev
-            if signal.score < config.MIN_SIGNAL_SCORE and rsi_slope_1h > 0:
+            _min_score_short = getattr(config, "MIN_SIGNAL_SCORE_SHORT", config.MIN_SIGNAL_SCORE)
+            if signal.score < _min_score_short and rsi_slope_1h > 0:
                 logger.info("%s: SKIP Groq — score=%d (< %d) e RSI slope=%.2f positivo (segnale debole in recovery)",
-                            signal.pair, signal.score, config.MIN_SIGNAL_SCORE, rsi_slope_1h)
+                            signal.pair, signal.score, _min_score_short, rsi_slope_1h)
                 self._groq_rejected[signal.pair] = time.time()
                 continue
 
@@ -1170,15 +1282,80 @@ class TradingBot:
             text="\n".join(lines),
         )
 
+    def _pos_from_pending(self, pair: str, po: dict, filled_crypto: float,
+                          entry_price: float, now: float) -> dict:
+        """Build a position dict from a (possibly partial) pending-order fill.
+
+        size_eur is recomputed from the ACTUAL filled volume so a partial fill
+        carries proportioned sizing; TP/SL/trailing are price levels and stay put.
+        """
+        side     = po.get("side", "long")
+        size_eur = round(filled_crypto * entry_price, 2)
+        fee_rate = config.KRAKEN_MAKER_FEE + (_margin_open_fee(pair) if side == "short" else 0.0)
+        return {
+            "pair":          pair,
+            "side":          side,
+            "entry":         entry_price,
+            "entry_signal":  po.get("entry_signal", entry_price),
+            "size_crypto":   filled_crypto,
+            "size_eur":      size_eur,
+            "fee_entry_eur": round(size_eur * fee_rate, 4),
+            "take_profit":   po["take_profit"],
+            "stop_loss":     po["stop_loss"],
+            "trailing_stop": po["trailing_stop"],
+            "atr":           po.get("atr") or 0.0,
+            "txid":          po["txid"],
+            "opened_at":     now,
+            "order_type":    "limit",
+        }
+
     async def _job_check_pending_orders(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Check whether live limit orders have been filled or have timed out."""
-        if config.PAPER_TRADING:
-            return
+        """Fill / timeout-cancel / partial-fill for post-only limit entries.
+
+        Runs in BOTH paper and live. On timeout the order is cancelled and the
+        signal is DISCARDED (no chasing). Live partial fills open a proportioned
+        position with the executed volume.
+        """
         pending = db.get_pending_orders()
         if not pending:
             return
-        now     = time.time()
-        to_remove = []
+        now = time.time()
+        to_remove: list[str] = []
+
+        # ── PAPER: simulate a maker fill only when price CROSSES the level ─────
+        if config.PAPER_TRADING:
+            for pair, po in list(pending.items()):
+                side  = po.get("side", "long")
+                limit = po["limit_price"]
+                try:
+                    ticker = await asyncio.to_thread(kraken_client.get_ticker, pair)
+                    px = float(ticker["ask"]) if side == "short" else float(ticker["bid"])
+                except Exception as exc:
+                    logger.warning("Paper pending %s: prezzo non disponibile (%s) — riprovo", pair, exc)
+                    continue
+                # Conservative: fill only if it strictly crosses (not merely touches).
+                crossed = (px > limit) if side == "short" else (px < limit)
+                if crossed:
+                    pos = self._pos_from_pending(pair, po, po["size_crypto"], limit, now)
+                    with self._positions_lock:
+                        self.positions[pair] = pos
+                        db.insert_position(pair, pos)
+                    to_remove.append(pair)
+                    await self.app.bot.send_message(
+                        chat_id=config.TELEGRAM_CHAT_ID,
+                        text=f"[PAPER] LIMIT ESEGUITO {pair} {side.upper()}  @{limit:.6f}",
+                    )
+                elif now > po["timeout_at"]:
+                    to_remove.append(pair)
+                    await self.app.bot.send_message(
+                        chat_id=config.TELEGRAM_CHAT_ID,
+                        text=f"[PAPER] LIMIT SCADUTO {pair} {side.upper()}  @{limit:.6f} — segnale scartato",
+                    )
+            for pair in to_remove:
+                db.delete_pending_order(pair)
+            return
+
+        # ── LIVE ──────────────────────────────────────────────────────────────
         try:
             open_orders = await asyncio.to_thread(kraken_client.get_open_orders)
             open_txids  = set(open_orders.get("open", {}).keys())
@@ -1187,62 +1364,89 @@ class TradingBot:
             return
         for pair, po in list(pending.items()):
             txid = po["txid"]
+            side = po.get("side", "long")
             if txid not in open_txids:
-                # Order left the open book: it either filled, or was canceled/expired.
-                # Never assume a fill — a transient query failure must not book a
-                # phantom position that isn't actually held on Kraken.
+                # Left the open book: filled or canceled/expired. Never assume a fill.
                 try:
-                    info = await asyncio.to_thread(kraken_client.query_orders, [txid])
-                    order_status = info.get(txid, {}).get("status", "unknown")
+                    info     = await asyncio.to_thread(kraken_client.query_orders, [txid])
+                    od       = info.get(txid, {})
+                    status   = od.get("status", "unknown")
+                    vol_exec = float(od.get("vol_exec", 0) or 0)
                 except Exception as exc:
                     logger.warning("Cannot query order %s: %s — lascio pending, riprovo", txid, exc)
                     continue
-                if order_status in ("canceled", "expired"):
-                    logger.warning("Limit order %s was %s — no position created", txid, order_status)
+                if status in ("canceled", "expired"):
+                    if vol_exec > 0:   # partial fill before cancel — keep it
+                        pos = self._pos_from_pending(pair, po, vol_exec, po["limit_price"], now)
+                        with self._positions_lock:
+                            self.positions[pair] = pos
+                            db.insert_position(pair, pos)
+                        await self.app.bot.send_message(
+                            chat_id=config.TELEGRAM_CHAT_ID,
+                            text=f"LIMIT {status.upper()} PARZIALE {pair} {side.upper()}  {vol_exec:.6f} @{po['limit_price']:.6f}",
+                        )
+                    else:
+                        await self.app.bot.send_message(
+                            chat_id=config.TELEGRAM_CHAT_ID,
+                            text=f"LIMIT {status.upper()} {pair}  TX {txid} — nessuna posizione aperta",
+                        )
                     to_remove.append(pair)
-                    await self.app.bot.send_message(
-                        chat_id=config.TELEGRAM_CHAT_ID,
-                        text=f"LIMIT {order_status.upper()} {pair}  TX {txid} — nessuna posizione aperta",
-                    )
                     continue
-                if order_status != "closed":
-                    # Not yet a confirmed fill (e.g. 'open'/'pending' on the next page,
-                    # or 'unknown') — leave it pending and re-check on the next cycle.
-                    logger.info("Limit order %s status=%s — non confermato, riprovo", txid, order_status)
+                if status != "closed":
+                    logger.info("Limit order %s status=%s — non confermato, riprovo", txid, status)
                     continue
-                pos_dict = {
-                    "entry":         po["limit_price"],
-                    "size_crypto":   po["size_crypto"],
-                    "size_eur":      po["size_eur"],
-                    "fee_entry_eur": round(po["size_eur"] * config.KRAKEN_MAKER_FEE, 4),
-                    "take_profit":   po["take_profit"],
-                    "stop_loss":     po["stop_loss"],
-                    "trailing_stop": po["trailing_stop"],
-                    "txid":          txid,
-                    "opened_at":     now,
-                    "order_type":    "limit",
-                    "side":          "long",
-                }
+                filled = vol_exec if vol_exec > 0 else po["size_crypto"]
+                pos = self._pos_from_pending(pair, po, filled, po["limit_price"], now)
                 with self._positions_lock:
-                    self.positions[pair] = pos_dict
-                    db.insert_position(pair, pos_dict)
+                    self.positions[pair] = pos
+                    db.insert_position(pair, pos)
                 to_remove.append(pair)
                 await self.app.bot.send_message(
                     chat_id=config.TELEGRAM_CHAT_ID,
-                    text=f"LIMIT ESEGUITO {pair}  @{po['limit_price']:.6f}  TX {txid}",
+                    text=f"LIMIT ESEGUITO {pair} {side.upper()}  @{po['limit_price']:.6f}  TX {txid}",
                 )
             elif now > po["timeout_at"]:
+                # Still resting at timeout → cancel; keep any partial fill.
                 try:
                     await asyncio.to_thread(kraken_client.cancel_order, txid)
                 except Exception:
                     pass
+                vol_exec = 0.0
+                try:
+                    info = await asyncio.to_thread(kraken_client.query_orders, [txid])
+                    vol_exec = float(info.get(txid, {}).get("vol_exec", 0) or 0)
+                except Exception:
+                    pass
+                if vol_exec > 0:
+                    pos = self._pos_from_pending(pair, po, vol_exec, po["limit_price"], now)
+                    with self._positions_lock:
+                        self.positions[pair] = pos
+                        db.insert_position(pair, pos)
+                    await self.app.bot.send_message(
+                        chat_id=config.TELEGRAM_CHAT_ID,
+                        text=f"LIMIT SCADUTO PARZIALE {pair} {side.upper()}  {vol_exec:.6f} @{po['limit_price']:.6f}, residuo cancellato",
+                    )
+                else:
+                    await self.app.bot.send_message(
+                        chat_id=config.TELEGRAM_CHAT_ID,
+                        text=f"LIMIT SCADUTO {pair} {side.upper()}  TX {txid} — cancellato, segnale scartato",
+                    )
                 to_remove.append(pair)
-                await self.app.bot.send_message(
-                    chat_id=config.TELEGRAM_CHAT_ID,
-                    text=f"LIMIT SCADUTO {pair}  TX {txid} — cancellato",
-                )
         for pair in to_remove:
             db.delete_pending_order(pair)
+
+    async def _cmd_protections(self, update, ctx) -> None:
+        """Show active protections (Mod 2) with their scope, reason and expiry."""
+        now = time.time()
+        prot = db.get_active_protections(now)
+        if not prot:
+            await update.message.reply_text("Nessuna protezione attiva.")
+            return
+        lines = ["Protezioni attive:"]
+        for p in prot:
+            mins = max(0, int((p["until_ts"] - now) / 60))
+            lines.append(f"• [{p['scope'].upper()}] {p['reason']} — scade tra {mins} min")
+        await update.message.reply_text("\n".join(lines))
 
     async def _cmd_ai(self, update, ctx) -> None:
         """Show the last N Groq AI decisions."""

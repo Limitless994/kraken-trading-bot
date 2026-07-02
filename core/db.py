@@ -124,7 +124,11 @@ def init_db() -> None:
                 timeout_at REAL,
                 take_profit REAL,
                 stop_loss REAL,
-                trailing_stop REAL
+                trailing_stop REAL,
+                side TEXT,
+                atr REAL,
+                fee_entry_eur REAL,
+                entry_signal REAL
             );
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,12 +138,25 @@ def init_db() -> None:
                 message TEXT,
                 UNIQUE(ts, module, message)
             );
+            CREATE TABLE IF NOT EXISTS protections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,     -- 'global' | 'long' | 'short'
+                reason TEXT,
+                until_ts REAL NOT NULL,
+                created_ts REAL NOT NULL
+            );
         """)
         # Forward-compat ALTERs for DBs created before these columns existed.
         # Silently skipped when the columns are already in place.
         for sql in (
             "ALTER TABLE trades ADD COLUMN entry_signal REAL",
             "ALTER TABLE trades ADD COLUMN slip_entry_pct REAL",
+            # Mod 1: pending limit orders now carry side + the fields needed to
+            # open a position on fill (both sides, paper + live, partial fills).
+            "ALTER TABLE pending_orders ADD COLUMN side TEXT",
+            "ALTER TABLE pending_orders ADD COLUMN atr REAL",
+            "ALTER TABLE pending_orders ADD COLUMN fee_entry_eur REAL",
+            "ALTER TABLE pending_orders ADD COLUMN entry_signal REAL",
         ):
             try:
                 conn.execute(sql)
@@ -233,8 +250,9 @@ def insert_pending_order(pair: str, po: dict) -> None:
                 """
                 INSERT OR REPLACE INTO pending_orders
                 (pair, txid, limit_price, signal_id, size_eur, size_crypto,
-                 placed_at, timeout_at, take_profit, stop_loss, trailing_stop)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 placed_at, timeout_at, take_profit, stop_loss, trailing_stop,
+                 side, atr, fee_entry_eur, entry_signal)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     pair,
@@ -248,6 +266,10 @@ def insert_pending_order(pair: str, po: dict) -> None:
                     po.get("take_profit"),
                     po.get("stop_loss"),
                     po.get("trailing_stop"),
+                    po.get("side", "long"),
+                    po.get("atr"),
+                    po.get("fee_entry_eur"),
+                    po.get("entry_signal"),
                 ),
             )
 
@@ -403,6 +425,97 @@ def seconds_since_last_trade():
     try:
         with get_conn() as conn:
             row = conn.execute("SELECT MAX(closed_at) AS last FROM trades").fetchone()
+    except Exception:
+        return None
+    if not row or row["last"] is None:
+        return None
+    return max(0.0, time.time() - float(row["last"]))
+
+
+# ── Protections (Mod 2) ───────────────────────────────────────────────────────
+
+def add_protection(scope: str, reason: str, until_ts: float) -> None:
+    """Activate a protection for `scope` ('global'|'long'|'short') until until_ts."""
+    with _write_lock:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO protections (scope, reason, until_ts, created_ts) VALUES (?,?,?,?)",
+                (scope, reason, until_ts, time.time()),
+            )
+
+
+def get_active_protections(now: float = None) -> list:
+    """Return active (not-yet-expired) protections, most-recently-expiring first."""
+    if now is None:
+        now = time.time()
+    if not DB_PATH.exists():
+        return []
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT scope, reason, until_ts, created_ts FROM protections "
+                "WHERE until_ts > ? ORDER BY until_ts DESC",
+                (now,),
+            ).fetchall()
+    except Exception:
+        return []
+    return [dict(r) for r in rows]
+
+
+def is_protected(scope: str, now: float = None) -> bool:
+    """True if `scope` currently has an active protection."""
+    if now is None:
+        now = time.time()
+    if not DB_PATH.exists():
+        return False
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM protections WHERE scope=? AND until_ts > ? LIMIT 1",
+                (scope, now),
+            ).fetchone()
+    except Exception:
+        return False
+    return row is not None
+
+
+def clear_expired_protections(now: float = None) -> None:
+    if now is None:
+        now = time.time()
+    try:
+        with _write_lock:
+            with get_conn() as conn:
+                conn.execute("DELETE FROM protections WHERE until_ts <= ?", (now,))
+    except Exception:
+        pass
+
+
+def get_sl_count_side_24h(side: str, hours: float = 24) -> int:
+    """Stop-loss exits for a given side within the last `hours` (per-side guard)."""
+    if not DB_PATH.exists():
+        return 0
+    cutoff = time.time() - hours * 3600
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM trades "
+                "WHERE side=? AND LOWER(exit_reason)='sl' AND closed_at >= ?",
+                (side, cutoff),
+            ).fetchone()
+    except Exception:
+        return 0
+    return row[0] if row else 0
+
+
+def seconds_since_pair_close(pair: str):
+    """Seconds since the most recent trade on `pair` closed, or None if none."""
+    if not DB_PATH.exists():
+        return None
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(closed_at) AS last FROM trades WHERE pair=?", (pair,)
+            ).fetchone()
     except Exception:
         return None
     if not row or row["last"] is None:

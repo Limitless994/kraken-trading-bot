@@ -141,8 +141,19 @@ def _collect_live_data() -> dict:
     daily_loss = sum(t["pnl_eur"] for t in trades_log if t.get("closed_at", 0) > today_ts and t["pnl_eur"] < 0)
     cb_active  = config.CIRCUIT_BREAKER_ENABLED and abs(daily_loss) >= config.CIRCUIT_BREAKER_LOSS_EUR
 
+    _now = time.time()
+    protections = [
+        {
+            "scope":       p["scope"],
+            "reason":      p["reason"],
+            "expires_min": max(0, int((p["until_ts"] - _now) / 60)),
+        }
+        for p in db.get_active_protections(_now)
+    ]
+
     return {
         "positions": enriched,
+        "protections": protections,
         "metrics": {
             "open_count":    len(enriched),
             "max_trades":    config.MAX_OPEN_TRADES,
@@ -443,6 +454,7 @@ TEMPLATE = """<!DOCTYPE html>
     {% if btc_rsi_init %}<span id="hdr-btc-rsi" class="badge {% if btc_rsi_init < 65 %}bg-secondary{% else %}badge-warn{% endif %} d-none d-sm-inline">BTC RSI: {{ "%.1f"|format(btc_rsi_init) }}</span>{% endif %}
     {% if fear_greed %}<span class="badge {% if fear_greed.value <= 20 or fear_greed.value >= 80 %}badge-warn{% elif fear_greed.value <= 40 %}bg-secondary{% else %}badge-online{% endif %} d-none d-sm-inline">F&G: {{ fear_greed.value }} {{ fear_greed.label }}</span>{% endif %}
     {% if init_data.circuit_breaker %}<span class="badge badge-error">CIRCUIT BREAKER</span>{% endif %}
+    {% for p in init_data.protections %}<span class="badge badge-error" title="{{ p.reason }}">PROT {{ p.scope|upper }} ({{ p.expires_min }}m)</span>{% endfor %}
     <span class="ms-auto d-flex align-items-center gap-2" style="font-size:.75rem;color:#aaa;">
       <span class="sse-dot" id="sse-dot"></span>
       <span id="last-update">--:--:--</span>

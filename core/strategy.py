@@ -98,9 +98,10 @@ def generate_signal(
         logger.info("%s: SKIP gate=daily_EMA50", analysis.pair)
         return None   # price below daily EMA50 = structural downtrend
 
-    # ── Gate 1: ADX — trend strength ─────────────────────────────────────────
-    if analysis.adx < config.ADX_MIN:
-        logger.info("%s: SKIP gate=ADX_basso (ADX=%.1f < %d)", analysis.pair, analysis.adx, config.ADX_MIN)
+    # ── Gate 1: ADX — trend strength (per-side threshold, Mod 3) ─────────────
+    _adx_min_long = getattr(config, "ADX_MIN_LONG", config.ADX_MIN)
+    if analysis.adx < _adx_min_long:
+        logger.info("%s: SKIP gate=ADX_basso (ADX=%.1f < %d)", analysis.pair, analysis.adx, _adx_min_long)
         return None   # ranging market
 
     # ── Gate 2: BTC market filter ─────────────────────────────────────────────
@@ -177,8 +178,9 @@ def generate_signal(
         score += 1
         reasons.append(f"ADX forte: {analysis.adx:.1f} (>30)")
 
-    # ── Score gate ────────────────────────────────────────────────────────────
-    if score < config.MIN_SIGNAL_SCORE:
+    # ── Score gate (per-side threshold, Mod 3) ──────────────────────────────────
+    _min_score_long = getattr(config, "MIN_SIGNAL_SCORE_LONG", config.MIN_SIGNAL_SCORE)
+    if score < _min_score_long:
         _ob_val = f"{analysis.ob_imbalance:.2f}" if analysis.ob_imbalance is not None else "N/A"
         logger.info(
             "%s: score=%d/6 [RSI=%d MACD=%d vol=%d(%.1f×) EMA50=%d OB=%d(%s) ADX30=%d(%.1f)] "
@@ -186,7 +188,7 @@ def generate_signal(
             analysis.pair, score,
             _rsi_ok, _macd_ok, _vol_ok, analysis.volume_ratio,
             _ema_ok, _ob_ok, _ob_val, _adx30_ok, analysis.adx,
-            config.MIN_SIGNAL_SCORE,
+            _min_score_long,
         )
         return None
 
@@ -207,12 +209,11 @@ def generate_signal(
         stop_loss   = round(analysis.price * (1 - config.STOP_LOSS_PCT),   8)
 
     # Gate: minimum profit check — TP gross must exceed round-trip costs with 30% margin.
-    # Spot long round-trip: 2× taker fee + 2× slippage estimate (no margin fee on spot).
-    # Mirrors the identical gate already present in generate_short_signal: without it
-    # the bot opens longs whose TP is too tight to cover fees+slippage — gross-positive
-    # trades that close net-negative (death by fees).
-    _SLIP_EST = 0.002
-    _min_cost_pct = 2 * config.KRAKEN_TAKER_FEE + 2 * _SLIP_EST
+    # Post-only entry (Mod 1) fills at the limit price → NO entry slippage, so the
+    # round-trip is: maker entry + taker exit + one-sided exit slippage
+    # (config.ROUND_TRIP_COST_PCT). Without it the bot opens longs whose TP is too
+    # tight to cover costs — gross-positive trades that close net-negative.
+    _min_cost_pct = config.ROUND_TRIP_COST_PCT
     _tp_gross_pct = (take_profit - analysis.price) / analysis.price
     if _tp_gross_pct < _min_cost_pct * 1.3:
         logger.info(
@@ -263,9 +264,10 @@ def generate_short_signal(
         logger.info("%s: SHORT SKIP gate=daily_EMA50_sopra", analysis.pair)
         return None
 
-    # Gate 1: ADX — strong trend in any direction
-    if analysis.adx < config.ADX_MIN:
-        logger.info("%s: SHORT SKIP gate=ADX_basso (%.1f < %d)", analysis.pair, analysis.adx, config.ADX_MIN)
+    # Gate 1: ADX — strong trend in any direction (per-side threshold, Mod 3)
+    _adx_min_short = getattr(config, "ADX_MIN_SHORT", config.ADX_MIN)
+    if analysis.adx < _adx_min_short:
+        logger.info("%s: SHORT SKIP gate=ADX_basso (%.1f < %d)", analysis.pair, analysis.adx, _adx_min_short)
         return None
 
     # Gate 2: Inverted BTC filter — BTC must be in downtrend to short alts
@@ -342,8 +344,9 @@ def generate_short_signal(
         score += 1
         reasons.append(f"ADX forte: {analysis.adx:.1f} (>30)")
 
-    if score < config.MIN_SIGNAL_SCORE:
-        logger.info("%s: SHORT score=%d/6 → SKIP (min=%d)", analysis.pair, score, config.MIN_SIGNAL_SCORE)
+    _min_score_short = getattr(config, "MIN_SIGNAL_SCORE_SHORT", config.MIN_SIGNAL_SCORE)
+    if score < _min_score_short:
+        logger.info("%s: SHORT score=%d/6 → SKIP (min=%d)", analysis.pair, score, _min_score_short)
         return None
 
     size_eur = max(round(available_eur * config.AI_SIZE_MED, 2), 10.0)  # cap short initial size below long
@@ -363,10 +366,10 @@ def generate_short_signal(
     take_profit = max(take_profit, analysis.price * 0.01)
 
     # Gate: minimum profit check — TP gross must exceed round-trip costs with 30% margin.
-    # Round-trip costs: 2× taker fee (0.4% each) + 2× slippage cap (0.2% each) + margin open fee (0.02%)
-    # = 1.22% minimum; with 30% safety margin → 1.59% minimum TP distance.
-    _SLIP_EST = 0.002
-    _min_cost_pct = 2 * config.KRAKEN_TAKER_FEE + 2 * _SLIP_EST + config.MARGIN_OPEN_FEE_ALT
+    # Post-only entry (Mod 1) → no entry slippage: maker entry + taker exit +
+    # one-sided exit slippage (config.ROUND_TRIP_COST_PCT), plus estimated funding
+    # for the short side (config.FUNDING_EST_PCT).
+    _min_cost_pct = config.ROUND_TRIP_COST_PCT + config.FUNDING_EST_PCT
     _tp_gross_pct = (analysis.price - take_profit) / analysis.price
     if _tp_gross_pct < _min_cost_pct * 1.3:
         logger.info(
