@@ -361,7 +361,7 @@ def generate_short_signal(
         stop_loss   = round(analysis.price + config.ATR_SL_MULT_SHORT * atr, 8)
     else:
         take_profit = round(analysis.price * (1 - config.TAKE_PROFIT_PCT), 8)
-        stop_loss   = round(analysis.price * (1 + config.STOP_LOSS_PCT),   8)
+        stop_loss   = round(analysis.price * (1 + config.STOP_LOSS_PCT_SHORT), 8)
 
     take_profit = max(take_profit, analysis.price * 0.01)
 
