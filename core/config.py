@@ -24,13 +24,14 @@ MAX_CAPITAL_DEPLOYED = float(os.getenv("MAX_CAPITAL_DEPLOYED", "0.80"))
 
 # ── Risk parameters ───────────────────────────────────────────────────────────
 TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT", "0.10"))
-STOP_LOSS_PCT    = float(os.getenv("STOP_LOSS_PCT",   "0.04"))
+STOP_LOSS_PCT      = float(os.getenv("STOP_LOSS_PCT",   "0.04"))
+STOP_LOSS_PCT_SHORT = float(os.getenv("STOP_LOSS_PCT_SHORT", str(STOP_LOSS_PCT)))  # Per-side override (default = base)
 SLIPPAGE_PCT     = float(os.getenv("SLIPPAGE_PCT",    "0.001"))
 
 # Exchange fees — set by Kraken, not user-configurable
 KRAKEN_TAKER_FEE         = 0.004
 KRAKEN_MAKER_FEE         = 0.0025
-MARGIN_LEVERAGE          = int(os.getenv("MARGIN_LEVERAGE", "2"))
+MARGIN_LEVERAGE          = int(os.getenv("MARGIN_LEVERAGE", "5"))  # Increased from 2 to 5× (Opzione A)
 # Opening and rollover fees vary by pair: BTC/ETH = 0.01%, altcoins = 0.02%
 MARGIN_OPEN_FEE_BTC      = 0.0001
 MARGIN_OPEN_FEE_ALT      = 0.0002
@@ -211,6 +212,7 @@ PROFILE_CONSERVATIVE: dict = {
     "ATR_SL_MULT":            1.0,
     "TAKE_PROFIT_PCT":        0.10,
     "STOP_LOSS_PCT":          0.04,
+    "STOP_LOSS_PCT_SHORT":    0.02,   # Leva 5×: SL stretto per margin safety
     "AI_SIZE_HIGH":           0.25,
     "AI_SIZE_MED":            0.18,
     "AI_SIZE_MIN":            0.12,
@@ -273,6 +275,7 @@ PROFILE_MODERATE: dict = {
     "ATR_SL_MULT":            1.2,
     "TAKE_PROFIT_PCT":        0.14,
     "STOP_LOSS_PCT":          0.05,
+    "STOP_LOSS_PCT_SHORT":    0.02,   # Leva 5×: SL stretto per non liquidare (2% vs 5% long)
     "AI_SIZE_HIGH":           0.35,
     "AI_SIZE_MED":            0.26,
     "AI_SIZE_MIN":            0.17,
@@ -329,6 +332,7 @@ PROFILE_AGGRESSIVE: dict = {
     "ATR_SL_MULT_SHORT":      1.6,
     "TAKE_PROFIT_PCT":        0.18,
     "STOP_LOSS_PCT":          0.07,
+    "STOP_LOSS_PCT_SHORT":    0.02,   # Leva 5×: SL stretto per margin safety
     # ── Position sizing — larger per-trade allocation ─────────────────────────
     "AI_SIZE_HIGH":           0.45, # conservative=0.25: 45% of capital per trade
     "AI_SIZE_MED":            0.35,
