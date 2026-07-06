@@ -914,6 +914,7 @@ class TradingBot:
             db.insert_groq_decision({
                 "ts":           time.time(),
                 "pair":         signal.pair,
+                "direction":    "BUY",
                 "decision":     "ESEGUI" if execute else "RIFIUTA",
                 "confidence":   confidence,
                 "size_pct":     round(size_pct * 100, 0),
@@ -1823,6 +1824,7 @@ class TradingBot:
             db.insert_groq_decision({
                 "ts":           time.time(),
                 "pair":         signal.pair,
+                "direction":    "BUY",
                 "decision":     "ESEGUI" if execute else "RIFIUTA",
                 "confidence":   confidence,
                 "size_pct":     round(size_pct * 100, 0),
