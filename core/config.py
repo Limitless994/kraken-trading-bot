@@ -61,6 +61,15 @@ ENTRY_FILL_TIMEOUT_SEC = int(os.getenv("ENTRY_FILL_TIMEOUT_SEC", "180"))
 # comes to us, but stops missing every rally (observed: 13/13 timeouts in uptrend).
 ENTRY_FALLBACK_MARKET        = os.getenv("ENTRY_FALLBACK_MARKET", "true").lower() == "true"
 ENTRY_FALLBACK_MAX_DRIFT_PCT = float(os.getenv("ENTRY_FALLBACK_MAX_DRIFT_PCT", "0.005"))
+
+# ── Regime detection (Mod 4) ──────────────────────────────────────────────────
+# The scan classifies BTC's daily regime (core/regime.py) and raises the entry
+# score thresholds in adverse regimes via these transient bumps. The bumps are
+# written by the bot at scan time — 0 here means "no adjustment" (also the
+# value backtests and previews see unless they set it themselves).
+REGIME_ENABLED          = os.getenv("REGIME_ENABLED", "true").lower() == "true"
+REGIME_SCORE_BUMP_LONG  = 0
+REGIME_SCORE_BUMP_SHORT = 0
 # Round-trip cost for the min-profit gate. With a post-only entry there is NO
 # entry slippage (fill at the limit price or not at all), so: maker entry +
 # taker exit + one-sided exit slippage. Shorts add estimated funding separately.

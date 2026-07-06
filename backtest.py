@@ -929,6 +929,92 @@ def preview_profile(profile_name: str, days: int = 30, budget: float = 100.0) ->
     return metrics
 
 
+def run_walk_forward(
+    n_windows:    int,
+    pairs:        list[str],
+    candles_map:  dict,
+    analyses_map: dict,
+    times_1h_map: dict,
+    fg_history:   dict,
+    start_ts:     int,
+    end_ts:       int,
+    budget:       float,
+    profiles:     list[str],
+) -> dict:
+    """Walk-forward consistency check: split [start, end) into N equal windows
+    and run each profile independently per window (fresh budget each time).
+
+    A profile that only wins in one window is overfit to that regime; a robust
+    one is positive in most windows. Prints a per-window table and a summary
+    (positive windows, mean ± std of net P&L). Returns {profile: [window dicts]}.
+    """
+    span   = (end_ts - start_ts) // n_windows
+    bounds = [(start_ts + i * span,
+               start_ts + (i + 1) * span if i < n_windows - 1 else end_ts)
+              for i in range(n_windows)]
+
+    print(f"\n{'='*72}\nWALK-FORWARD: {n_windows} finestre "
+          f"({date.fromtimestamp(start_ts)} → {date.fromtimestamp(end_ts)})\n{'='*72}")
+
+    all_results: dict[str, list] = {}
+    for prof in profiles:
+        if prof not in cfg.PROFILES:
+            print(f"  Unknown profile '{prof}', skipping.")
+            continue
+        windows: list[dict] = []
+        for w_start, w_end in bounds:
+            try:
+                result = run_backtest(
+                    pairs=pairs, candles_map=candles_map, analyses_map=analyses_map,
+                    times_1h_map=times_1h_map, fg_history=fg_history,
+                    start_ts=w_start, end_ts=w_end, budget=budget, profile_name=prof,
+                )
+                trades = result["trades"]
+                net    = sum(t["net_pnl_eur"] for t in trades)
+                windows.append({
+                    "start": date.fromtimestamp(w_start), "end": date.fromtimestamp(w_end),
+                    "n": len(trades), "net": net,
+                })
+            except ValueError as exc:   # window too short for warm-up
+                windows.append({
+                    "start": date.fromtimestamp(w_start), "end": date.fromtimestamp(w_end),
+                    "n": 0, "net": 0.0, "error": str(exc),
+                })
+        all_results[prof] = windows
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    for prof, windows in all_results.items():
+        print(f"\n  {prof.upper()}")
+        print(f"  {'finestra':<26} {'trade':>6} {'net P&L':>10}")
+        nets = []
+        for w in windows:
+            if w.get("error"):
+                print(f"  {w['start']} → {w['end']}   (troppo corta: {w['error']})")
+                continue
+            print(f"  {str(w['start'])} → {str(w['end'])}  {w['n']:>6d} {w['net']:>+9.2f}€")
+            nets.append(w["net"])
+        if nets:
+            pos   = sum(1 for x in nets if x > 0)
+            mean  = sum(nets) / len(nets)
+            var   = sum((x - mean) ** 2 for x in nets) / len(nets)
+            std   = var ** 0.5
+            total = sum(nets)
+            print(f"  {'-'*46}")
+            print(f"  Finestre positive: {pos}/{len(nets)}   "
+                  f"media {mean:+.2f}€ ± {std:.2f}   totale {total:+.2f}€")
+            if pos == len(nets):
+                verdict = "ROBUSTO — positivo in ogni finestra"
+            elif pos >= len(nets) * 0.6:
+                verdict = "ACCETTABILE — positivo nella maggioranza delle finestre"
+            elif pos > 0:
+                verdict = "FRAGILE — profitto concentrato in poche finestre (regime-dipendente)"
+            else:
+                verdict = "NEGATIVO — nessuna finestra profittevole"
+            print(f"  Verdetto: {verdict}")
+    print()
+    return all_results
+
+
 def main():
     p = argparse.ArgumentParser(description="Kraken bot backtest")
     p.add_argument("--pairs",       nargs="+", default=None)
@@ -939,6 +1025,9 @@ def main():
     p.add_argument("--no-download", action="store_true")
     p.add_argument("--profiles",    nargs="+",
                    default=["conservative", "moderate", "aggressive"])
+    p.add_argument("--walk-forward", type=int, default=0, metavar="N",
+                   help="split the period into N windows and report per-window results "
+                        "(consistency check against overfitting)")
     args = p.parse_args()
 
     global CACHE_DIR
@@ -994,6 +1083,16 @@ def main():
         analyses_map[pair] = precompute_analyses(pair, candles_map)
         n_computed = sum(1 for a in analyses_map[pair] if a is not None)
         print(f"  {pair}: {n_computed} analyses")
+
+    # ── Walk-forward mode: N independent windows, judge consistency ──────────
+    if args.walk_forward and args.walk_forward > 1:
+        run_walk_forward(
+            n_windows=args.walk_forward, pairs=pairs, candles_map=candles_map,
+            analyses_map=analyses_map, times_1h_map=times_1h_map,
+            fg_history=fg_history, start_ts=start_ts, end_ts=end_ts,
+            budget=args.budget, profiles=args.profiles,
+        )
+        return
 
     # ── Run simulation per profile ────────────────────────────────────────────
     results: list[dict] = []

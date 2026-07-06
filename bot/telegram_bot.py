@@ -36,8 +36,9 @@ from telegram.ext import (
     filters,
 )
 
-from core import config, db, kraken_client, market_data
-from core.analyzer import analyze
+from core import config, db, kraken_client, market_data, regime
+from core.analyzer import analyze, _get_ohlc as _get_ohlc_cached
+from core import strategy as strategy_module
 from core.strategy import Signal, generate_signal, generate_short_signal, kelly_size_pct
 from services import discovery, groq_evaluator
 from services.groq_evaluator import GroqUnavailableError
@@ -244,6 +245,8 @@ class TradingBot:
         self._scan_skip_counter: dict[str, int] = {}  # tracks scan skips for non-discovery pairs
         self._in_flight: set = set()  # per-scan idempotency guard
         self._groq_rejected: dict = {}  # (side, pair) → timestamp of last Groq RIFIUTA
+        # Funnel analytics (live only): every strategy gate outcome goes to gate_events.
+        strategy_module.set_gate_hook(db.insert_gate_event)
         self._register_handlers()
 
     # ── Handler registration ──────────────────────────────────────────────────
@@ -272,6 +275,7 @@ class TradingBot:
         add(CommandHandler("ai",        self._cmd_ai,        filters=auth_filter))
         add(CommandHandler("profile",   self._cmd_profile,   filters=auth_filter))
         add(CommandHandler("protections", self._cmd_protections, filters=auth_filter))
+        add(CommandHandler("gates",     self._cmd_gates,     filters=auth_filter))
 
     # ── Commands ──────────────────────────────────────────────────────────────
 
@@ -723,6 +727,7 @@ class TradingBot:
         # ── Protections (Mod 2) ───────────────────────────────────────────────
         now_p = time.time()
         db.clear_expired_protections(now_p)
+        db.purge_gate_events()   # keep the funnel table bounded (30 days)
 
         # MaxDrawdownGuard (global): peak-to-trough over the window > MAX_DD_PCT×BUDGET.
         if config.MAX_DD_PCT > 0:
@@ -824,6 +829,34 @@ class TradingBot:
                 # in a downtrend on a transient fetch failure. Skip the whole cycle.
                 logger.warning("BTC filter ON ma dati BTC non disponibili — scan saltato (fail-safe)")
                 return False
+
+        # ── Regime detection (Mod 4): BTC daily regime → score-threshold bumps ─
+        config.REGIME_SCORE_BUMP_LONG  = 0
+        config.REGIME_SCORE_BUMP_SHORT = 0
+        if config.REGIME_ENABLED:
+            reg = None
+            try:
+                daily_candles = await asyncio.to_thread(_get_ohlc_cached, config.BTC_PAIR, 1440)
+                reg = regime.classify(daily_candles)
+            except Exception as exc:
+                logger.warning("Regime detection fallita: %s — nessun aggiustamento", exc)
+            if reg:
+                config.REGIME_SCORE_BUMP_LONG  = reg.bump_long
+                config.REGIME_SCORE_BUMP_SHORT = reg.bump_short
+                logger.info(
+                    "Regime: %s (ADX_daily=%.1f  ATR=%.1f%%  EMA_dist=%+.1f%%) → bump score L+%d/S+%d",
+                    reg.label, reg.adx_daily, reg.atr_pct * 100, reg.ema_dist_pct * 100,
+                    reg.bump_long, reg.bump_short,
+                )
+                db.set_setting("market_regime", json.dumps({
+                    "label":        reg.label,
+                    "adx_daily":    reg.adx_daily,
+                    "atr_pct":      reg.atr_pct,
+                    "ema_dist_pct": reg.ema_dist_pct,
+                    "bump_long":    reg.bump_long,
+                    "bump_short":   reg.bump_short,
+                    "ts":           time.time(),
+                }))
 
         dynamic = _load_json(DYNAMIC_PAIRS_FILE, [])
         discovery_data = _load_json(DISCOVERY_LOG_FILE, {})
@@ -940,6 +973,7 @@ class TradingBot:
 
             if execute:
                 self._groq_rejected.pop(("long", signal.pair), None)
+                db.insert_gate_event(signal.pair, "long", "groq_ok")
                 if signal.pair in self._in_flight:
                     logger.warning("Guard: %s già in-flight — skip", signal.pair)
                 else:
@@ -953,6 +987,7 @@ class TradingBot:
                         self._in_flight.discard(signal.pair)
             else:
                 self._groq_rejected[("long", signal.pair)] = time.time()
+                db.insert_gate_event(signal.pair, "long", "groq_rifiuto")
                 reasons_text = "\n".join(f"  • {r}" for r in signal.reasons)
                 await self.app.bot.send_message(
                     chat_id=config.TELEGRAM_CHAT_ID,
@@ -1095,6 +1130,7 @@ class TradingBot:
 
             if execute:
                 self._groq_rejected.pop(("short", signal.pair), None)
+                db.insert_gate_event(signal.pair, "short", "groq_ok")
                 if signal.pair in self._in_flight:
                     logger.warning("Guard: %s già in-flight — skip", signal.pair)
                 else:
@@ -1119,6 +1155,7 @@ class TradingBot:
                 )
                 logger.info("Groq rejected SHORT %s [%d/10]: %s", signal.pair, confidence, reason)
                 self._groq_rejected[("short", signal.pair)] = time.time()
+                db.insert_gate_event(signal.pair, "short", "groq_rifiuto")
 
             signal_found = True
             await asyncio.sleep(1)
@@ -1365,6 +1402,7 @@ class TradingBot:
         with self._positions_lock:
             self.positions[pair] = pos
             db.insert_position(pair, pos)
+        db.insert_gate_event(pair, side, "market_fallback")
         logger.info("Limit TIMEOUT → MARKET fallback %s %s @%.6f TX %s", pair, side.upper(), fill_px, txid)
         await self.app.bot.send_message(
             chat_id=config.TELEGRAM_CHAT_ID,
@@ -1404,6 +1442,7 @@ class TradingBot:
                         self.positions[pair] = pos
                         db.insert_position(pair, pos)
                     to_remove.append(pair)
+                    db.insert_gate_event(pair, side, "entry_fill")
                     logger.info("[PAPER] Limit FILLED %s %s @%.6f", pair, side.upper(), limit)
                     await self.app.bot.send_message(
                         chat_id=config.TELEGRAM_CHAT_ID,
@@ -1419,6 +1458,7 @@ class TradingBot:
                         with self._positions_lock:
                             self.positions[pair] = pos
                             db.insert_position(pair, pos)
+                        db.insert_gate_event(pair, side, "market_fallback")
                         logger.info("[PAPER] Limit TIMEOUT → MARKET fallback %s %s @%.6f (signal %.6f)",
                                     pair, side.upper(), mkt_px, po.get("entry_signal", limit))
                         await self.app.bot.send_message(
@@ -1426,6 +1466,7 @@ class TradingBot:
                             text=f"[PAPER] LIMIT SCADUTO → MARKET {pair} {side.upper()}  @{mkt_px:.6f}",
                         )
                     else:
+                        db.insert_gate_event(pair, side, "limit_timeout")
                         logger.info("[PAPER] Limit TIMEOUT %s %s @%.6f — drift oltre %.2f%%, segnale scartato",
                                     pair, side.upper(), limit, config.ENTRY_FALLBACK_MAX_DRIFT_PCT * 100)
                         await self.app.bot.send_message(
@@ -1482,6 +1523,7 @@ class TradingBot:
                     self.positions[pair] = pos
                     db.insert_position(pair, pos)
                 to_remove.append(pair)
+                db.insert_gate_event(pair, side, "entry_fill")
                 logger.info("Limit FILLED %s %s @%.6f TX %s", pair, side.upper(), po["limit_price"], txid)
                 await self.app.bot.send_message(
                     chat_id=config.TELEGRAM_CHAT_ID,
@@ -1513,6 +1555,7 @@ class TradingBot:
                 else:
                     filled = await self._try_market_fallback(pair, po, now)
                     if not filled:
+                        db.insert_gate_event(pair, side, "limit_timeout")
                         logger.info("Limit TIMEOUT %s %s TX %s — cancellato, segnale scartato",
                                     pair, side.upper(), txid)
                         await self.app.bot.send_message(
@@ -1534,6 +1577,31 @@ class TradingBot:
         for p in prot:
             mins = max(0, int((p["until_ts"] - now) / 60))
             lines.append(f"• [{p['scope'].upper()}] {p['reason']} — scade tra {mins} min")
+        await update.message.reply_text("\n".join(lines))
+
+    async def _cmd_gates(self, update, ctx) -> None:
+        """Funnel dei gate: quanti segnali bloccati da ogni filtro (default 24h)."""
+        hours = 24
+        if ctx.args and ctx.args[0].isdigit():
+            hours = int(ctx.args[0])
+        funnel = db.get_gate_funnel(hours)
+        if not funnel:
+            await update.message.reply_text(f"Nessun evento gate nelle ultime {hours}h.")
+            return
+        lines = [f"FUNNEL GATE — ultime {hours}h:"]
+        for row in funnel:
+            lines.append(f"• {row['gate']} [{row['side']}]: {row['n']}×")
+        # Regime badge if available
+        raw = db.get_setting("market_regime")
+        if raw:
+            try:
+                reg = json.loads(raw)
+                lines.append(
+                    f"\nRegime: {reg.get('label', '?')} "
+                    f"(ADX_d={reg.get('adx_daily', 0):.0f}, bump L+{reg.get('bump_long', 0)}/S+{reg.get('bump_short', 0)})"
+                )
+            except Exception:
+                pass
         await update.message.reply_text("\n".join(lines))
 
     async def _cmd_ai(self, update, ctx) -> None:
@@ -1575,6 +1643,9 @@ class TradingBot:
         # Hold the scan flag so a concurrent scan doesn't see a swapped profile.
         self._scanning = True
         original_profile = config.ACTIVE_PROFILE
+        # Preview reuses generate_signal in-process: mute the funnel hook so the
+        # simulated gates don't pollute the live gate_events stats.
+        strategy_module.set_gate_hook(None)
         try:
             from backtest import preview_profile  # imported lazily to avoid heavy startup cost
             metrics = await asyncio.to_thread(
@@ -1586,6 +1657,7 @@ class TradingBot:
                 config.apply_profile(original_profile, persist=False, quiet=True)
             except Exception as exc:
                 logger.error("Impossibile ripristinare profilo %s: %s", original_profile, exc)
+            strategy_module.set_gate_hook(db.insert_gate_event)
             self._scanning = False
 
         if metrics.get("error"):
