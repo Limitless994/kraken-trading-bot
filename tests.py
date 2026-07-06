@@ -1431,6 +1431,9 @@ class TestLimitEntry(unittest.TestCase):
             if order_info is not None:
                 patches.append(patch.object(tb.kraken_client, "query_orders", return_value=order_info))
             patches.append(patch.object(tb.kraken_client, "cancel_order", return_value={}))
+            patches.append(patch.object(tb.kraken_client, "format_volume", return_value="20"))
+            patches.append(patch.object(tb.kraken_client, "add_order", return_value={"txid": ["MKT-1"]}))
+            patches.append(patch.object(tb.kraken_client, "get_executed_price", return_value=None))
             try:
                 for p in patches:
                     p.start()
@@ -1470,8 +1473,51 @@ class TestLimitEntry(unittest.TestCase):
         inserted, deleted = self._run_check(
             {"SOLEUR": self._po("long", limit=1.0, timeout=1.0)}, paper=True,
             ticker={"bid": 1.0, "ask": 1.01, "last": 1.0})
-        self.assertNotIn("SOLEUR", inserted)           # never filled
+        self.assertNotIn("SOLEUR", inserted)           # ask drifted 1% > 0.5% → no fallback
         self.assertEqual(deleted, ["SOLEUR"])          # discarded on timeout (no chase)
+
+    def test_fallback_drift_ok(self):
+        from bot.telegram_bot import _fallback_drift_ok
+        self.assertTrue(_fallback_drift_ok(100.0, 100.4))    # 0.4% ≤ 0.5%
+        self.assertTrue(_fallback_drift_ok(100.0, 99.6))     # drift is symmetric
+        self.assertFalse(_fallback_drift_ok(100.0, 100.6))   # 0.6% > 0.5%
+        self.assertFalse(_fallback_drift_ok(0.0, 100.0))     # degenerate signal price
+        prev = config.ENTRY_FALLBACK_MARKET
+        config.ENTRY_FALLBACK_MARKET = False
+        try:
+            self.assertFalse(_fallback_drift_ok(100.0, 100.0))  # disabled → never
+        finally:
+            config.ENTRY_FALLBACK_MARKET = prev
+
+    def test_pos_from_pending_taker_fee(self):
+        import bot.telegram_bot as tb
+        po  = self._po(side="long", limit=2.0)
+        pos = tb.TradingBot._pos_from_pending(None, "SOLEUR", po, filled_crypto=6.0,
+                                              entry_price=2.0, now=1000.0, taker=True)
+        self.assertEqual(pos["order_type"], "market")
+        self.assertAlmostEqual(pos["fee_entry_eur"], 12.0 * config.KRAKEN_TAKER_FEE, places=6)
+
+    def test_paper_timeout_fallback_to_market(self):
+        # Timeout with ask only 0.3% above the signal → market fallback fills at ask.
+        inserted, deleted = self._run_check(
+            {"SOLEUR": self._po("long", limit=1.0, timeout=1.0)}, paper=True,
+            ticker={"bid": 1.0, "ask": 1.003, "last": 1.0})
+        self.assertIn("SOLEUR", inserted)
+        self.assertEqual(inserted["SOLEUR"]["order_type"], "market")
+        self.assertAlmostEqual(inserted["SOLEUR"]["entry"], 1.003)
+        self.assertEqual(deleted, ["SOLEUR"])
+
+    def test_paper_timeout_no_fallback_when_disabled(self):
+        prev = config.ENTRY_FALLBACK_MARKET
+        config.ENTRY_FALLBACK_MARKET = False
+        try:
+            inserted, deleted = self._run_check(
+                {"SOLEUR": self._po("long", limit=1.0, timeout=1.0)}, paper=True,
+                ticker={"bid": 1.0, "ask": 1.003, "last": 1.0})
+        finally:
+            config.ENTRY_FALLBACK_MARKET = prev
+        self.assertNotIn("SOLEUR", inserted)
+        self.assertEqual(deleted, ["SOLEUR"])
 
     def test_live_partial_fill_on_timeout(self):
         inserted, deleted = self._run_check(
@@ -1481,6 +1527,19 @@ class TestLimitEntry(unittest.TestCase):
         self.assertIn("SOLEUR", inserted)
         self.assertAlmostEqual(inserted["SOLEUR"]["size_crypto"], 5.0)  # partial volume
         self.assertAlmostEqual(inserted["SOLEUR"]["size_eur"], 10.0)    # 5 × 2.0
+        self.assertEqual(deleted, ["SOLEUR"])
+
+    def test_live_timeout_fallback_to_market(self):
+        # Nothing executed at timeout, ask within drift → market order replaces the limit.
+        inserted, deleted = self._run_check(
+            {"SOLEUR": self._po("long", limit=2.0, timeout=1.0)}, paper=False,
+            ticker={"bid": 1.999, "ask": 2.005, "last": 2.0},
+            open_orders={"open": {"OTEST-1": {}}},
+            order_info={"OTEST-1": {"status": "open", "vol_exec": 0}})
+        self.assertIn("SOLEUR", inserted)
+        self.assertEqual(inserted["SOLEUR"]["order_type"], "market")
+        self.assertAlmostEqual(inserted["SOLEUR"]["entry"], 2.005)  # taker fill at ask
+        self.assertEqual(inserted["SOLEUR"]["txid"], "MKT-1")
         self.assertEqual(deleted, ["SOLEUR"])
 
     def test_calc_exit_limit_has_half_slippage(self):

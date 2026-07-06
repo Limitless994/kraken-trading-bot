@@ -146,6 +146,15 @@ def _update_trailing_stop(pos: dict, current: float, atr: float, cfg) -> bool:
     return False
 
 
+def _fallback_drift_ok(entry_signal: float, mkt_px: float, cfg=config) -> bool:
+    """True when a timed-out limit entry may fall back to a market order:
+    fallback enabled and current price within MAX_DRIFT of the original signal
+    price (so we never chase a market that already ran away)."""
+    if not cfg.ENTRY_FALLBACK_MARKET or entry_signal <= 0:
+        return False
+    return abs(mkt_px - entry_signal) / entry_signal <= cfg.ENTRY_FALLBACK_MAX_DRIFT_PCT
+
+
 def _check_exit_signals(pos: dict, current: float) -> tuple:
     """Returns (hit_tp, hit_sl) based on current price and effective trailing stop."""
     side        = pos.get("side", "long")
@@ -234,7 +243,7 @@ class TradingBot:
         self._discovering = False  # lock discovery
         self._scan_skip_counter: dict[str, int] = {}  # tracks scan skips for non-discovery pairs
         self._in_flight: set = set()  # per-scan idempotency guard
-        self._groq_rejected: dict = {}  # pair → timestamp of last Groq RIFIUTA
+        self._groq_rejected: dict = {}  # (side, pair) → timestamp of last Groq RIFIUTA
         self._register_handlers()
 
     # ── Handler registration ──────────────────────────────────────────────────
@@ -871,10 +880,10 @@ class TradingBot:
 
             if signal.rsi_1h > config.RSI_1H_BUY_MAX:
                 logger.info("%s: SKIP Groq — RSI(1h)=%.1f > %d overbought (opportunità migliori più tardi)", signal.pair, signal.rsi_1h, config.RSI_1H_BUY_MAX)
-                self._groq_rejected[signal.pair] = time.time()
+                self._groq_rejected[("long", signal.pair)] = time.time()
                 continue
 
-            last_rejected = self._groq_rejected.get(signal.pair, 0)
+            last_rejected = self._groq_rejected.get(("long", signal.pair), 0)
             elapsed_min   = (time.time() - last_rejected) / 60
             if last_rejected and elapsed_min < config.GROQ_REJECTION_COOLDOWN_MIN:
                 logger.info("%s: SKIP Groq (long) — rifiutato %.0f min fa (cooldown %d min)",
@@ -930,7 +939,7 @@ class TradingBot:
             })
 
             if execute:
-                self._groq_rejected.pop(signal.pair, None)
+                self._groq_rejected.pop(("long", signal.pair), None)
                 if signal.pair in self._in_flight:
                     logger.warning("Guard: %s già in-flight — skip", signal.pair)
                 else:
@@ -943,7 +952,7 @@ class TradingBot:
                     finally:
                         self._in_flight.discard(signal.pair)
             else:
-                self._groq_rejected[signal.pair] = time.time()
+                self._groq_rejected[("long", signal.pair)] = time.time()
                 reasons_text = "\n".join(f"  • {r}" for r in signal.reasons)
                 await self.app.bot.send_message(
                     chat_id=config.TELEGRAM_CHAT_ID,
@@ -1016,7 +1025,7 @@ class TradingBot:
                     continue
 
             cooldown_secs = config.GROQ_REJECTION_COOLDOWN_MIN * 60
-            last_rejected = self._groq_rejected.get(signal.pair, 0)
+            last_rejected = self._groq_rejected.get(("short", signal.pair), 0)
             elapsed_min   = (time.time() - last_rejected) / 60
             if last_rejected and elapsed_min < config.GROQ_REJECTION_COOLDOWN_MIN:
                 logger.info("%s: SKIP Groq — rifiutato %.0f min fa (cooldown %d min)",
@@ -1028,12 +1037,12 @@ class TradingBot:
             if signal.score < _min_score_short and rsi_slope_1h > 0:
                 logger.info("%s: SKIP Groq — score=%d (< %d) e RSI slope=%.2f positivo (segnale debole in recovery)",
                             signal.pair, signal.score, _min_score_short, rsi_slope_1h)
-                self._groq_rejected[signal.pair] = time.time()
+                self._groq_rejected[("short", signal.pair)] = time.time()
                 continue
 
             if signal.rsi_1h < 35:
                 logger.info("%s: SKIP Groq — RSI(1h)=%.1f oversold (rimbalzo probabile)", signal.pair, signal.rsi_1h)
-                self._groq_rejected[signal.pair] = time.time()
+                self._groq_rejected[("short", signal.pair)] = time.time()
                 continue
 
             if not groq_evaluator.budget_available():
@@ -1085,7 +1094,7 @@ class TradingBot:
             })
 
             if execute:
-                self._groq_rejected.pop(signal.pair, None)
+                self._groq_rejected.pop(("short", signal.pair), None)
                 if signal.pair in self._in_flight:
                     logger.warning("Guard: %s già in-flight — skip", signal.pair)
                 else:
@@ -1109,7 +1118,7 @@ class TradingBot:
                     ),
                 )
                 logger.info("Groq rejected SHORT %s [%d/10]: %s", signal.pair, confidence, reason)
-                self._groq_rejected[signal.pair] = time.time()
+                self._groq_rejected[("short", signal.pair)] = time.time()
 
             signal_found = True
             await asyncio.sleep(1)
@@ -1284,15 +1293,19 @@ class TradingBot:
         )
 
     def _pos_from_pending(self, pair: str, po: dict, filled_crypto: float,
-                          entry_price: float, now: float) -> dict:
+                          entry_price: float, now: float, taker: bool = False,
+                          txid: str | None = None) -> dict:
         """Build a position dict from a (possibly partial) pending-order fill.
 
         size_eur is recomputed from the ACTUAL filled volume so a partial fill
         carries proportioned sizing; TP/SL/trailing are price levels and stay put.
+        taker=True is the market-fallback path (limit timed out → market entry):
+        taker fee instead of maker, order_type="market".
         """
         side     = po.get("side", "long")
         size_eur = round(filled_crypto * entry_price, 2)
-        fee_rate = config.KRAKEN_MAKER_FEE + (_margin_open_fee(pair) if side == "short" else 0.0)
+        base_fee = config.KRAKEN_TAKER_FEE if taker else config.KRAKEN_MAKER_FEE
+        fee_rate = base_fee + (_margin_open_fee(pair) if side == "short" else 0.0)
         return {
             "pair":          pair,
             "side":          side,
@@ -1305,10 +1318,59 @@ class TradingBot:
             "stop_loss":     po["stop_loss"],
             "trailing_stop": po["trailing_stop"],
             "atr":           po.get("atr") or 0.0,
-            "txid":          po["txid"],
+            "txid":          txid or po["txid"],
             "opened_at":     now,
-            "order_type":    "limit",
+            "order_type":    "market" if taker else "limit",
         }
+
+    async def _try_market_fallback(self, pair: str, po: dict, now: float) -> bool:
+        """LIVE market fallback after an unfilled limit timeout.
+
+        Places a taker market order for the original volume if the price hasn't
+        drifted more than ENTRY_FALLBACK_MAX_DRIFT_PCT from the signal. Returns
+        True when a position was opened.
+        """
+        side = po.get("side", "long")
+        try:
+            ticker = await asyncio.to_thread(kraken_client.get_ticker, pair)
+            mkt_px = float(ticker["bid"]) if side == "short" else float(ticker["ask"])
+        except Exception as exc:
+            logger.warning("Market fallback %s: prezzo non disponibile (%s) — scarto", pair, exc)
+            return False
+        if not _fallback_drift_ok(po.get("entry_signal", po["limit_price"]), mkt_px):
+            logger.info("Market fallback %s %s: drift oltre %.2f%% (signal %.6f, mkt %.6f) — scarto",
+                        pair, side.upper(), config.ENTRY_FALLBACK_MAX_DRIFT_PCT * 100,
+                        po.get("entry_signal", po["limit_price"]), mkt_px)
+            return False
+        try:
+            vol_str = kraken_client.format_volume(pair, po["size_crypto"])
+            kw = {"leverage": config.MARGIN_LEVERAGE} if side == "short" else {}
+            order = await asyncio.to_thread(
+                kraken_client.add_order, pair, "sell" if side == "short" else "buy",
+                "market", vol_str, **kw,
+            )
+            txids = order.get("txid", [])
+            txid  = txids[0] if txids else "unknown"
+        except Exception as exc:
+            logger.error("Market fallback FAILED %s: %s — segnale scartato", pair, exc)
+            return False
+        fill_px = mkt_px
+        try:
+            executed = await asyncio.to_thread(kraken_client.get_executed_price, txid)
+            if executed and executed > 0:
+                fill_px = executed
+        except Exception:
+            pass
+        pos = self._pos_from_pending(pair, po, po["size_crypto"], fill_px, now, taker=True, txid=txid)
+        with self._positions_lock:
+            self.positions[pair] = pos
+            db.insert_position(pair, pos)
+        logger.info("Limit TIMEOUT → MARKET fallback %s %s @%.6f TX %s", pair, side.upper(), fill_px, txid)
+        await self.app.bot.send_message(
+            chat_id=config.TELEGRAM_CHAT_ID,
+            text=f"LIMIT SCADUTO → MARKET {pair} {side.upper()}  @{fill_px:.6f}  TX {txid}",
+        )
+        return True
 
     async def _job_check_pending_orders(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Fill / timeout-cancel / partial-fill for post-only limit entries.
@@ -1342,16 +1404,34 @@ class TradingBot:
                         self.positions[pair] = pos
                         db.insert_position(pair, pos)
                     to_remove.append(pair)
+                    logger.info("[PAPER] Limit FILLED %s %s @%.6f", pair, side.upper(), limit)
                     await self.app.bot.send_message(
                         chat_id=config.TELEGRAM_CHAT_ID,
                         text=f"[PAPER] LIMIT ESEGUITO {pair} {side.upper()}  @{limit:.6f}",
                     )
                 elif now > po["timeout_at"]:
                     to_remove.append(pair)
-                    await self.app.bot.send_message(
-                        chat_id=config.TELEGRAM_CHAT_ID,
-                        text=f"[PAPER] LIMIT SCADUTO {pair} {side.upper()}  @{limit:.6f} — segnale scartato",
-                    )
+                    # Market fallback: simulate a taker fill at the crossing side of
+                    # the book (ask for a long buy, bid for a short sell).
+                    mkt_px = float(ticker["bid"]) if side == "short" else float(ticker["ask"])
+                    if _fallback_drift_ok(po.get("entry_signal", limit), mkt_px):
+                        pos = self._pos_from_pending(pair, po, po["size_crypto"], mkt_px, now, taker=True)
+                        with self._positions_lock:
+                            self.positions[pair] = pos
+                            db.insert_position(pair, pos)
+                        logger.info("[PAPER] Limit TIMEOUT → MARKET fallback %s %s @%.6f (signal %.6f)",
+                                    pair, side.upper(), mkt_px, po.get("entry_signal", limit))
+                        await self.app.bot.send_message(
+                            chat_id=config.TELEGRAM_CHAT_ID,
+                            text=f"[PAPER] LIMIT SCADUTO → MARKET {pair} {side.upper()}  @{mkt_px:.6f}",
+                        )
+                    else:
+                        logger.info("[PAPER] Limit TIMEOUT %s %s @%.6f — drift oltre %.2f%%, segnale scartato",
+                                    pair, side.upper(), limit, config.ENTRY_FALLBACK_MAX_DRIFT_PCT * 100)
+                        await self.app.bot.send_message(
+                            chat_id=config.TELEGRAM_CHAT_ID,
+                            text=f"[PAPER] LIMIT SCADUTO {pair} {side.upper()}  @{limit:.6f} — segnale scartato",
+                        )
             for pair in to_remove:
                 db.delete_pending_order(pair)
             return
@@ -1402,6 +1482,7 @@ class TradingBot:
                     self.positions[pair] = pos
                     db.insert_position(pair, pos)
                 to_remove.append(pair)
+                logger.info("Limit FILLED %s %s @%.6f TX %s", pair, side.upper(), po["limit_price"], txid)
                 await self.app.bot.send_message(
                     chat_id=config.TELEGRAM_CHAT_ID,
                     text=f"LIMIT ESEGUITO {pair} {side.upper()}  @{po['limit_price']:.6f}  TX {txid}",
@@ -1423,15 +1504,21 @@ class TradingBot:
                     with self._positions_lock:
                         self.positions[pair] = pos
                         db.insert_position(pair, pos)
+                    logger.info("Limit TIMEOUT partial %s %s %.6f @%.6f — residuo cancellato",
+                                pair, side.upper(), vol_exec, po["limit_price"])
                     await self.app.bot.send_message(
                         chat_id=config.TELEGRAM_CHAT_ID,
                         text=f"LIMIT SCADUTO PARZIALE {pair} {side.upper()}  {vol_exec:.6f} @{po['limit_price']:.6f}, residuo cancellato",
                     )
                 else:
-                    await self.app.bot.send_message(
-                        chat_id=config.TELEGRAM_CHAT_ID,
-                        text=f"LIMIT SCADUTO {pair} {side.upper()}  TX {txid} — cancellato, segnale scartato",
-                    )
+                    filled = await self._try_market_fallback(pair, po, now)
+                    if not filled:
+                        logger.info("Limit TIMEOUT %s %s TX %s — cancellato, segnale scartato",
+                                    pair, side.upper(), txid)
+                        await self.app.bot.send_message(
+                            chat_id=config.TELEGRAM_CHAT_ID,
+                            text=f"LIMIT SCADUTO {pair} {side.upper()}  TX {txid} — cancellato, segnale scartato",
+                        )
                 to_remove.append(pair)
         for pair in to_remove:
             db.delete_pending_order(pair)
