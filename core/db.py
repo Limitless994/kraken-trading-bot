@@ -145,6 +145,14 @@ def init_db() -> None:
                 until_ts REAL NOT NULL,
                 created_ts REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS gate_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                pair TEXT NOT NULL,
+                side TEXT NOT NULL,      -- 'long' | 'short'
+                gate TEXT NOT NULL       -- blocking gate name, or 'signal_ok'/'eseguito'
+            );
+            CREATE INDEX IF NOT EXISTS idx_gate_events_ts ON gate_events(ts);
         """)
         # Forward-compat ALTERs for DBs created before these columns existed.
         # Silently skipped when the columns are already in place.
@@ -486,6 +494,52 @@ def clear_expired_protections(now: float = None) -> None:
         with _write_lock:
             with get_conn() as conn:
                 conn.execute("DELETE FROM protections WHERE until_ts <= ?", (now,))
+    except Exception:
+        pass
+
+
+# ── Gate analytics (funnel) ───────────────────────────────────────────────────
+
+def insert_gate_event(pair: str, side: str, gate: str, ts: float = None) -> None:
+    """Record one funnel event: a gate that blocked a signal, or a milestone
+    ('signal_ok', 'groq_rifiuto', 'eseguito', 'limit_timeout', ...)."""
+    if ts is None:
+        ts = time.time()
+    try:
+        with _write_lock:
+            with get_conn() as conn:
+                conn.execute(
+                    "INSERT INTO gate_events (ts, pair, side, gate) VALUES (?,?,?,?)",
+                    (ts, pair, side, gate),
+                )
+    except Exception:
+        pass   # analytics must never break the scan
+
+
+def get_gate_funnel(hours: float = 24) -> list:
+    """Aggregate gate events over the last `hours`: [{gate, side, count}], most frequent first."""
+    if not DB_PATH.exists():
+        return []
+    cutoff = time.time() - hours * 3600
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT gate, side, COUNT(*) AS n FROM gate_events "
+                "WHERE ts >= ? GROUP BY gate, side ORDER BY n DESC",
+                (cutoff,),
+            ).fetchall()
+    except Exception:
+        return []
+    return [dict(r) for r in rows]
+
+
+def purge_gate_events(days: float = 30) -> None:
+    """Drop gate events older than `days` to keep the table bounded."""
+    cutoff = time.time() - days * 86400
+    try:
+        with _write_lock:
+            with get_conn() as conn:
+                conn.execute("DELETE FROM gate_events WHERE ts < ?", (cutoff,))
     except Exception:
         pass
 

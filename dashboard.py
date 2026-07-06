@@ -151,9 +151,21 @@ def _collect_live_data() -> dict:
         for p in db.get_active_protections(_now)
     ]
 
+    gate_funnel = db.get_gate_funnel(24)
+
+    market_regime = {}
+    try:
+        _raw_regime = db.get_setting("market_regime")
+        if _raw_regime:
+            market_regime = json.loads(_raw_regime)
+    except Exception:
+        pass
+
     return {
         "positions": enriched,
         "protections": protections,
+        "gate_funnel": gate_funnel,
+        "regime": market_regime,
         "metrics": {
             "open_count":    len(enriched),
             "max_trades":    config.MAX_OPEN_TRADES,
@@ -543,7 +555,15 @@ TEMPLATE = """<!DOCTYPE html>
       {% set btc = init_data.btc %}
       <div class="card mb-3">
         <div class="card-header d-flex justify-content-between align-items-center">
-          <span>Stato Mercato &mdash; BTC</span>
+          <span>Stato Mercato &mdash; BTC
+            {% set reg = init_data.regime %}
+            {% if reg.get('label') %}
+              <span class="badge ms-2 {% if reg.label == 'trend_up' %}badge-online{% elif reg.label == 'trend_down' %}badge-error{% elif reg.label == 'volatile' %}badge-warn{% else %}bg-secondary{% endif %}"
+                    title="ADX daily {{ '%.0f'|format(reg.get('adx_daily', 0)) }} &middot; soglie score +{{ reg.get('bump_long', 0) }} long / +{{ reg.get('bump_short', 0) }} short">
+                REGIME: {% if reg.label == 'trend_up' %}TREND UP{% elif reg.label == 'trend_down' %}TREND DOWN{% elif reg.label == 'volatile' %}VOLATILE{% else %}RANGE{% endif %}
+              </span>
+            {% endif %}
+          </span>
           {% if btc.get('ema50') == 'SOTTO' and btc_ema_filter %}
             <span class="badge badge-error" id="btc-badge">BOT IN ATTESA &mdash; BTC sotto EMA50</span>
           {% elif btc.get('rsi') and btc.rsi > 65 %}
@@ -593,6 +613,28 @@ TEMPLATE = """<!DOCTYPE html>
           {% endif %}
         </div>
       </div>
+
+      <!-- Funnel gate (24h) -->
+      {% if init_data.gate_funnel %}
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span>Funnel Gate &mdash; ultime 24h</span>
+          <span style="font-size:.75rem;color:#888;">perch&eacute; i segnali vengono scartati</span>
+        </div>
+        <div class="card-body py-2">
+          <div class="row g-2">
+            {% for g in init_data.gate_funnel[:12] %}
+            <div class="col-6 col-md-3">
+              <div class="btc-card" style="border-color:{% if g.gate in ('signal_ok', 'groq_ok', 'entry_fill', 'market_fallback') %}#1a7a4a{% elif g.gate in ('groq_rifiuto', 'limit_timeout') %}#f0a500{% else %}#2a2d3e{% endif %};">
+                <div class="lbl">{{ g.gate }} <span style="color:#666;">[{{ g.side }}]</span></div>
+                <div class="val text-white">{{ g.n }}&times;</div>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+      {% endif %}
 
       <!-- Posizioni aperte -->
       <div class="card mb-3">

@@ -1887,6 +1887,123 @@ TestGroqEvaluator.tearDown = _groq_evaluator_tearDown
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# MOD 4a — Gate analytics (funnel)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestGateEvents(unittest.TestCase):
+
+    def setUp(self):
+        self._tmpdir = Path(tempfile.mkdtemp())
+        self._orig = _db_module.DB_PATH
+        _db_module.DB_PATH = self._tmpdir / "gates_test.db"
+        _db_module.init_db()
+
+    def tearDown(self):
+        _db_module.DB_PATH = self._orig
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_insert_and_funnel_aggregation(self):
+        _db_module.insert_gate_event("SOLEUR", "long", "ADX_basso")
+        _db_module.insert_gate_event("SOLEUR", "long", "ADX_basso")
+        _db_module.insert_gate_event("XBTEUR", "short", "score_basso")
+        funnel = _db_module.get_gate_funnel(24)
+        self.assertEqual(funnel[0]["gate"], "ADX_basso")   # most frequent first
+        self.assertEqual(funnel[0]["n"], 2)
+        self.assertEqual(funnel[0]["side"], "long")
+        self.assertEqual(len(funnel), 2)
+
+    def test_funnel_window_excludes_old_events(self):
+        _db_module.insert_gate_event("SOLEUR", "long", "vecchio", ts=time.time() - 48 * 3600)
+        _db_module.insert_gate_event("SOLEUR", "long", "recente")
+        gates = {r["gate"] for r in _db_module.get_gate_funnel(24)}
+        self.assertEqual(gates, {"recente"})
+
+    def test_purge_drops_only_old_events(self):
+        _db_module.insert_gate_event("SOLEUR", "long", "vecchio", ts=time.time() - 40 * 86400)
+        _db_module.insert_gate_event("SOLEUR", "long", "recente")
+        _db_module.purge_gate_events(days=30)
+        gates = {r["gate"] for r in _db_module.get_gate_funnel(24 * 45)}
+        self.assertEqual(gates, {"recente"})
+
+    def test_strategy_hook_records_gates(self):
+        import core.strategy as strategy
+        recorded = []
+        strategy.set_gate_hook(lambda pair, side, gate: recorded.append((pair, side, gate)))
+        try:
+            # Low ADX blocks the long at the ADX gate
+            generate_signal(_make_analysis(adx=5.0), available_eur=100.0)
+        finally:
+            strategy.set_gate_hook(None)
+        self.assertIn(("SOLEUR", "long", "ADX_basso"), recorded)
+
+    def test_hook_error_does_not_break_signal(self):
+        import core.strategy as strategy
+        strategy.set_gate_hook(lambda *a: 1 / 0)   # hook raises
+        try:
+            result = generate_signal(_make_analysis(adx=5.0), available_eur=100.0)
+        finally:
+            strategy.set_gate_hook(None)
+        self.assertIsNone(result)   # gate outcome unchanged, no exception propagated
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MOD 4b — Regime detection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRegime(unittest.TestCase):
+
+    @staticmethod
+    def _candles(closes):
+        return [{"high": c * 1.005, "low": c * 0.995, "close": c} for c in closes]
+
+    def test_trend_up(self):
+        from core import regime
+        reg = regime.classify(self._candles([100 + i for i in range(100)]))
+        self.assertEqual(reg.label, "trend_up")
+        self.assertEqual((reg.bump_long, reg.bump_short), (0, 1))
+
+    def test_trend_down(self):
+        from core import regime
+        reg = regime.classify(self._candles([300 - i for i in range(100)]))
+        self.assertEqual(reg.label, "trend_down")
+        self.assertEqual((reg.bump_long, reg.bump_short), (1, 0))
+
+    def test_range(self):
+        from core import regime
+        closes = [100 + (1 if i % 2 else -1) for i in range(100)]   # 99/101 chop
+        reg = regime.classify(self._candles(closes))
+        self.assertEqual(reg.label, "range")
+        self.assertEqual((reg.bump_long, reg.bump_short), (1, 1))
+
+    def test_volatile(self):
+        from core import regime
+        closes = [100 + (15 if i % 2 else -15) for i in range(100)]  # ±15% swings
+        reg = regime.classify(self._candles(closes))
+        self.assertEqual(reg.label, "volatile")
+        self.assertEqual((reg.bump_long, reg.bump_short), (1, 1))
+
+    def test_insufficient_data_returns_none(self):
+        from core import regime
+        self.assertIsNone(regime.classify(self._candles([100] * 30)))
+        self.assertIsNone(regime.classify([]))
+
+    def test_score_bump_raises_long_threshold(self):
+        """A signal that passes with bump=0 is rejected with bump=+2 (same analysis)."""
+        # Score exactly 4/6 (no volume spike, neutral order book): passes min=3,
+        # fails min=3+2 when the regime bump is active.
+        analysis = _make_analysis(adx=32.0, atr=2.0, volume_ratio=1.0, ob_imbalance=0.50)
+        base = generate_signal(analysis, available_eur=100.0)
+        self.assertIsNotNone(base)
+        prev = config.REGIME_SCORE_BUMP_LONG
+        config.REGIME_SCORE_BUMP_LONG = 2
+        try:
+            bumped = generate_signal(analysis, available_eur=100.0)
+        finally:
+            config.REGIME_SCORE_BUMP_LONG = prev
+        self.assertIsNone(bumped)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # RUNNER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1910,6 +2027,7 @@ if __name__ == "__main__":
         TestMinProfitGate, TestRSISlopeFilter,
         TestTrailingStopBreakEven, TestTrailingCostBuffer,
         TestPerSideThresholds, TestLimitEntry, TestProtections,
+        TestGateEvents, TestRegime,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

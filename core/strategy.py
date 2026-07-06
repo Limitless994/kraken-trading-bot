@@ -34,6 +34,24 @@ from .analyzer import Analysis
 
 logger = logging.getLogger(__name__)
 
+# Funnel analytics hook — set by the live bot (db.insert_gate_event); stays None
+# in backtests and profile previews so they don't pollute the live funnel stats.
+_gate_hook = None
+
+
+def set_gate_hook(fn) -> None:
+    """Register a callable(pair, side, gate) invoked at every gate outcome."""
+    global _gate_hook
+    _gate_hook = fn
+
+
+def _gate(pair: str, side: str, gate: str) -> None:
+    if _gate_hook is not None:
+        try:
+            _gate_hook(pair, side, gate)
+        except Exception:
+            pass   # analytics must never break signal generation
+
 
 @dataclass
 class Signal:
@@ -96,21 +114,25 @@ def generate_signal(
     # ── Gate 0: Daily EMA50 — long-term trend filter ─────────────────────────
     if config.DAILY_EMA_FILTER and not analysis.daily_above_ema50:
         logger.info("%s: SKIP gate=daily_EMA50", analysis.pair)
+        _gate(analysis.pair, "long", "daily_EMA50")
         return None   # price below daily EMA50 = structural downtrend
 
     # ── Gate 1: ADX — trend strength (per-side threshold, Mod 3) ─────────────
     _adx_min_long = getattr(config, "ADX_MIN_LONG", config.ADX_MIN)
     if analysis.adx < _adx_min_long:
         logger.info("%s: SKIP gate=ADX_basso (ADX=%.1f < %d)", analysis.pair, analysis.adx, _adx_min_long)
+        _gate(analysis.pair, "long", "ADX_basso")
         return None   # ranging market
 
     # ── Gate 2: BTC market filter ─────────────────────────────────────────────
     if config.BTC_FILTER_ENABLED and btc_analysis and analysis.pair != config.BTC_PAIR:
         if btc_analysis.rsi_1h > config.BTC_RSI_MAX:
             logger.info("%s: SKIP gate=BTC_RSI_alto (BTC_RSI=%.1f > %d)", analysis.pair, btc_analysis.rsi_1h, config.BTC_RSI_MAX)
+            _gate(analysis.pair, "long", "BTC_RSI_alto")
             return None   # overheated market
         if config.BTC_EMA_FILTER and not btc_analysis.price_above_ema50:
             logger.info("%s: SKIP gate=BTC_downtrend", analysis.pair)
+            _gate(analysis.pair, "long", "BTC_downtrend")
             return None   # BTC in downtrend
 
     # ── Gate 3: correlation ───────────────────────────────────────────────────
@@ -122,6 +144,7 @@ def generate_signal(
                     for other in grp:
                         if other != analysis.pair and other in open_pairs:
                             logger.info("%s: SKIP gate=correlazione (%s già aperta)", analysis.pair, other)
+                            _gate(analysis.pair, "long", "correlazione")
                             return None   # correlated pair already open
 
     # ── Scoring ───────────────────────────────────────────────────────────────
@@ -178,8 +201,9 @@ def generate_signal(
         score += 1
         reasons.append(f"ADX forte: {analysis.adx:.1f} (>30)")
 
-    # ── Score gate (per-side threshold, Mod 3) ──────────────────────────────────
-    _min_score_long = getattr(config, "MIN_SIGNAL_SCORE_LONG", config.MIN_SIGNAL_SCORE)
+    # ── Score gate (per-side threshold Mod 3, + regime bump Mod 4) ─────────────
+    _min_score_long = (getattr(config, "MIN_SIGNAL_SCORE_LONG", config.MIN_SIGNAL_SCORE)
+                       + getattr(config, "REGIME_SCORE_BUMP_LONG", 0))
     if score < _min_score_long:
         _ob_val = f"{analysis.ob_imbalance:.2f}" if analysis.ob_imbalance is not None else "N/A"
         logger.info(
@@ -190,6 +214,7 @@ def generate_signal(
             _ema_ok, _ob_ok, _ob_val, _adx30_ok, analysis.adx,
             _min_score_long,
         )
+        _gate(analysis.pair, "long", "score_basso")
         return None
 
     # ── Position sizing (Groq will redefine size after evaluation) ──────────
@@ -220,8 +245,10 @@ def generate_signal(
             "%s: SKIP gate=tp_stretto (TP gross=%.2f%% < min=%.2f%%, ATR=%.6f)",
             analysis.pair, _tp_gross_pct * 100, _min_cost_pct * 1.3 * 100, atr,
         )
+        _gate(analysis.pair, "long", "tp_stretto")
         return None
 
+    _gate(analysis.pair, "long", "signal_ok")
     return Signal(
         id=str(uuid.uuid4())[:8],
         pair=analysis.pair,
@@ -262,21 +289,25 @@ def generate_short_signal(
     # Gate 0: Daily EMA50 — for short the price must be BELOW EMA50
     if config.DAILY_EMA_FILTER and analysis.daily_above_ema50:
         logger.info("%s: SHORT SKIP gate=daily_EMA50_sopra", analysis.pair)
+        _gate(analysis.pair, "short", "daily_EMA50_sopra")
         return None
 
     # Gate 1: ADX — strong trend in any direction (per-side threshold, Mod 3)
     _adx_min_short = getattr(config, "ADX_MIN_SHORT", config.ADX_MIN)
     if analysis.adx < _adx_min_short:
         logger.info("%s: SHORT SKIP gate=ADX_basso (%.1f < %d)", analysis.pair, analysis.adx, _adx_min_short)
+        _gate(analysis.pair, "short", "ADX_basso")
         return None
 
     # Gate 2: Inverted BTC filter — BTC must be in downtrend to short alts
     if config.BTC_FILTER_ENABLED and btc_analysis and analysis.pair != config.BTC_PAIR:
         if btc_analysis.rsi_1h < config.BTC_RSI_SHORT_MIN:
             logger.info("%s: SHORT SKIP gate=BTC_oversold (BTC_RSI=%.1f < %d)", analysis.pair, btc_analysis.rsi_1h, config.BTC_RSI_SHORT_MIN)
+            _gate(analysis.pair, "short", "BTC_oversold")
             return None
         if config.BTC_EMA_FILTER and btc_analysis.price_above_ema50:
             logger.info("%s: SHORT SKIP gate=BTC_uptrend", analysis.pair)
+            _gate(analysis.pair, "short", "BTC_uptrend")
             return None
 
     # Gate 3: correlation
@@ -286,11 +317,13 @@ def generate_short_signal(
                 for other in grp:
                     if other != analysis.pair and other in open_pairs:
                         logger.info("%s: SHORT SKIP gate=correlazione (%s già aperta)", analysis.pair, other)
+                        _gate(analysis.pair, "short", "correlazione")
                         return None
 
     # Gate 4: RSI not yet oversold — avoid shorting into capitulation
     if analysis.rsi_1h < config.RSI_SHORT_MIN:
         logger.info("%s: SHORT SKIP gate=RSI_oversold (%.1f < %d)", analysis.pair, analysis.rsi_1h, config.RSI_SHORT_MIN)
+        _gate(analysis.pair, "short", "RSI_oversold")
         return None
 
     # Gate 5: RSI slope — reject if RSI is bouncing from oversold territory.
@@ -304,6 +337,7 @@ def generate_short_signal(
             "%s: SHORT SKIP gate=RSI_rimbalzo (RSI=%.1f slope=+%.1f > %.1f)",
             analysis.pair, analysis.rsi_1h, rsi_slope, slope_threshold,
         )
+        _gate(analysis.pair, "short", "RSI_rimbalzo")
         return None
 
     # ── Scoring (symmetric to longs, conditions inverted) ────────────────────
@@ -344,9 +378,11 @@ def generate_short_signal(
         score += 1
         reasons.append(f"ADX forte: {analysis.adx:.1f} (>30)")
 
-    _min_score_short = getattr(config, "MIN_SIGNAL_SCORE_SHORT", config.MIN_SIGNAL_SCORE)
+    _min_score_short = (getattr(config, "MIN_SIGNAL_SCORE_SHORT", config.MIN_SIGNAL_SCORE)
+                        + getattr(config, "REGIME_SCORE_BUMP_SHORT", 0))
     if score < _min_score_short:
         logger.info("%s: SHORT score=%d/6 → SKIP (min=%d)", analysis.pair, score, _min_score_short)
+        _gate(analysis.pair, "short", "score_basso")
         return None
 
     size_eur = max(round(available_eur * config.AI_SIZE_MED, 2), 10.0)  # cap short initial size below long
@@ -376,8 +412,10 @@ def generate_short_signal(
             "%s: SHORT SKIP gate=tp_stretto (TP gross=%.2f%% < min=%.2f%%, ATR=%.6f)",
             analysis.pair, _tp_gross_pct * 100, _min_cost_pct * 1.3 * 100, atr,
         )
+        _gate(analysis.pair, "short", "tp_stretto")
         return None
 
+    _gate(analysis.pair, "short", "signal_ok")
     return Signal(
         id=str(uuid.uuid4())[:8],
         pair=analysis.pair,
