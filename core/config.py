@@ -55,6 +55,12 @@ LIMIT_TIMEOUT_SEC    = int(os.getenv("LIMIT_TIMEOUT_SEC", "300"))
 # (no price chasing). "market" falls back to taker market entries.
 ENTRY_ORDER_TYPE       = os.getenv("ENTRY_ORDER_TYPE", "limit_post_only")  # limit_post_only | market
 ENTRY_FILL_TIMEOUT_SEC = int(os.getenv("ENTRY_FILL_TIMEOUT_SEC", "180"))
+# Market fallback after a limit timeout: if the order expires unfilled and the
+# price hasn't drifted more than MAX_DRIFT from the original signal, enter at
+# market (taker fee) instead of discarding. Keeps the maker saving when the book
+# comes to us, but stops missing every rally (observed: 13/13 timeouts in uptrend).
+ENTRY_FALLBACK_MARKET        = os.getenv("ENTRY_FALLBACK_MARKET", "true").lower() == "true"
+ENTRY_FALLBACK_MAX_DRIFT_PCT = float(os.getenv("ENTRY_FALLBACK_MAX_DRIFT_PCT", "0.005"))
 # Round-trip cost for the min-profit gate. With a post-only entry there is NO
 # entry slippage (fill at the limit price or not at all), so: maker entry +
 # taker exit + one-sided exit slippage. Shorts add estimated funding separately.
