@@ -16,6 +16,16 @@ DASH_PID_FILE="$DIR/logs/dashboard.pid"
 
 mkdir -p "$DIR/logs"
 
+# At NAS boot the network may come up after this script (DSM triggered task):
+# wait for connectivity up to 2 minutes. Instant no-op when already online.
+for _i in $(seq 1 24); do
+    if ping -c1 -W2 1.1.1.1 > /dev/null 2>&1 || nslookup api.kraken.com > /dev/null 2>&1; then
+        break
+    fi
+    echo "$(date '+%Y-%m-%d %H:%M:%S') rete non pronta — attendo 5s ($_i/24)" >> "$DIR/logs/stdout_bot.log"
+    sleep 5
+done
+
 # Kill previous loop (kill -0 checks if the process is still running)
 if [ -f "$LOOP_PID_FILE" ]; then
     OLD_PID=$(cat "$LOOP_PID_FILE")
