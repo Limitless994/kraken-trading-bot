@@ -2004,6 +2004,114 @@ class TestRegime(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TREND MODE — daily trend-following (core/trend.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTrendMode(unittest.TestCase):
+
+    @staticmethod
+    def _candles(closes):
+        """Synthetic daily candles + one forming candle (dropped by core.trend)."""
+        out = [{"time": i, "high": c * 1.01, "low": c * 0.99, "close": c}
+               for i, c in enumerate(closes)]
+        out.append({"time": len(closes), "high": closes[-1], "low": closes[-1],
+                    "close": closes[-1]})   # forming candle, must be ignored
+        return out
+
+    def test_entry_on_breakout_above_ema(self):
+        from core import trend
+        closes = [100.0] * 50 + [100 + i for i in range(1, 16)]   # ramp to 115
+        dec = trend.evaluate_entry(self._candles(closes))
+        self.assertIsNotNone(dec)
+        self.assertTrue(dec.enter)                  # 115 > max(prev 40) and > EMA50
+        self.assertAlmostEqual(dec.close, 115.0)
+        self.assertGreater(dec.close, dec.ema50)
+
+    def test_no_entry_without_breakout(self):
+        from core import trend
+        closes = [100.0] * 50 + [110.0, 105.0]      # 105 below the 110 high
+        dec = trend.evaluate_entry(self._candles(closes))
+        self.assertIsNotNone(dec)
+        self.assertFalse(dec.enter)
+
+    def test_no_entry_below_ema(self):
+        from core import trend
+        # Long decline then a bounce: breaks the 40d high of closes but stays
+        # below the (much higher) EMA50 → structural downtrend, no entry.
+        closes = [float(200 - i) for i in range(60)] + [145.0]
+        dec = trend.evaluate_entry(self._candles(closes))
+        self.assertIsNotNone(dec)
+        self.assertFalse(dec.enter)
+
+    def test_insufficient_history_returns_none(self):
+        from core import trend
+        self.assertIsNone(trend.evaluate_entry(self._candles([100.0] * 10)))
+        self.assertIsNone(trend.evaluate_entry([]))
+
+    def test_chandelier_stop(self):
+        from core import trend
+        prev = config.TREND_CHANDELIER_MULT
+        config.TREND_CHANDELIER_MULT = 3.0
+        try:
+            self.assertAlmostEqual(trend.chandelier_stop(100.0, 2.0), 94.0)
+        finally:
+            config.TREND_CHANDELIER_MULT = prev
+
+    def test_exit_peak_ratchets_and_triggers(self):
+        from core import trend
+        # Incremental use, one daily close per call (as the live monitor does):
+        # spike day ratchets the peak, crash day fires the exit against it.
+        spike = [100.0] * 30 + [115.0]
+        res1 = trend.evaluate_exit(self._candles(spike), peak_close=100.0)
+        self.assertIsNotNone(res1)
+        self.assertAlmostEqual(res1["peak"], 115.0)   # peak ratcheted up
+        self.assertFalse(res1["exit"])
+        crash = spike + [90.0]
+        res2 = trend.evaluate_exit(self._candles(crash), peak_close=res1["peak"])
+        self.assertAlmostEqual(res2["peak"], 115.0)   # never ratchets down
+        self.assertTrue(res2["exit"])                 # 90 < 115 − 3×ATR
+
+    def test_no_exit_in_uptrend(self):
+        from core import trend
+        closes = [100.0 + i * 0.5 for i in range(40)]   # steady rise
+        res = trend.evaluate_exit(self._candles(closes), peak_close=closes[-1])
+        self.assertIsNotNone(res)
+        self.assertFalse(res["exit"])
+
+    def test_execute_trend_entry_paper(self):
+        import asyncio as _asyncio
+        from unittest.mock import AsyncMock
+        from core import trend
+        import bot.telegram_bot as tb
+        dec = trend.TrendDecision(enter=True, close=100.0, ema50=95.0,
+                                  breakout_level=99.0, atr=2.0, reason="test breakout")
+        with patch("bot.telegram_bot.Application") as mock_app_cls:
+            mock_app_cls.builder.return_value.token.return_value.build.return_value = MagicMock()
+            bot = tb.TradingBot()
+            bot.app = MagicMock()
+            bot.app.bot.send_message = AsyncMock()
+            inserted = {}
+            prev_paper, prev_mult = config.PAPER_TRADING, config.TREND_CHANDELIER_MULT
+            config.PAPER_TRADING, config.TREND_CHANDELIER_MULT = True, 3.0
+            try:
+                with patch.object(tb.kraken_client, "get_ticker",
+                                  return_value={"ask": 100.0, "bid": 99.5, "last": 100.0}), \
+                     patch.object(tb.db, "insert_position",
+                                  side_effect=lambda p, d: inserted.__setitem__(p, d)), \
+                     patch.object(tb.db, "insert_gate_event"):
+                    ok = _asyncio.run(bot._execute_trend_entry("SOLEUR", dec, 20.0))
+            finally:
+                config.PAPER_TRADING, config.TREND_CHANDELIER_MULT = prev_paper, prev_mult
+            self.assertTrue(ok)
+            self.assertIn("SOLEUR", inserted)
+            pos = inserted["SOLEUR"]
+            self.assertEqual(pos["mode"], "trend")
+            self.assertEqual(pos["side"], "long")
+            self.assertAlmostEqual(pos["stop_loss"], 94.0)       # 100 − 3×2
+            self.assertGreater(pos["take_profit"], pos["entry"] * 50)  # no real TP
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # RUNNER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2027,7 +2135,7 @@ if __name__ == "__main__":
         TestMinProfitGate, TestRSISlopeFilter,
         TestTrailingStopBreakEven, TestTrailingCostBuffer,
         TestPerSideThresholds, TestLimitEntry, TestProtections,
-        TestGateEvents, TestRegime,
+        TestGateEvents, TestRegime, TestTrendMode,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

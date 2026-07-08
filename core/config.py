@@ -62,6 +62,18 @@ ENTRY_FILL_TIMEOUT_SEC = int(os.getenv("ENTRY_FILL_TIMEOUT_SEC", "180"))
 ENTRY_FALLBACK_MARKET        = os.getenv("ENTRY_FALLBACK_MARKET", "true").lower() == "true"
 ENTRY_FALLBACK_MAX_DRIFT_PCT = float(os.getenv("ENTRY_FALLBACK_MAX_DRIFT_PCT", "0.005"))
 
+# ── Trading mode ──────────────────────────────────────────────────────────────
+# "trend"    = daily trend-following (Donchian breakout + EMA50, chandelier exit).
+#              Walk-forward 2022–2026: +111…+172€ per 100€, whole parameter grid
+#              positive. ~1.5 trade/month. No Groq, no TP: winners run.
+# "momentum" = legacy 1h scoring strategy (RSI/MACD/volume + Groq). Walk-forward:
+#              0/18 windows positive — kept for comparison only.
+TRADING_MODE          = os.getenv("TRADING_MODE", "trend")
+TREND_BREAKOUT_DAYS   = int(os.getenv("TREND_BREAKOUT_DAYS", "40"))
+TREND_EMA_DAYS        = int(os.getenv("TREND_EMA_DAYS", "50"))
+TREND_ATR_DAYS        = int(os.getenv("TREND_ATR_DAYS", "20"))
+TREND_CHANDELIER_MULT = float(os.getenv("TREND_CHANDELIER_MULT", "3.0"))
+
 # ── Regime detection (Mod 4) ──────────────────────────────────────────────────
 # The scan classifies BTC's daily regime (core/regime.py) and raises the entry
 # score thresholds in adverse regimes via these transient bumps. The bumps are
@@ -76,6 +88,9 @@ REGIME_SCORE_BUMP_SHORT = 0
 SLIP_EXIT_PCT          = float(os.getenv("SLIP_EXIT_PCT", "0.002"))   # 1-sided exit slippage
 FUNDING_EST_PCT        = float(os.getenv("FUNDING_EST_PCT", "0.0004"))# est. short funding component
 ROUND_TRIP_COST_PCT    = KRAKEN_MAKER_FEE + KRAKEN_TAKER_FEE + SLIP_EXIT_PCT
+# Min-profit gate multiple: TP gross must exceed round-trip costs by this factor.
+# 1.3 = barely-clears-costs trades allowed; 3.0 = only fat setups (wins pay ≥3× the house).
+MIN_PROFIT_MULT        = float(os.getenv("MIN_PROFIT_MULT", "1.3"))
 
 # ── ATR-based TP/SL ───────────────────────────────────────────────────────────
 ATR_TP_MULT       = float(os.getenv("ATR_TP_MULT",       "2.5"))

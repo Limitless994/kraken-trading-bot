@@ -465,6 +465,7 @@ TEMPLATE = """<!DOCTYPE html>
     {% set btc_rsi_init = init_data.btc.get('rsi') %}
     {% if btc_rsi_init %}<span id="hdr-btc-rsi" class="badge {% if btc_rsi_init < 65 %}bg-secondary{% else %}badge-warn{% endif %} d-none d-sm-inline">BTC RSI: {{ "%.1f"|format(btc_rsi_init) }}</span>{% endif %}
     {% if fear_greed %}<span class="badge {% if fear_greed.value <= 20 or fear_greed.value >= 80 %}badge-warn{% elif fear_greed.value <= 40 %}bg-secondary{% else %}badge-online{% endif %} d-none d-sm-inline">F&G: {{ fear_greed.value }} {{ fear_greed.label }}</span>{% endif %}
+    {% if trading_mode == 'trend' %}<span class="badge badge-online" title="Trend-following daily: breakout Donchian + EMA50, uscita chandelier. Niente Groq, niente TP.">MODE: TREND</span>{% else %}<span class="badge bg-secondary">MODE: MOMENTUM</span>{% endif %}
     {% if init_data.circuit_breaker %}<span class="badge badge-error">CIRCUIT BREAKER</span>{% endif %}
     {% for p in init_data.protections %}<span class="badge badge-error" title="{{ p.reason }}">PROT {{ p.scope|upper }} ({{ p.expires_min }}m)</span>{% endfor %}
     <span class="ms-auto d-flex align-items-center gap-2" style="font-size:.75rem;color:#aaa;">
@@ -1703,6 +1704,7 @@ def index():
         kraken_status=kraken_status,
         pairs=", ".join(config.PAIRS),
         scan_interval=config.SCAN_INTERVAL_MINUTES,
+        trading_mode=config.TRADING_MODE,
         groq_model=config.GROQ_MODEL,
         fee_taker=f"{config.KRAKEN_TAKER_FEE*100:.2f}",
         fee_maker=f"{config.KRAKEN_MAKER_FEE*100:.2f}",

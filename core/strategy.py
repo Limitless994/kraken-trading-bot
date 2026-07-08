@@ -239,11 +239,12 @@ def generate_signal(
     # (config.ROUND_TRIP_COST_PCT). Without it the bot opens longs whose TP is too
     # tight to cover costs — gross-positive trades that close net-negative.
     _min_cost_pct = config.ROUND_TRIP_COST_PCT
+    _profit_mult  = getattr(config, "MIN_PROFIT_MULT", 1.3)
     _tp_gross_pct = (take_profit - analysis.price) / analysis.price
-    if _tp_gross_pct < _min_cost_pct * 1.3:
+    if _tp_gross_pct < _min_cost_pct * _profit_mult:
         logger.info(
             "%s: SKIP gate=tp_stretto (TP gross=%.2f%% < min=%.2f%%, ATR=%.6f)",
-            analysis.pair, _tp_gross_pct * 100, _min_cost_pct * 1.3 * 100, atr,
+            analysis.pair, _tp_gross_pct * 100, _min_cost_pct * _profit_mult * 100, atr,
         )
         _gate(analysis.pair, "long", "tp_stretto")
         return None
@@ -406,11 +407,12 @@ def generate_short_signal(
     # one-sided exit slippage (config.ROUND_TRIP_COST_PCT), plus estimated funding
     # for the short side (config.FUNDING_EST_PCT).
     _min_cost_pct = config.ROUND_TRIP_COST_PCT + config.FUNDING_EST_PCT
+    _profit_mult  = getattr(config, "MIN_PROFIT_MULT", 1.3)
     _tp_gross_pct = (analysis.price - take_profit) / analysis.price
-    if _tp_gross_pct < _min_cost_pct * 1.3:
+    if _tp_gross_pct < _min_cost_pct * _profit_mult:
         logger.info(
             "%s: SHORT SKIP gate=tp_stretto (TP gross=%.2f%% < min=%.2f%%, ATR=%.6f)",
-            analysis.pair, _tp_gross_pct * 100, _min_cost_pct * 1.3 * 100, atr,
+            analysis.pair, _tp_gross_pct * 100, _min_cost_pct * _profit_mult * 100, atr,
         )
         _gate(analysis.pair, "short", "tp_stretto")
         return None
