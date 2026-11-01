@@ -49,6 +49,10 @@ def _setup_logging(log_dir: "Path") -> None:
     root.addHandler(logging.StreamHandler(sys.stdout))
     root.addHandler(_file_handler("bot"))
 
+    # httpx logs full request URLs, which include the Telegram token
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     # Modules with a dedicated log file
     for module, logfile in [
         ("bot.telegram_bot",      "trading"),

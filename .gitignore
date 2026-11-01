@@ -22,3 +22,7 @@ build/
 # Claude
 .claude/
 .idea/
+
+# Runtime state
+*.db
+*.bak
