@@ -37,6 +37,8 @@ Stesse regole trend su ETF USA liquidi (`STOCK_SYMBOLS`), con budget separato in
 
 Non esiste una modalità live: `AlpacaBroker` rifiuta qualunque host diverso dall'endpoint paper. Gli ordini partono solo a mercato aperto, sul segnale della chiusura precedente.
 
+Gli ETF americani dell'universo di default (SPY, QQQ, …) vanno bene solo in paper: un cliente retail dell'UE non può comprarli dal vivo (regolamento PRIIPs). Il percorso verso un sistema azionario completo — dati, validazione, strategie, eventuale live — è in [docs/PIANO_AZIONARIO.md](docs/PIANO_AZIONARIO.md).
+
 ### Sicurezza
 
 - `PAPER_TRADING` vale `true` anche se la riga manca dal `.env`: il live richiede `PAPER_TRADING=false` esplicito.

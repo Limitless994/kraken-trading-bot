@@ -101,6 +101,8 @@ STOCK_EXECUTION    = os.getenv("STOCK_EXECUTION", "local")
 STOCK_BUDGET_USD   = float(os.getenv("STOCK_BUDGET_USD", "1000"))
 # Liquid, diversified ETFs (US large/tech/small caps, developed/emerging ex-US,
 # gold, long Treasuries, energy). A starting universe, not a recommendation.
+# PAPER ONLY in practice: EU retail clients cannot buy US-domiciled ETFs live
+# (PRIIPs). See docs/PIANO_AZIONARIO.md for the single-stock plan.
 STOCK_SYMBOLS = [s.strip().upper() for s in
                  os.getenv("STOCK_SYMBOLS", "SPY,QQQ,IWM,EFA,EEM,GLD,TLT,XLE").split(",")
                  if s.strip()]
