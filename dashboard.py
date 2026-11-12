@@ -17,6 +17,35 @@ from core import config, db, market_data
 
 app = Flask(__name__)
 
+
+# ── Access control ────────────────────────────────────────────────────────────
+# The dashboard can close positions, restart the bot and rewrite parameters, and
+# it listens on the LAN. With DASHBOARD_PASSWORD set, every request needs HTTP
+# Basic auth (any username). Without it the dashboard is read-only: actions are
+# refused instead of being open to anyone who can reach the port.
+
+def _password_ok(supplied: str) -> bool:
+    import hmac
+    return hmac.compare_digest((supplied or "").encode(), config.DASHBOARD_PASSWORD.encode())
+
+
+@app.before_request
+def _guard():
+    if config.DASHBOARD_PASSWORD:
+        auth = request.authorization
+        if auth is None or not _password_ok(auth.password):
+            return Response(
+                "Autenticazione richiesta", 401,
+                {"WWW-Authenticate": 'Basic realm="Trading bot"'},
+            )
+        return None
+    if request.method != "GET":
+        return Response(
+            "Dashboard in sola lettura: imposta DASHBOARD_PASSWORD nel .env e riavvia "
+            "per abilitare le azioni (chiudi, riavvia, parametri).", 403,
+        )
+    return None
+
 _DYNAMIC_PAIRS_FILE = Path(__file__).parent / "dynamic_pairs.json"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -1744,4 +1773,6 @@ def index():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8501, debug=False, threaded=True)
+    if not config.DASHBOARD_PASSWORD:
+        print("ATTENZIONE: DASHBOARD_PASSWORD non impostata — dashboard in sola lettura.")
+    app.run(host=config.DASHBOARD_HOST, port=8501, debug=False, threaded=True)

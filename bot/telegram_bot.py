@@ -36,8 +36,10 @@ from telegram.ext import (
     filters,
 )
 
-from core import config, db, kraken_client, market_data, regime, trend
+from core import config, db, kraken_client, market_data, regime
 from core.analyzer import analyze, _get_ohlc as _get_ohlc_cached
+from core.broker import AlpacaBroker, BrokerError, KrakenBroker
+from core.trend_engine import PositionStore, TrendMarket, TrendTrader
 from core import strategy as strategy_module
 from core.strategy import Signal, generate_signal, generate_short_signal, kelly_size_pct
 from services import discovery, groq_evaluator
@@ -233,6 +235,69 @@ def _compute_drawdown(trades: list, budget: float, window_sec: float, now: float
     return round(peak - trough, 4), round(peak, 4), round(trough, 4)
 
 
+# ── Trend mode: limits and position stores ────────────────────────────────────
+
+def _max_open_trades() -> int:
+    """Open-position cap. Trend mode gives every pair its own fixed slot, exactly
+    as backtest_trend.py simulates, so the cap is the number of pairs — the
+    momentum profiles' MAX_OPEN_TRADES would silently drop the 5th breakout."""
+    if config.TRADING_MODE == "trend":
+        return max(len(config.PAIRS), 1)
+    return config.MAX_OPEN_TRADES
+
+
+def _capital_cap() -> float:
+    """Deployable capital. Trend mode sizes slots as BUDGET / n_pairs, so the whole
+    budget is deployable; MAX_CAPITAL_DEPLOYED belongs to the momentum sizing."""
+    if config.TRADING_MODE == "trend":
+        return config.BUDGET_EUR
+    return config.BUDGET_EUR * config.MAX_CAPITAL_DEPLOYED
+
+
+class _CryptoTrendStore(PositionStore):
+    """Trend positions live in the bot's own dict + positions table, so /positions,
+    /close and the dashboard keep working unchanged."""
+
+    def __init__(self, bot: "TradingBot") -> None:
+        self._bot = bot
+
+    def positions(self) -> dict:
+        with self._bot._positions_lock:
+            return dict(self._bot.positions)
+
+    def save(self, symbol: str, pos: dict) -> None:
+        with self._bot._positions_lock:
+            self._bot.positions[symbol] = pos
+            db.insert_position(symbol, pos)
+
+    def remove(self, symbol: str) -> None:
+        with self._bot._positions_lock:
+            self._bot.positions.pop(symbol, None)
+            db.delete_position(symbol)
+
+    def record_trade(self, trade: dict) -> None:
+        db.insert_trade(trade)
+
+    def gate(self, symbol: str, event: str) -> None:
+        db.insert_gate_event(symbol, "long", event)
+
+
+class _StockTrendStore(PositionStore):
+    """Stock positions and trades live in their own tables (see core/db.py)."""
+
+    def positions(self) -> dict:
+        return db.get_stock_positions()
+
+    def save(self, symbol: str, pos: dict) -> None:
+        db.save_stock_position(symbol, pos)
+
+    def remove(self, symbol: str) -> None:
+        db.delete_stock_position(symbol)
+
+    def record_trade(self, trade: dict) -> None:
+        db.insert_stock_trade(trade)
+
+
 # ── Bot ───────────────────────────────────────────────────────────────────────
 
 class TradingBot:
@@ -247,7 +312,61 @@ class TradingBot:
         self._groq_rejected: dict = {}  # (side, pair) → timestamp of last Groq RIFIUTA
         # Funnel analytics (live only): every strategy gate outcome goes to gate_events.
         strategy_module.set_gate_hook(db.insert_gate_event)
+        self._crypto_trend = TrendTrader(self._crypto_market(), _CryptoTrendStore(self))
+        self._stock_trend = self._build_stock_trader()
         self._register_handlers()
+
+    # ── Trend traders ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _crypto_market(broker: KrakenBroker = None) -> TrendMarket:
+        return TrendMarket(
+            name="crypto",
+            broker=broker or KrakenBroker(),
+            symbols=list(config.PAIRS),
+            budget=config.BUDGET_EUR,
+            execute_orders=not config.PAPER_TRADING,
+            slippage_pct=config.SLIPPAGE_PCT,
+            max_entry_drift=config.TREND_MAX_ENTRY_DRIFT_PCT,
+        )
+
+    def _refresh_crypto_market(self) -> None:
+        """Budget and paper/live can change at runtime (dashboard, profiles):
+        re-read them, keeping the same broker (and its candle cache)."""
+        self._crypto_trend.market = self._crypto_market(self._crypto_trend.market.broker)
+
+    @staticmethod
+    def _build_stock_trader():
+        """TrendTrader for stocks/ETFs on Alpaca paper, or None when disabled.
+        A misconfiguration disables stocks; it never stops the crypto bot."""
+        if not config.STOCKS_ENABLED:
+            return None
+        if config.STOCK_EXECUTION not in ("local", "alpaca_paper"):
+            logger.error("STOCK_EXECUTION=%r non valido (local | alpaca_paper) — azionario "
+                         "disattivato", config.STOCK_EXECUTION)
+            return None
+        try:
+            broker = AlpacaBroker()
+        except BrokerError as exc:
+            logger.error("Azionario disattivato: %s", exc)
+            return None
+        market = TrendMarket(
+            name="stocks",
+            broker=broker,
+            symbols=list(config.STOCK_SYMBOLS),
+            budget=config.STOCK_BUDGET_USD,
+            execute_orders=config.STOCK_EXECUTION == "alpaca_paper",
+            slippage_pct=config.STOCK_SLIPPAGE_PCT,
+            max_entry_drift=config.TREND_MAX_ENTRY_DRIFT_PCT,
+        )
+        return TrendTrader(market, _StockTrendStore())
+
+    async def _send_events(self, events: list) -> None:
+        for text in events:
+            try:
+                await self.app.bot.send_message(chat_id=config.TELEGRAM_CHAT_ID, text=text)
+            except Exception as exc:
+                logger.error("Notifica Telegram fallita: %s", exc)
 
     # ── Handler registration ──────────────────────────────────────────────────
 
@@ -276,6 +395,7 @@ class TradingBot:
         add(CommandHandler("profile",   self._cmd_profile,   filters=auth_filter))
         add(CommandHandler("protections", self._cmd_protections, filters=auth_filter))
         add(CommandHandler("gates",     self._cmd_gates,     filters=auth_filter))
+        add(CommandHandler("stocks",    self._cmd_stocks,    filters=auth_filter))
 
     # ── Commands ──────────────────────────────────────────────────────────────
 
@@ -293,7 +413,8 @@ class TradingBot:
             "/close XYZ  — chiudi posizione su XYZ (es. /close SOLEUR)\n"
             "/ai [N]     — ultime N decisioni Groq (default 5)\n"
             "/discover   — discovery manuale nuove coppie\n"
-            "/profile    — mostra/cambia profilo di rischio\n\n"
+            "/profile    — mostra/cambia profilo di rischio\n"
+            "/stocks     — azionario in paper (posizioni e storico)\n\n"
             f"Profilo: {config.ACTIVE_PROFILE.upper()}  |  "
             f"TP: +{config.TAKE_PROFIT_PCT*100:.0f}%  "
             f"SL: -{config.STOP_LOSS_PCT*100:.0f}%"
@@ -312,12 +433,24 @@ class TradingBot:
         pairs_line = f"Coppie: {', '.join(config.PAIRS)}"
         if extra:
             pairs_line += f"\nDiscovery: {', '.join(extra)}"
+        if config.TRADING_MODE == "trend":
+            decisions_line = (f"Strategia: TREND daily (breakout {config.TREND_BREAKOUT_DAYS}g, "
+                              f"chandelier {config.TREND_CHANDELIER_MULT:g}×ATR) — senza Groq")
+        else:
+            decisions_line = f"Decisioni: Groq AI ({config.GROQ_MODEL})"
+        if self._stock_trend is not None:
+            sm = self._stock_trend.market
+            stocks_line = (f"Azionario PAPER: attivo ({len(sm.symbols)} simboli, "
+                           f"{sm.budget:.0f}$) — /stocks")
+        else:
+            stocks_line = "Azionario PAPER: disattivato"
         await update.message.reply_text(
             f"Sistema: ATTIVO ({mode})\n"
             f"{kraken_line}\n"
             f"Profilo: {config.ACTIVE_PROFILE.upper()}\n"
-            f"Decisioni: Groq AI ({config.GROQ_MODEL})\n"
-            f"Posizioni aperte: {len(self.positions)} / {config.MAX_OPEN_TRADES}\n"
+            f"{decisions_line}\n"
+            f"Posizioni aperte: {len(self.positions)} / {_max_open_trades()}\n"
+            f"{stocks_line}\n"
             f"{pairs_line}\n"
             f"Intervallo scansione: {config.SCAN_INTERVAL_MINUTES} min\n"
             f"TP: +{config.TAKE_PROFIT_PCT*100:.0f}%  "
@@ -637,8 +770,8 @@ class TradingBot:
             logger.error("Cannot reach Kraken status API: %s — skipping scan.", exc)
             return False
 
-        if len(self.positions) >= config.MAX_OPEN_TRADES:
-            logger.info("Max open trades reached (%d), skipping scan.", config.MAX_OPEN_TRADES)
+        if len(self.positions) >= _max_open_trades():
+            logger.info("Max open trades reached (%d), skipping scan.", _max_open_trades())
             return False
 
         if config.PAPER_TRADING:
@@ -655,7 +788,7 @@ class TradingBot:
                 return False
 
         spent       = sum(p["size_eur"] for p in self.positions.values())
-        max_allowed = config.BUDGET_EUR * config.MAX_CAPITAL_DEPLOYED
+        max_allowed = _capital_cap()
         if spent >= max_allowed:
             logger.info("Capital cap raggiunto (%.2f€ / %.2f€) — skip scan.", spent, max_allowed)
             return False
@@ -785,7 +918,7 @@ class TradingBot:
         # scan (Groq, BTC filter, F&G, correlations are momentum machinery —
         # the validated trend backtest uses none of them). ──────────────────
         if config.TRADING_MODE == "trend":
-            return await self._run_trend_scan(available_eur, already_open, long_protected)
+            return await self._run_trend_scan(available_eur, long_protected)
 
         # ── Market context (Fear & Greed, funding rates) ──────────────────────
         mkt_ctx = await asyncio.to_thread(market_data.get_market_context)
@@ -1170,189 +1303,77 @@ class TradingBot:
 
     # ── TREND MODE (daily trend-following) ────────────────────────────────────
 
-    async def _run_trend_scan(self, available_eur: float, already_open: set,
-                              long_protected: bool) -> bool:
-        """Daily trend scan: Donchian breakout + EMA50 entry, one fixed slot per pair.
-
-        Decisions use COMPLETED daily candles (core/trend.py), so re-running the
-        scan within the same day is idempotent. Long-only, as validated.
-        """
-        if long_protected:
-            logger.info("TREND scan: lato long protetto — skip")
-            return False
-
-        slot = round(config.BUDGET_EUR / max(len(config.PAIRS), 1), 2)
-        entered = False
-
-        for pair in config.PAIRS:
-            if pair in already_open or pair in self.positions:
-                continue
-            if len(self.positions) >= config.MAX_OPEN_TRADES:
-                break
-            try:
-                daily = await asyncio.to_thread(_get_ohlc_cached, pair, 1440)
-                dec = trend.evaluate_entry(daily)
-            except Exception as exc:
-                logger.warning("TREND %s: dati daily non disponibili (%s)", pair, exc)
-                continue
-            if dec is None:
-                logger.info("TREND %s: storico daily insufficiente", pair)
-                continue
-            if not dec.enter:
-                logger.info("TREND %s: %s", pair, dec.reason)
-                db.insert_gate_event(pair, "long", "trend_no_breakout")
-                continue
-
-            size_eur = min(slot, available_eur)
-            if size_eur < 10.0:
-                logger.info("TREND %s: capitale insufficiente (%.2f€ < 10€)", pair, size_eur)
-                continue
-
-            db.insert_gate_event(pair, "long", "signal_ok")
-            if await self._execute_trend_entry(pair, dec, size_eur):
-                available_eur -= size_eur
-                already_open.add(pair)
-                entered = True
-            await asyncio.sleep(1)
-
-        return entered
-
-    async def _execute_trend_entry(self, pair: str, dec: "trend.TrendDecision",
-                                   size_eur: float) -> bool:
-        """Market entry for a trend signal. At daily scale the maker saving is
-        noise vs the 20-50% moves being targeted, so no limit/pending lifecycle."""
-        try:
-            ticker = await asyncio.to_thread(kraken_client.get_ticker, pair)
-            price  = float(ticker["ask"])
-            size_crypto = size_eur / price
-
-            if config.PAPER_TRADING:
-                txid = "PAPER"
-            else:
-                vol_str = kraken_client.format_volume(pair, size_crypto)
-                order = await asyncio.to_thread(
-                    kraken_client.add_order, pair, "buy", "market", vol_str,
-                )
-                txids = order.get("txid", [])
-                txid  = txids[0] if txids else "unknown"
-                executed = await asyncio.to_thread(kraken_client.get_executed_price, txid)
-                if executed and executed > 0:
-                    price    = executed
-                    size_eur = round(size_crypto * price, 2)
-
-            stop      = round(trend.chandelier_stop(dec.close, dec.atr), 8)
-            fee_entry = round(size_eur * config.KRAKEN_TAKER_FEE, 4)
-            pos = {
-                "pair":          pair,
-                "side":          "long",
-                "mode":          "trend",
-                "entry":         price,
-                "entry_signal":  dec.close,
-                "size_crypto":   size_crypto,
-                "size_eur":      size_eur,
-                "fee_entry_eur": fee_entry,
-                "take_profit":   round(price * 100, 8),   # sentinel: no TP, winners run
-                "stop_loss":     stop,
-                "trailing_stop": stop,
-                "peak_price":    dec.close,
-                "atr":           dec.atr,
-                "txid":          txid,
-                "opened_at":     time.time(),
-                "order_type":    "market",
-            }
-            with self._positions_lock:
-                self.positions[pair] = pos
-                db.insert_position(pair, pos)
-            db.insert_gate_event(pair, "long", "entry_fill")
-            logger.info("TREND ENTRY %s @%.6f  stop=%.6f  size=%.2f€  TX %s",
-                        pair, price, stop, size_eur, txid)
-            await self.app.bot.send_message(
-                chat_id=config.TELEGRAM_CHAT_ID,
-                text=(f"🌊 TREND ENTRY {pair} LONG @{price:.6f}\n"
-                      f"{dec.reason}\n"
-                      f"Stop chandelier: {stop:.6f}  |  Size: {size_eur:.2f}€\n"
-                      f"Nessun TP — si esce quando il trend muore."),
-            )
-            return True
-        except Exception as exc:
-            logger.error("TREND entry FAILED %s: %s", pair, exc, exc_info=True)
-            return False
-
-    async def _monitor_trend_position(self, pair: str, pos: dict,
-                                      to_close: list, ctx) -> None:
-        """Chandelier exit on completed daily closes (matches backtest semantics):
-        peak ratchets up with each closed day; exit when a daily close drops
-        below peak − TREND_CHANDELIER_MULT × ATR. Stop level is stored in
-        trailing_stop for the dashboard."""
-        daily = await asyncio.to_thread(_get_ohlc_cached, pair, 1440)
-        res = trend.evaluate_exit(daily, pos.get("peak_price") or pos["entry"])
-        if res is None:
-            return
-
-        new_stop = round(res["stop"], 8)
-        if res["peak"] != pos.get("peak_price") or new_stop != pos.get("trailing_stop"):
-            pos["peak_price"]    = res["peak"]
-            pos["trailing_stop"] = new_stop
-            pos["atr"]           = res["atr"]
-            with self._positions_lock:
-                self.positions[pair] = pos
-                db.update_position(pair, pos)
-            logger.info("TREND %s: peak=%.6f  stop=%.6f", pair, res["peak"], new_stop)
-
-        if not res["exit"]:
-            return
-
-        try:
-            ticker  = await asyncio.to_thread(kraken_client.get_ticker, pair)
-            current = float(ticker["bid"])
-        except Exception as exc:
-            logger.error("TREND exit %s: prezzo non disponibile (%s) — riprovo", pair, exc)
-            return
-
-        exit_data = _calc_exit(pos, current, config)
-        try:
-            if config.PAPER_TRADING:
-                suffix = "TX: PAPER"
-            else:
-                vol_str = kraken_client.format_volume(pair, pos["size_crypto"])
-                order = await asyncio.to_thread(
-                    kraken_client.add_order, pair, "sell", "market", vol_str,
-                )
-                txids  = order.get("txid", [])
-                suffix = f"TX: {txids[0] if txids else 'unknown'}"
-        except Exception as exc:
-            logger.error("TREND close FAILED %s: %s — posizione mantenuta, riprovo", pair, exc)
-            await ctx.bot.send_message(
-                chat_id=config.TELEGRAM_CHAT_ID,
-                text=f"🚨 Chiusura TREND {pair} FALLITA — riprovo al prossimo ciclo\n{exc}",
-            )
-            return
-
-        net = exit_data["net_pnl_eur"]
-        icon = "✅" if net >= 0 else "🛑"
-        logger.info("TREND EXIT %s @%.6f  net=%+.2f€ (chandelier: close %.6f < stop %.6f)",
-                    pair, current, net, res["close"], res["stop"])
-        await ctx.bot.send_message(
-            chat_id=config.TELEGRAM_CHAT_ID,
-            text=(f"{icon} TREND EXIT {pair}  {net:+.2f}€ ({exit_data['net_pnl_pct']:+.2f}%)\n"
-                  f"Chandelier: chiusura daily {res['close']:.6f} < stop {res['stop']:.6f}\n"
-                  f"{suffix}"),
+    async def _run_trend_scan(self, available_eur: float, long_protected: bool) -> bool:
+        """Daily trend scan for crypto, run by the shared trend engine
+        (core/trend_engine.py): Donchian breakout + EMA50 entry, one fixed slot
+        per pair, long-only. Decisions use completed daily candles, so re-running
+        within the same day is idempotent."""
+        self._refresh_crypto_market()
+        events = await asyncio.to_thread(
+            self._crypto_trend.scan, available_eur, long_protected,
         )
-        db.insert_trade({
-            "pair": pair, "side": "long",
-            "exit_reason": "chandelier",
-            "entry": pos["entry"], "exit": current,
-            "entry_signal": pos.get("entry_signal"),
-            "size_eur": pos["size_eur"],
-            "gross_pnl_eur": round(exit_data["gross_pnl_eur"], 4),
-            "fee_eur": round(exit_data["fee_entry"] + exit_data["fee_exit"]
-                             + exit_data["slip_eur"] + exit_data["funding_cost"], 4),
-            "pnl_eur": round(net, 4),
-            "pnl_pct": round(exit_data["net_pnl_pct"], 4),
-            "opened_at": pos.get("opened_at"),
-            "closed_at": time.time(),
-        })
-        to_close.append(pair)
+        await self._send_events(events)
+        return bool(events)
+
+    async def _job_stocks(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Stocks/ETFs on Alpaca paper: resolve pending orders and exits, then
+        look for new breakouts. Both are no-ops while the US market is closed."""
+        if self._stock_trend is None:
+            return
+        try:
+            events = await asyncio.to_thread(self._stock_trend.monitor)
+            events += await asyncio.to_thread(self._stock_trend.scan)
+        except Exception as exc:
+            logger.error("Job azionario fallito: %s", exc, exc_info=True)
+            return
+        await self._send_events(events)
+
+    async def _cmd_stocks(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        trader = self._stock_trend
+        if trader is None:
+            await update.message.reply_text(
+                "Azionario disattivato. Imposta STOCKS_ENABLED=true e le chiavi "
+                "ALPACA_API_KEY / ALPACA_API_SECRET nel .env, poi riavvia."
+            )
+            return
+        m = trader.market
+        try:
+            is_open = await asyncio.to_thread(m.broker.is_market_open)
+            session = "aperto" if is_open else "chiuso"
+        except Exception as exc:
+            session = f"non verificabile ({exc})"
+        mode = "ordini su conto paper Alpaca" if m.execute_orders else "fill simulati in locale"
+        lines = [
+            f"Azionario PAPER — {mode}",
+            f"Mercato USA: {session}",
+            f"Budget: {m.budget:.0f}$  ({m.slot:.0f}$ per simbolo)",
+            f"Simboli: {', '.join(m.symbols)}",
+        ]
+        positions = db.get_stock_positions()
+        if not positions:
+            lines.append("\nNessuna posizione aperta.")
+        for symbol, pos in positions.items():
+            if pos.get("pending"):
+                lines.append(f"\n{symbol}: ordine {pos['pending']} in attesa di conferma")
+                continue
+            try:
+                last = (await asyncio.to_thread(m.broker.quote, symbol))["last"]
+                pnl = (last - pos["entry"]) * pos["size_crypto"]
+                pnl_pct = (last - pos["entry"]) / pos["entry"] * 100
+                lines.append(
+                    f"\n{symbol} [LONG]  {pnl_pct:+.2f}%  ({pnl:+.2f}$)\n"
+                    f"  Entry: {pos['entry']:.2f}  |  Now: {last:.2f}  |  "
+                    f"Stop: {pos['trailing_stop']:.2f}"
+                )
+            except Exception as exc:
+                lines.append(f"\n{symbol}: errore recupero prezzo — {exc}")
+        trades = db.get_stock_trades()
+        if trades:
+            wins = sum(1 for t in trades if (t.get("pnl") or 0) > 0)
+            total = sum(t.get("pnl") or 0 for t in trades)
+            lines.append(f"\nTrade chiusi: {len(trades)} ({wins} in utile)  "
+                         f"P&L netto: {total:+.2f}$")
+        await update.message.reply_text("\n".join(lines))
 
     async def _job_monitor_positions(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Check every open position against its TP and SL."""
@@ -1361,12 +1382,17 @@ class TradingBot:
 
         to_close: list[str] = []
 
+        # Trend positions are handled by the shared engine (pending fills and
+        # the chandelier exit); it removes the ones it closes from self.positions.
+        if any(p.get("mode") == "trend" for p in self.positions.values()):
+            self._refresh_crypto_market()
+            try:
+                await self._send_events(await asyncio.to_thread(self._crypto_trend.monitor))
+            except Exception as exc:
+                logger.error("Trend monitor error: %s", exc, exc_info=True)
+
         for pair, pos in list(self.positions.items()):
             if pos.get("mode") == "trend":
-                try:
-                    await self._monitor_trend_position(pair, pos, to_close, ctx)
-                except Exception as exc:
-                    logger.error("Trend monitor error for %s: %s", pair, exc)
                 continue
             try:
                 ticker  = await asyncio.to_thread(kraken_client.get_ticker, pair)
@@ -1505,7 +1531,7 @@ class TradingBot:
             f"REPORT {time.strftime('%d/%m %H:%M')}",
             f"Kraken: {kraken_status.upper()}  |  {'PAPER' if config.PAPER_TRADING else 'LIVE'}  |  {config.ACTIVE_PROFILE.upper()}",
             f"Capitale deployato: {spent:.2f}€ / {config.BUDGET_EUR * config.MAX_CAPITAL_DEPLOYED:.0f}€ max",
-            f"Posizioni aperte: {len(positions)} / {config.MAX_OPEN_TRADES}",
+            f"Posizioni aperte: {len(positions)} / {_max_open_trades()}",
         ]
         if pos_lines:
             lines += pos_lines
@@ -2253,6 +2279,13 @@ class TradingBot:
             first=15,
             name="dashboard_commands",
         )
+        if self._stock_trend is not None:
+            jq.run_repeating(
+                self._job_stocks,
+                interval=300,
+                first=45,
+                name="stocks_trend",
+            )
         jq.run_repeating(
             self._job_reconcile_orders,
             interval=3600,

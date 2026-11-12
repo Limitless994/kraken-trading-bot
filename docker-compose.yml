@@ -3,19 +3,21 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    environment:
+      BOT_DB_PATH: /app/data/trading.db
     volumes:
       - ./logs:/app/logs
-      - ./positions.json:/app/positions.json
-      - ./active_profile.json:/app/active_profile.json
-      - ./dynamic_pairs.json:/app/dynamic_pairs.json
+      - ./data:/app/data          # trading.db: posizioni, trade, impostazioni
 
   dashboard:
     build: .
     restart: unless-stopped
     env_file: .env
+    environment:
+      BOT_DB_PATH: /app/data/trading.db
     command: python dashboard.py
     ports:
       - "8501:8501"
     volumes:
       - ./logs:/app/logs
-      - ./positions.json:/app/positions.json
+      - ./data:/app/data

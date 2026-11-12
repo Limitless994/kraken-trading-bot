@@ -1,18 +1,48 @@
 # Kraken Trading Bot
 
-Bot di trading algoritmico per coppie crypto/EUR su Kraken, con segnali tecnici multi-timeframe, valutazione AI tramite Groq, notifiche e controllo via Telegram.
+Bot di trading algoritmico con notifiche e controllo via Telegram. Due mercati, una sola strategia di default:
 
-## Funzionalità principali
+- **Crypto/EUR su Kraken** (paper o live)
+- **Azioni/ETF USA su Alpaca** — **solo paper**, opzionale
 
-- **Long e Short**: apre posizioni spot (BUY) e a margine (SELL/SHORT) in base alle condizioni di mercato
-- **Analisi tecnica multi-timeframe**: RSI su 15m/1h/4h/Daily, MACD, EMA50, ADX, ATR, volume
-- **Valutazione AI**: ogni segnale viene valutato da un LLM (Groq) che assegna uno score 1-10 e decide la size
-- **Trailing stop**: si attiva solo dopo che il trade è in profitto di almeno `TRAILING_ACTIVATION_ATR × ATR`; la distanza è configurabile separatamente (`TRAILING_DISTANCE_ATR`)
-- **Paper trading**: modalità simulata senza eseguire ordini reali
-- **Profili di rischio**: conservative / moderate / aggressive, cambiabili a runtime via Telegram
-- **Discovery giornaliera**: scansione automatica di tutte le coppie EUR su Kraken per trovare opportunità
-- **Circuit breaker**: blocca automaticamente il trading se le perdite giornaliere superano una soglia
-- **Dashboard web**: interfaccia Flask su `http://localhost:8501`
+## Strategie
+
+| `TRADING_MODE` | Cosa fa | Stato |
+|---|---|---|
+| `trend` (default) | Trend-following daily, long-only: ingresso su breakout delle chiusure a 40 giorni sopra EMA50, uscita con stop chandelier (picco − 3×ATR20). Nessun take profit, nessuna AI. | Attiva |
+| `momentum` | Strategia 1h storica: punteggio RSI/MACD/volume, valutazione Groq, short a margine con leva 5×. | Solo confronto: nei backtest perde in ogni finestra |
+
+Le sezioni "Segnali LONG/SHORT", "Profili di rischio" e "Discovery" più sotto descrivono la modalità `momentum`.
+
+### Cosa dice il backtest della trend mode
+
+`python backtest_trend.py --grid` simula il portafoglio con le stesse funzioni del bot (`core/trend.py`), fill all'apertura del giorno dopo il segnale e costi dello 0,5% per lato. Sui dati crypto 2022-01 → 2026-06, 100€ di budget:
+
+- netto circa **+128€**, contro **−17€** del buy-and-hold delle stesse coppie;
+- **2 anni positivi su 5**: quasi tutto il risultato viene dal 2024;
+- i 5 trade migliori valgono +170€, tutti gli altri insieme −42€;
+- drawdown massimo circa **−74€** dal picco.
+
+È il profilo tipico del trend-following: molte piccole perdite, pochi trade grandi. Non è una garanzia sul futuro, e le coppie sono state scelte col senno di poi.
+
+### Azionario in paper (Alpaca)
+
+Stesse regole trend su ETF USA liquidi (`STOCK_SYMBOLS`), con budget separato in dollari e tabelle separate nel database: non entra nei conti, nelle protezioni né nella dashboard della parte crypto.
+
+1. Crea un account Alpaca gratuito e genera le chiavi **Paper Trading**.
+2. Nel `.env`: `STOCKS_ENABLED=true`, `ALPACA_API_KEY`, `ALPACA_API_SECRET`.
+3. `STOCK_EXECUTION=local` simula i fill nel bot; `alpaca_paper` invia gli ordini al conto paper di Alpaca.
+4. Backtest: `python backtest_trend.py --market stocks --start 2018-01-01` (scarica i dati da Alpaca).
+5. Su Telegram: `/stocks`.
+
+Non esiste una modalità live: `AlpacaBroker` rifiuta qualunque host diverso dall'endpoint paper. Gli ordini partono solo a mercato aperto, sul segnale della chiusura precedente.
+
+### Sicurezza
+
+- `PAPER_TRADING` vale `true` anche se la riga manca dal `.env`: il live richiede `PAPER_TRADING=false` esplicito.
+- La dashboard senza `DASHBOARD_PASSWORD` è in sola lettura; con la password richiede HTTP Basic auth.
+- In trend mode una posizione viene aperta o chiusa solo su fill confermato dal broker.
+- Non c'è uno stop piazzato sull'exchange: l'uscita è decisa dal bot sulla chiusura daily, quindi a bot spento la posizione non è protetta.
 
 ---
 
@@ -21,21 +51,27 @@ Bot di trading algoritmico per coppie crypto/EUR su Kraken, con segnali tecnici 
 ```
 main.py                      # Entry point, logging, crash handler
 dashboard.py                 # Dashboard web (Flask, porta 8501)
+backtest_trend.py            # Backtest di portafoglio della trend mode (crypto e azionario)
 core/
   config.py                  # Tutti i parametri + sistema profili
-  prompts.py                 # Prompt Groq (editabili senza toccare il codice)
+  trend.py                   # Regole trend: ingresso e uscita su candele daily completate
+  trend_engine.py            # TrendTrader: scan, fill, uscite — uguale per ogni mercato
+  broker.py                  # Interfaccia Broker, KrakenBroker, AlpacaBroker (solo paper)
   kraken_client.py           # Wrapper API Kraken (public + private)
-  analyzer.py                # Calcolo indicatori (RSI, MACD, EMA, ADX, ATR)
-  strategy.py                # Generazione segnali LONG e SHORT
-  market_data.py             # Fear & Greed, funding rates, news, mempool
+  db.py                      # SQLite: posizioni, trade, impostazioni (crypto e azionario separati)
+  prompts.py                 # [momentum] Prompt Groq
+  analyzer.py                # [momentum] Indicatori (RSI, MACD, EMA, ADX, ATR)
+  strategy.py                # [momentum] Segnali LONG e SHORT
+  regime.py                  # [momentum] Regime di mercato
+  market_data.py             # [momentum] Fear & Greed, funding rates, news, mempool
 services/
-  groq_evaluator.py          # Valutazione LLM del segnale
-  discovery.py               # Scansione giornaliera di nuove coppie
+  groq_evaluator.py          # [momentum] Valutazione LLM del segnale
+  discovery.py               # [momentum] Scansione giornaliera di nuove coppie
 bot/
-  telegram_bot.py            # Loop principale, scan, ordini, comandi Telegram
+  telegram_bot.py            # Loop principale, job, comandi Telegram, percorso momentum
 ```
 
-### Flusso di una scansione
+### Flusso di una scansione (momentum)
 
 ```
 ogni 15 minuti
@@ -57,7 +93,7 @@ ogni 60 secondi: monitor posizioni → trailing stop, TP, SL → close se necess
 
 ---
 
-## Segnali LONG
+## Segnali LONG (momentum)
 
 **Gate hard (uno solo blocca tutto):**
 | Gate | Condizione |
@@ -82,7 +118,7 @@ ogni 60 secondi: monitor posizioni → trailing stop, TP, SL → close se necess
 
 ---
 
-## Segnali SHORT (margin, leverage 2x)
+## Segnali SHORT (momentum, margine con leva 5×)
 
 **Gate hard:**
 | Gate | Condizione |
@@ -153,6 +189,7 @@ I due circuit breaker sono indipendenti:
 | `/profile <nome>` | Cambia profilo (conservative/moderate/aggressive) |
 | `/profile preview <nome>` | Backtest dry-run di 30 giorni con i parametri del profilo target — **non** cambia il profilo attivo |
 | `/pause` / `/resume` | Sospende/riprende lo scan automatico |
+| `/stocks` | Azionario in paper: stato del mercato, posizioni e storico |
 
 I comandi sono accettati solo dalla chat indicata in `TELEGRAM_CHAT_ID`. Messaggi da altri chat vengono ignorati: chiunque ottenga il token del bot non può comandarlo.
 
@@ -188,7 +225,7 @@ cp .env.example .env
 docker compose up -d
 ```
 
-Il bot e la dashboard partono come servizi separati. I log e lo stato persistono nei volumi montati.
+Il bot e la dashboard partono come servizi separati. I log persistono in `./logs` e il database in `./data/trading.db`.
 
 ### File .env
 
@@ -298,6 +335,7 @@ Lo stato persistente vive in `trading.db` (SQLite, WAL mode). Al primo avvio i v
 | `trading.db` → `groq_decisions` | Decisioni AI (per `/ai` e dashboard) |
 | `trading.db` → `pending_orders` | Limit order in attesa di esecuzione |
 | `trading.db` → `settings` | Profilo attivo + flag vari |
+| `trading.db` → `stock_positions` / `stock_trades` | Azionario in paper (in dollari, separato dal resto) |
 | `dynamic_pairs.json` | Coppie aggiornate dall'ultima discovery |
 | `logs/bot.log` | Log principale |
 | `logs/trading.log` | Scan e ordini |

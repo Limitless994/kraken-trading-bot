@@ -2011,12 +2011,10 @@ class TestTrendMode(unittest.TestCase):
 
     @staticmethod
     def _candles(closes):
-        """Synthetic daily candles + one forming candle (dropped by core.trend)."""
-        out = [{"time": i, "high": c * 1.01, "low": c * 0.99, "close": c}
-               for i, c in enumerate(closes)]
-        out.append({"time": len(closes), "high": closes[-1], "low": closes[-1],
-                    "close": closes[-1]})   # forming candle, must be ignored
-        return out
+        """Synthetic COMPLETED daily candles — the contract of core.trend: brokers
+        drop the forming candle, core.trend drops nothing."""
+        return [{"time": i, "high": c * 1.01, "low": c * 0.99, "close": c}
+                for i, c in enumerate(closes)]
 
     def test_entry_on_breakout_above_ema(self):
         from core import trend
@@ -2078,42 +2076,634 @@ class TestTrendMode(unittest.TestCase):
         self.assertIsNotNone(res)
         self.assertFalse(res["exit"])
 
-    def test_execute_trend_entry_paper(self):
-        import asyncio as _asyncio
-        from unittest.mock import AsyncMock
+    def test_last_candle_is_the_decision_candle(self):
+        """Regression: the live bot decided one day late because the forming candle
+        was dropped twice (kraken_client.get_ohlc AND core.trend). The breakout
+        sits on the LAST candle passed in; it must be seen, not discarded."""
         from core import trend
+        closes = [100.0] * 60 + [120.0]            # breakout on the final close
+        dec = trend.evaluate_entry(self._candles(closes))
+        self.assertTrue(dec.enter)
+        self.assertAlmostEqual(dec.close, 120.0)
+        res = trend.evaluate_exit(self._candles([100.0] * 30 + [60.0]), peak_close=100.0)
+        self.assertTrue(res["exit"])               # crash on the final close exits today
+        self.assertAlmostEqual(res["close"], 60.0)
+
+    def test_trend_caps_follow_pairs_not_profile(self):
+        """Trend mode: one slot per pair and the whole budget deployable, as the
+        backtest assumes — not the momentum profile's MAX_OPEN_TRADES/80% cap."""
         import bot.telegram_bot as tb
-        dec = trend.TrendDecision(enter=True, close=100.0, ema50=95.0,
-                                  breakout_level=99.0, atr=2.0, reason="test breakout")
-        with patch("bot.telegram_bot.Application") as mock_app_cls:
-            mock_app_cls.builder.return_value.token.return_value.build.return_value = MagicMock()
-            bot = tb.TradingBot()
-            bot.app = MagicMock()
-            bot.app.bot.send_message = AsyncMock()
-            inserted = {}
-            prev_paper, prev_mult = config.PAPER_TRADING, config.TREND_CHANDELIER_MULT
-            config.PAPER_TRADING, config.TREND_CHANDELIER_MULT = True, 3.0
-            try:
-                with patch.object(tb.kraken_client, "get_ticker",
-                                  return_value={"ask": 100.0, "bid": 99.5, "last": 100.0}), \
-                     patch.object(tb.db, "insert_position",
-                                  side_effect=lambda p, d: inserted.__setitem__(p, d)), \
-                     patch.object(tb.db, "insert_gate_event"):
-                    ok = _asyncio.run(bot._execute_trend_entry("SOLEUR", dec, 20.0))
-            finally:
-                config.PAPER_TRADING, config.TREND_CHANDELIER_MULT = prev_paper, prev_mult
-            self.assertTrue(ok)
-            self.assertIn("SOLEUR", inserted)
-            pos = inserted["SOLEUR"]
-            self.assertEqual(pos["mode"], "trend")
-            self.assertEqual(pos["side"], "long")
-            self.assertAlmostEqual(pos["stop_loss"], 94.0)       # 100 − 3×2
-            self.assertGreater(pos["take_profit"], pos["entry"] * 50)  # no real TP
+        prev = (config.TRADING_MODE, config.PAIRS, config.MAX_OPEN_TRADES,
+                config.MAX_CAPITAL_DEPLOYED, config.BUDGET_EUR)
+        config.PAIRS = ["A", "B", "C", "D", "E"]
+        config.MAX_OPEN_TRADES, config.MAX_CAPITAL_DEPLOYED, config.BUDGET_EUR = 4, 0.80, 100.0
+        try:
+            config.TRADING_MODE = "trend"
+            self.assertEqual(tb._max_open_trades(), 5)
+            self.assertAlmostEqual(tb._capital_cap(), 100.0)
+            config.TRADING_MODE = "momentum"
+            self.assertEqual(tb._max_open_trades(), 4)
+            self.assertAlmostEqual(tb._capital_cap(), 80.0)
+        finally:
+            (config.TRADING_MODE, config.PAIRS, config.MAX_OPEN_TRADES,
+             config.MAX_CAPITAL_DEPLOYED, config.BUDGET_EUR) = prev
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TREND ENGINE — shared trader (core/trend_engine.py) against a fake broker
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from core import broker as broker_module
+from core.broker import DEAD, FILLED, OPEN, UNKNOWN, AlpacaBroker, BrokerError, Fill, KrakenBroker
+from core.trend_engine import PositionStore, TrendMarket, TrendTrader
+
+
+def _daily(closes):
+    return [{"time": i, "high": c * 1.01, "low": c * 0.99, "close": c}
+            for i, c in enumerate(closes)]
+
+
+_BREAKOUT = _daily([100.0] * 60 + [120.0])     # last close breaks the 40d high
+_FLAT     = _daily([100.0] * 61)
+_CRASH    = _daily([100.0] * 60 + [120.0, 60.0])
+
+
+class _FakeBroker(broker_module.Broker):
+    name, currency, fee_rate, min_order = "fake", "EUR", 0.004, 10.0
+
+    def __init__(self, candles, price=120.0, market_open=True):
+        self.candles = dict(candles)
+        self.price = price
+        self.market_open = market_open
+        self.fills = []            # queue of Fill returned by order_fill
+        self.orders = []           # (side, symbol, qty)
+
+    def daily_candles(self, symbol):
+        return self.candles[symbol]
+
+    def quote(self, symbol):
+        return {"bid": self.price, "ask": self.price, "last": self.price}
+
+    def is_market_open(self):
+        return self.market_open
+
+    def market_buy(self, symbol, qty):
+        self.orders.append(("buy", symbol, qty))
+        return f"B{len(self.orders)}"
+
+    def market_sell(self, symbol, qty):
+        self.orders.append(("sell", symbol, qty))
+        return f"S{len(self.orders)}"
+
+    def order_fill(self, order_id, wait_s=5.0):
+        return self.fills.pop(0) if self.fills else Fill(UNKNOWN)
+
+
+class _MemStore(PositionStore):
+    def __init__(self):
+        self.pos, self.trades, self.gates = {}, [], []
+
+    def positions(self):
+        return dict(self.pos)
+
+    def save(self, symbol, pos):
+        self.pos[symbol] = pos
+
+    def remove(self, symbol):
+        self.pos.pop(symbol, None)
+
+    def record_trade(self, trade):
+        self.trades.append(trade)
+
+    def gate(self, symbol, event):
+        self.gates.append((symbol, event))
+
+
+def _trader(broker, symbols=("AAA",), budget=100.0, execute=False, drift=0.05):
+    store = _MemStore()
+    market = TrendMarket(name="test", broker=broker, symbols=list(symbols), budget=budget,
+                         execute_orders=execute, slippage_pct=0.001, max_entry_drift=drift)
+    return TrendTrader(market, store), store
+
+
+class TestTrendEngine(unittest.TestCase):
+
+    def setUp(self):
+        self._prev = (config.TREND_BREAKOUT_DAYS, config.TREND_EMA_DAYS,
+                      config.TREND_ATR_DAYS, config.TREND_CHANDELIER_MULT)
+        (config.TREND_BREAKOUT_DAYS, config.TREND_EMA_DAYS,
+         config.TREND_ATR_DAYS, config.TREND_CHANDELIER_MULT) = 40, 50, 20, 3.0
+
+    def tearDown(self):
+        (config.TREND_BREAKOUT_DAYS, config.TREND_EMA_DAYS,
+         config.TREND_ATR_DAYS, config.TREND_CHANDELIER_MULT) = self._prev
+
+    def test_simulated_entry_opens_position_without_orders(self):
+        b = _FakeBroker({"AAA": _BREAKOUT})
+        t, store = _trader(b)
+        events = t.scan()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(b.orders, [])                       # paper: nothing sent
+        pos = store.pos["AAA"]
+        self.assertEqual((pos["mode"], pos["side"], pos["txid"]), ("trend", "long", "PAPER"))
+        self.assertAlmostEqual(pos["size_eur"], 100.0)
+        self.assertIsNone(pos["pending"])
+        self.assertGreater(pos["take_profit"], pos["entry"] * 50)   # no real TP
+        self.assertLess(pos["stop_loss"], 120.0)
+        self.assertIn(("AAA", "entry_fill"), store.gates)
+
+    def test_no_breakout_no_entry(self):
+        t, store = _trader(_FakeBroker({"AAA": _FLAT}, price=100.0))
+        self.assertEqual(t.scan(), [])
+        self.assertEqual(store.pos, {})
+        self.assertIn(("AAA", "trend_no_breakout"), store.gates)
+
+    def test_slot_is_budget_over_symbols_and_all_slots_fill(self):
+        syms = ["A", "B", "C", "D", "E"]
+        t, store = _trader(_FakeBroker({s: _BREAKOUT for s in syms}), symbols=syms)
+        self.assertEqual(len(t.scan()), 5)                   # all five, not four
+        self.assertTrue(all(abs(p["size_eur"] - 20.0) < 1e-6 for p in store.pos.values()))
+
+    def test_available_caps_spending(self):
+        syms = ["A", "B", "C"]
+        t, store = _trader(_FakeBroker({s: _BREAKOUT for s in syms}), symbols=syms, budget=90.0)
+        t.scan(available=45.0)                               # room for 30 + 15
+        self.assertEqual(sorted(store.pos), ["A", "B"])
+        self.assertAlmostEqual(store.pos["B"]["size_eur"], 15.0)
+
+    def test_blocked_and_closed_market_do_nothing(self):
+        t, store = _trader(_FakeBroker({"AAA": _BREAKOUT}))
+        self.assertEqual(t.scan(blocked=True), [])
+        t2, store2 = _trader(_FakeBroker({"AAA": _BREAKOUT}, market_open=False))
+        self.assertEqual(t2.scan(), [])
+        self.assertEqual((store.pos, store2.pos), ({}, {}))
+
+    def test_entry_skipped_when_price_ran_away_from_signal(self):
+        b = _FakeBroker({"AAA": _BREAKOUT}, price=120.0 * 1.06)   # +6% > 5% drift
+        t, store = _trader(b)
+        self.assertEqual(t.scan(), [])
+        self.assertIn(("AAA", "trend_entry_drift"), store.gates)
+
+    def test_existing_position_is_not_reentered(self):
+        b = _FakeBroker({"AAA": _BREAKOUT})
+        t, store = _trader(b)
+        t.scan()
+        self.assertEqual(t.scan(), [])                       # idempotent within the day
+
+    def test_real_entry_uses_confirmed_fill(self):
+        b = _FakeBroker({"AAA": _BREAKOUT})
+        b.fills = [Fill(FILLED, price=121.0, qty=0.8)]
+        t, store = _trader(b, execute=True)
+        t.scan()
+        pos = store.pos["AAA"]
+        self.assertEqual(len(b.orders), 1)
+        self.assertAlmostEqual(pos["entry"], 121.0)
+        self.assertAlmostEqual(pos["size_crypto"], 0.8)
+        self.assertAlmostEqual(pos["fee_entry_eur"], round(96.8 * 0.004, 4))
+        self.assertIsNone(pos["pending"])
+
+    def test_dead_entry_order_opens_nothing(self):
+        b = _FakeBroker({"AAA": _BREAKOUT})
+        b.fills = [Fill(DEAD)]
+        t, store = _trader(b, execute=True)
+        events = t.scan()
+        self.assertEqual(store.pos, {})
+        self.assertIn("annullato", events[0])
+
+    def test_unconfirmed_entry_is_pending_then_resolved(self):
+        b = _FakeBroker({"AAA": _BREAKOUT})
+        b.fills = [Fill(OPEN)]
+        t, store = _trader(b, execute=True)
+        t.scan()
+        self.assertEqual(store.pos["AAA"]["pending"], "entry")
+        b.fills = [Fill(UNKNOWN)]
+        self.assertEqual(t.monitor(), [])                    # still unknown: keep waiting
+        self.assertEqual(store.pos["AAA"]["pending"], "entry")
+        b.fills = [Fill(FILLED, price=119.0, qty=0.84)]
+        t.monitor()
+        self.assertIsNone(store.pos["AAA"]["pending"])
+        self.assertAlmostEqual(store.pos["AAA"]["entry"], 119.0)
+        self.assertEqual(len(b.orders), 1)                   # never re-sent
+
+    def test_unconfirmed_entry_that_dies_is_removed(self):
+        b = _FakeBroker({"AAA": _BREAKOUT})
+        b.fills = [Fill(OPEN)]
+        t, store = _trader(b, execute=True)
+        t.scan()
+        b.fills = [Fill(DEAD)]
+        t.monitor()
+        self.assertEqual(store.pos, {})
+
+    def test_simulated_exit_books_trade_net_of_costs(self):
+        b = _FakeBroker({"AAA": _BREAKOUT})
+        t, store = _trader(b)
+        t.scan()
+        qty = store.pos["AAA"]["size_crypto"]
+        b.candles["AAA"], b.price = _CRASH, 60.0
+        events = t.monitor()
+        self.assertEqual(store.pos, {})
+        tr = store.trades[0]
+        self.assertEqual(tr["exit_reason"], "chandelier")
+        gross = (60.0 - 120.0) * qty
+        costs = 100.0 * 0.004 + 60.0 * qty * 0.004 + 100.0 * 0.001 * 2
+        self.assertAlmostEqual(tr["gross_pnl_eur"], gross, places=3)
+        self.assertAlmostEqual(tr["pnl_eur"], gross - costs, places=3)
+        self.assertIn("TREND EXIT", events[0])
+
+    def test_no_exit_while_trend_holds_and_peak_ratchets(self):
+        b = _FakeBroker({"AAA": _BREAKOUT})
+        t, store = _trader(b)
+        t.scan()
+        b.candles["AAA"] = _daily([100.0] * 60 + [120.0, 130.0])
+        self.assertEqual(t.monitor(), [])
+        self.assertAlmostEqual(store.pos["AAA"]["peak_price"], 130.0)
+
+    def test_exit_waits_for_market_open(self):
+        b = _FakeBroker({"AAA": _BREAKOUT})
+        t, store = _trader(b)
+        t.scan()
+        b.candles["AAA"], b.price, b.market_open = _CRASH, 60.0, False
+        self.assertEqual(t.monitor(), [])
+        self.assertIn("AAA", store.pos)
+        b.market_open = True
+        t.monitor()
+        self.assertEqual(store.pos, {})
+
+    def test_real_exit_uses_confirmed_fill_and_no_slippage_estimate(self):
+        b = _FakeBroker({"AAA": _BREAKOUT})
+        b.fills = [Fill(FILLED, price=120.0, qty=0.5)]
+        t, store = _trader(b, execute=True)
+        t.scan()
+        b.candles["AAA"] = _CRASH
+        b.fills = [Fill(FILLED, price=59.0, qty=0.5)]
+        t.monitor()
+        tr = store.trades[0]
+        self.assertAlmostEqual(tr["exit"], 59.0)
+        fees = 60.0 * 0.004 + 59.0 * 0.5 * 0.004
+        self.assertAlmostEqual(tr["pnl_eur"], (59.0 - 120.0) * 0.5 - fees, places=3)
+
+    def test_unconfirmed_exit_is_never_sold_twice(self):
+        b = _FakeBroker({"AAA": _BREAKOUT})
+        b.fills = [Fill(FILLED, price=120.0, qty=0.5)]
+        t, store = _trader(b, execute=True)
+        t.scan()
+        b.candles["AAA"] = _CRASH
+        b.fills = [Fill(UNKNOWN)]
+        t.monitor()
+        self.assertEqual(store.pos["AAA"]["pending"], "exit")
+        b.fills = [Fill(OPEN)]
+        t.monitor()                                           # must not sell again
+        self.assertEqual([o[0] for o in b.orders], ["buy", "sell"])
+        b.fills = [Fill(FILLED, price=58.0, qty=0.5)]
+        t.monitor()
+        self.assertEqual(store.pos, {})
+        self.assertAlmostEqual(store.trades[0]["exit"], 58.0)
+
+    def test_dead_exit_order_keeps_position_and_retries(self):
+        b = _FakeBroker({"AAA": _BREAKOUT})
+        b.fills = [Fill(FILLED, price=120.0, qty=0.5)]
+        t, store = _trader(b, execute=True)
+        t.scan()
+        b.candles["AAA"] = _CRASH
+        b.fills = [Fill(DEAD)]
+        t.monitor()
+        self.assertIn("AAA", store.pos)
+        self.assertIsNone(store.pos["AAA"].get("pending"))
+        b.fills = [Fill(FILLED, price=58.0, qty=0.5)]
+        t.monitor()
+        self.assertEqual(store.pos, {})
+        self.assertEqual([o[0] for o in b.orders], ["buy", "sell", "sell"])
+
+    def test_failed_sell_keeps_position(self):
+        b = _FakeBroker({"AAA": _BREAKOUT})
+        b.fills = [Fill(FILLED, price=120.0, qty=0.5)]
+        t, store = _trader(b, execute=True)
+        t.scan()
+        b.candles["AAA"] = _CRASH
+        b.market_sell = MagicMock(side_effect=BrokerError("boom"))
+        events = t.monitor()
+        self.assertIn("AAA", store.pos)
+        self.assertIn("FALLITA", events[0])
+
+    def test_non_trend_positions_are_left_alone(self):
+        b = _FakeBroker({"AAA": _CRASH}, price=60.0)
+        t, store = _trader(b)
+        store.pos["AAA"] = {"mode": None, "side": "short", "entry": 100.0,
+                            "size_crypto": 1.0, "size_eur": 100.0, "stop_loss": 1.0}
+        self.assertEqual(t.monitor(), [])                    # legacy momentum position
+        self.assertEqual(t.scan(), [])                       # and no second entry on it
+        self.assertEqual(store.trades, [])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BROKERS — Kraken adapter and Alpaca (paper only), HTTP mocked
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _Resp:
+    def __init__(self, payload, status=200):
+        self._payload, self.status_code, self.text = payload, status, json.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+
+class _AlpacaHTTP:
+    """Fake requests.Session routing by URL suffix."""
+    def __init__(self, routes):
+        self.routes, self.calls = routes, []
+
+    def request(self, method, url, headers=None, timeout=None, **kw):
+        self.calls.append((method, url, kw, headers))
+        for suffix, payload in self.routes.items():
+            if url.endswith(suffix):
+                value = payload(kw) if callable(payload) else payload
+                return value if isinstance(value, _Resp) else _Resp(value)
+        return _Resp({"message": "not found"}, 404)
+
+
+def _bars(dates):
+    return [{"t": f"{d}T05:00:00Z", "o": 10, "h": 11, "l": 9, "c": 10.5, "v": 1000}
+            for d in dates]
+
+
+class TestAlpacaBroker(unittest.TestCase):
+
+    def _broker(self, routes):
+        http = _AlpacaHTTP(routes)
+        return AlpacaBroker(key="k", secret="s", session=http, feed="iex"), http
+
+    def test_refuses_any_non_paper_host(self):
+        for url in ("https://api.alpaca.markets", "https://evil.example", "http://paper-api.alpaca.markets"):
+            with self.assertRaises(BrokerError):
+                AlpacaBroker(key="k", secret="s", trading_url=url, session=_AlpacaHTTP({}))
+
+    def test_missing_keys_raise(self):
+        with self.assertRaises(BrokerError):
+            AlpacaBroker(key="", secret="", session=_AlpacaHTTP({}))
+
+    def test_forming_bar_dropped_while_market_open(self):
+        b, _ = self._broker({
+            "/v2/clock": {"timestamp": "2026-11-12T10:30:00-05:00", "is_open": True},
+            "/bars": {"bars": _bars(["2026-11-10", "2026-11-11", "2026-11-12"]),
+                      "next_page_token": None},
+        })
+        candles = b.daily_candles("SPY")
+        self.assertEqual([c["date"] for c in candles], ["2026-11-10", "2026-11-11"])
+        self.assertAlmostEqual(candles[-1]["close"], 10.5)
+
+    def test_todays_bar_kept_after_the_close(self):
+        b, _ = self._broker({
+            "/v2/clock": {"timestamp": "2026-11-12T18:00:00-05:00", "is_open": False,
+                          "next_open": "2026-11-13T09:30:00-05:00"},
+            "/bars": {"bars": _bars(["2026-11-11", "2026-11-12"]), "next_page_token": None},
+        })
+        self.assertEqual(b.daily_candles("SPY")[-1]["date"], "2026-11-12")
+
+    def test_todays_bar_dropped_before_the_open(self):
+        b, _ = self._broker({
+            "/v2/clock": {"timestamp": "2026-11-12T08:00:00-05:00", "is_open": False,
+                          "next_open": "2026-11-12T09:30:00-05:00"},
+            "/bars": {"bars": _bars(["2026-11-11", "2026-11-12"]), "next_page_token": None},
+        })
+        self.assertEqual(b.daily_candles("SPY")[-1]["date"], "2026-11-11")
+
+    def test_bars_request_is_adjusted_daily_on_configured_feed_and_cached(self):
+        b, http = self._broker({
+            "/v2/clock": {"timestamp": "2026-11-12T18:00:00-05:00", "is_open": False},
+            "/bars": {"bars": _bars(["2026-11-12"]), "next_page_token": None},
+        })
+        b.daily_candles("SPY"); b.daily_candles("SPY")
+        bar_calls = [c for c in http.calls if c[1].endswith("/bars")]
+        self.assertEqual(len(bar_calls), 1)                  # second call served from cache
+        params = bar_calls[0][2]["params"]
+        self.assertEqual((params["timeframe"], params["adjustment"], params["feed"]),
+                         ("1Day", "all", "iex"))
+        self.assertTrue(bar_calls[0][1].startswith("https://data.alpaca.markets/v2/stocks/SPY/"))
+        self.assertEqual(bar_calls[0][3]["APCA-API-KEY-ID"], "k")
+
+    def test_bars_pagination(self):
+        pages = [{"bars": _bars(["2026-11-10"]), "next_page_token": "tok"},
+                 {"bars": _bars(["2026-11-11"]), "next_page_token": None}]
+        b, _ = self._broker({
+            "/v2/clock": {"timestamp": "2026-11-12T18:00:00-05:00", "is_open": False},
+            "/bars": lambda kw: pages.pop(0),
+        })
+        self.assertEqual(len(b.daily_candles("SPY")), 2)
+
+    def test_orders_go_to_paper_as_market_day(self):
+        b, http = self._broker({"/v2/orders": {"id": "ord-1", "status": "accepted"}})
+        self.assertEqual(b.market_buy("SPY", 0.123456789), "ord-1")
+        method, url, kw, _ = http.calls[-1]
+        self.assertEqual((method, url), ("POST", "https://paper-api.alpaca.markets/v2/orders"))
+        self.assertEqual(kw["json"], {"symbol": "SPY", "qty": "0.123457", "side": "buy",
+                                      "type": "market", "time_in_force": "day"})
+
+    def test_order_fill_states(self):
+        b, _ = self._broker({"/v2/orders/a": {"status": "filled", "filled_qty": "2",
+                                               "filled_avg_price": "501.5"},
+                             "/v2/orders/b": {"status": "rejected", "filled_qty": "0"},
+                             "/v2/orders/c": {"status": "accepted", "filled_qty": "0"}})
+        f = b.order_fill("a", wait_s=0)
+        self.assertEqual((f.status, f.price, f.qty), (FILLED, 501.5, 2.0))
+        self.assertEqual(b.order_fill("b", wait_s=0).status, DEAD)
+        self.assertEqual(b.order_fill("c", wait_s=0).status, OPEN)
+        self.assertEqual(b.order_fill("missing", wait_s=0).status, UNKNOWN)
+
+    def test_http_error_raises(self):
+        b, _ = self._broker({"/v2/account": _Resp({"message": "forbidden"}, 403)})
+        with self.assertRaises(BrokerError):
+            b.cash()
+
+    def test_quote_uses_last_trade(self):
+        b, _ = self._broker({"/trades/latest": {"symbol": "SPY", "trade": {"p": 600.25}}})
+        self.assertEqual(b.quote("SPY"), {"bid": 600.25, "ask": 600.25, "last": 600.25})
+
+
+class TestKrakenBroker(unittest.TestCase):
+
+    def test_daily_candles_refetch_across_a_daily_close(self):
+        """The shared OHLC cache keeps daily data for 4h; the broker must not
+        serve a series that is missing the day that has just closed."""
+        day = 86400
+        now = 1_800_000_000.0
+        last_done = (int(now) // day - 1) * day
+        stale = [{"time": last_done - day, "close": 1.0}]
+        fresh = stale + [{"time": last_done, "close": 2.0}]
+        b = KrakenBroker()
+        with patch("core.broker.time.time", return_value=now), \
+             patch.object(broker_module.kraken_client, "get_ohlc", side_effect=[stale, fresh]) as g:
+            self.assertEqual(b.daily_candles("XBTEUR"), stale)
+            self.assertEqual(b.daily_candles("XBTEUR"), stale)      # throttled refetch
+            self.assertEqual(g.call_count, 1)
+        with patch("core.broker.time.time", return_value=now + 601), \
+             patch.object(broker_module.kraken_client, "get_ohlc", return_value=fresh) as g:
+            self.assertEqual(b.daily_candles("XBTEUR"), fresh)      # refetched
+            self.assertEqual(b.daily_candles("XBTEUR"), fresh)      # now up to date: cached
+            self.assertEqual(g.call_count, 1)
+
+    def test_order_fill_maps_kraken_statuses(self):
+        b = KrakenBroker()
+        cases = [({"status": "closed", "vol_exec": "0.5", "price": "100"}, FILLED),
+                 ({"status": "canceled", "vol_exec": "0", "price": "0"}, DEAD),
+                 ({"status": "open", "vol_exec": "0"}, OPEN)]
+        for order, expected in cases:
+            with patch.object(broker_module.kraken_client, "query_orders",
+                              return_value={"TX": order}):
+                self.assertEqual(b.order_fill("TX", wait_s=0).status, expected)
+        with patch.object(broker_module.kraken_client, "query_orders",
+                          side_effect=RuntimeError("down")):
+            self.assertEqual(b.order_fill("TX", wait_s=0).status, UNKNOWN)
+
+    def test_market_order_without_txid_raises(self):
+        b = KrakenBroker()
+        with patch.object(broker_module.kraken_client, "add_order", return_value={}), \
+             patch.object(broker_module.kraken_client, "format_volume", return_value="1"):
+            with self.assertRaises(BrokerError):
+                b.market_buy("XBTEUR", 1.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SAFETY DEFAULTS — paper by default, dashboard not open on the LAN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSafetyDefaults(unittest.TestCase):
+
+    def _paper_flag(self, value):
+        import subprocess
+        env = dict(os.environ)
+        env.pop("PAPER_TRADING", None)
+        if value is not None:
+            env["PAPER_TRADING"] = value
+        root = Path(__file__).parent
+        # load_dotenv does not override real env vars; an empty one pins "unset".
+        code = ("import os,sys; sys.path.insert(0, %r); "
+                "import dotenv; dotenv.load_dotenv = lambda *a, **k: False; "
+                "from core import config; print(config.PAPER_TRADING)" % str(root))
+        out = subprocess.run([sys.executable, "-c", code], env=env, cwd=tempfile.gettempdir(),
+                             capture_output=True, text=True)
+        return out.stdout.strip().splitlines()[-1]
+
+    def test_paper_is_the_default_and_live_needs_explicit_false(self):
+        self.assertEqual(self._paper_flag(None), "True")     # variable missing
+        self.assertEqual(self._paper_flag("ture"), "True")   # typo must not go live
+        self.assertEqual(self._paper_flag("true"), "True")
+        self.assertEqual(self._paper_flag("false"), "False")
+
+    def test_dashboard_read_only_without_password(self):
+        import dashboard
+        prev = config.DASHBOARD_PASSWORD
+        config.DASHBOARD_PASSWORD = ""
+        try:
+            with patch.object(dashboard, "_queue_command") as q:
+                resp = dashboard.app.test_client().post("/action/restart")
+            self.assertEqual(resp.status_code, 403)
+            q.assert_not_called()
+        finally:
+            config.DASHBOARD_PASSWORD = prev
+
+    def test_dashboard_requires_basic_auth_when_password_set(self):
+        import base64
+        import dashboard
+        prev = config.DASHBOARD_PASSWORD
+        config.DASHBOARD_PASSWORD = "s3cret"
+        client = dashboard.app.test_client()
+        hdr = lambda pw: {"Authorization": "Basic " + base64.b64encode(f"u:{pw}".encode()).decode()}
+        try:
+            with patch.object(dashboard, "_queue_command") as q:
+                self.assertEqual(client.post("/action/restart").status_code, 401)
+                self.assertEqual(client.post("/action/restart", headers=hdr("wrong")).status_code, 401)
+                self.assertEqual(client.get("/api/balance").status_code, 401)
+                q.assert_not_called()
+                ok = client.post("/action/restart", headers=hdr("s3cret"))
+                self.assertEqual(ok.status_code, 302)
+                q.assert_called_once()
+        finally:
+            config.DASHBOARD_PASSWORD = prev
+
+
+class TestStockStore(unittest.TestCase):
+
+    def test_stock_positions_and_trades_roundtrip_apart_from_crypto(self):
+        from core import db
+        tmp = Path(tempfile.mkdtemp())
+        prev = db.DB_PATH
+        db.DB_PATH = tmp / "t.db"
+        try:
+            db.init_db()
+            db.save_stock_position("SPY", {"entry": 600.0, "size_crypto": 0.2, "pending": None})
+            self.assertEqual(db.get_stock_positions()["SPY"]["entry"], 600.0)
+            self.assertEqual(db.get_positions(), {})          # crypto table untouched
+            db.insert_stock_trade({"pair": "SPY", "currency": "USD", "entry": 600.0,
+                                   "exit": 630.0, "qty": 0.2, "size_eur": 120.0,
+                                   "gross_pnl_eur": 6.0, "fee_eur": 0.12, "pnl_eur": 5.88,
+                                   "pnl_pct": 4.9, "exit_reason": "chandelier",
+                                   "opened_at": 1.0, "closed_at": 2.0})
+            tr = db.get_stock_trades()
+            self.assertEqual((tr[0]["symbol"], tr[0]["pnl"], tr[0]["currency"]),
+                             ("SPY", 5.88, "USD"))
+            self.assertEqual(db.get_trades(), [])             # crypto trades untouched
+            db.delete_stock_position("SPY")
+            self.assertEqual(db.get_stock_positions(), {})
+        finally:
+            db.DB_PATH = prev
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RUNNER
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKTEST TREND — the simulation must not see the future
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTrendBacktest(unittest.TestCase):
+    """backtest_trend.simulate: a close decides, the NEXT open fills."""
+
+    @staticmethod
+    def _series(closes, opens=None):
+        out = []
+        for i, c in enumerate(closes):
+            o = opens[i] if opens else (closes[i - 1] if i else c)
+            out.append({"time": 1_600_000_000 + i * 86400, "open": o,
+                        "high": max(o, c) + 1, "low": min(o, c) - 1, "close": c})
+        return out
+
+    def _run(self, candles, drift=0.05, cost=0.0):
+        import backtest_trend as bt
+        start = bt._day(candles[0])
+        return bt.simulate({"AAA": candles}, start, 100.0, cost, drift), bt
+
+    def test_entry_fills_at_next_open_not_signal_close(self):
+        # Flat at 100, breakout close of 110 on the last-but-one day, next open 111.
+        closes = [100.0] * 60 + [110.0, 112.0]
+        opens = [100.0] * 60 + [100.0, 111.0]
+        res, bt = self._run(self._series(closes, opens))
+        self.assertEqual(len(res["trades"]), 1)
+        t = res["trades"][0]
+        self.assertTrue(t["still_open"])
+        self.assertEqual(t["open"], bt._day(self._series(closes, opens)[61]))
+        # 100 budget / fill 111 shares, marked at 112 → +100/111
+        self.assertAlmostEqual(t["pnl"], 100.0 / 111.0 * (112.0 - 111.0), places=6)
+
+    def test_breakout_on_last_day_is_not_traded(self):
+        # The signal exists but there is no next open to fill it: no trade.
+        closes = [100.0] * 60 + [110.0]
+        res, _ = self._run(self._series(closes))
+        self.assertEqual(res["trades"], [])
+
+    def test_entry_skipped_when_open_gaps_beyond_drift(self):
+        closes = [100.0] * 60 + [110.0, 125.0]
+        opens = [100.0] * 60 + [100.0, 120.0]       # +9% over the 110 signal
+        res, _ = self._run(self._series(closes, opens), drift=0.05)
+        self.assertEqual(res["trades"], [])
+        self.assertEqual(res["skipped_drift"], 1)
+
+    def test_max_drawdown(self):
+        import backtest_trend as bt
+        dd = bt.max_drawdown([("d1", 0.0), ("d2", 50.0), ("d3", 20.0), ("d4", 60.0), ("d5", 45.0)])
+        self.assertEqual(dd, (30.0, "d2", "d3"))
 
 if __name__ == "__main__":
     loader = unittest.TestLoader()
@@ -2136,6 +2726,9 @@ if __name__ == "__main__":
         TestTrailingStopBreakEven, TestTrailingCostBuffer,
         TestPerSideThresholds, TestLimitEntry, TestProtections,
         TestGateEvents, TestRegime, TestTrendMode,
+        TestTrendEngine, TestAlpacaBroker, TestKrakenBroker,
+        TestSafetyDefaults, TestStockStore,
+        TestTrendBacktest,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
