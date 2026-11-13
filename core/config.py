@@ -15,7 +15,9 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL        = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-PAPER_TRADING     = os.getenv("PAPER_TRADING", "false").lower() == "true"
+# Safe default: a missing/mistyped PAPER_TRADING must never mean "trade real money".
+# Live trading requires PAPER_TRADING=false written explicitly in .env.
+PAPER_TRADING     = os.getenv("PAPER_TRADING", "true").lower() != "false"
 
 # ── Budget & position sizing ──────────────────────────────────────────────────
 BUDGET_EUR           = float(os.getenv("BUDGET_EUR", "100"))
@@ -62,6 +64,58 @@ ENTRY_FILL_TIMEOUT_SEC = int(os.getenv("ENTRY_FILL_TIMEOUT_SEC", "180"))
 ENTRY_FALLBACK_MARKET        = os.getenv("ENTRY_FALLBACK_MARKET", "true").lower() == "true"
 ENTRY_FALLBACK_MAX_DRIFT_PCT = float(os.getenv("ENTRY_FALLBACK_MAX_DRIFT_PCT", "0.005"))
 
+# ── Trading mode ──────────────────────────────────────────────────────────────
+# "trend"    = daily trend-following (Donchian breakout + EMA50, chandelier exit).
+#              Long-only, no Groq, no TP: winners run. ~1.5 trades/month.
+#              Evidence: `python backtest_trend.py` (portfolio-level, same rules
+#              as live). On 2022-01 → 2026-06 crypto data it nets about +130€ per
+#              100€ against −18€ for buy-and-hold, BUT the result is carried by a
+#              handful of trades (the best 5 make more than the whole total), only
+#              2 of 5 calendar years are clearly positive, and the drawdown from
+#              the equity peak reaches ~75€. Read the report before trusting it.
+# "momentum" = legacy 1h scoring strategy (RSI/MACD/volume + Groq). Walk-forward:
+#              0/18 windows positive — kept for comparison only.
+TRADING_MODE          = os.getenv("TRADING_MODE", "trend")
+TREND_BREAKOUT_DAYS   = int(os.getenv("TREND_BREAKOUT_DAYS", "40"))
+TREND_EMA_DAYS        = int(os.getenv("TREND_EMA_DAYS", "50"))
+TREND_ATR_DAYS        = int(os.getenv("TREND_ATR_DAYS", "20"))
+TREND_CHANDELIER_MULT = float(os.getenv("TREND_CHANDELIER_MULT", "3.0"))
+# Skip a trend entry when the ask is more than this above the signal's daily
+# close (the bot was down, or the market gapped): not the trade that was tested.
+TREND_MAX_ENTRY_DRIFT_PCT = float(os.getenv("TREND_MAX_ENTRY_DRIFT_PCT", "0.05"))
+
+# ── Stocks / ETFs (Alpaca, PAPER ONLY) ────────────────────────────────────────
+# Same trend rules as crypto, run by a second TrendTrader on US-listed symbols.
+# Off by default. Needs a (free) Alpaca account for market data even in "local"
+# execution. There is no live mode: core/broker.AlpacaBroker refuses any host
+# other than Alpaca's paper endpoint.
+STOCKS_ENABLED     = os.getenv("STOCKS_ENABLED", "false").lower() == "true"
+ALPACA_API_KEY     = os.getenv("ALPACA_API_KEY", "")
+ALPACA_API_SECRET  = os.getenv("ALPACA_API_SECRET", "")
+# "iex" is the only real-time feed on Alpaca's free plan (a subset of US volume:
+# fine for daily bars on liquid ETFs). "sip" needs a paid data subscription.
+ALPACA_DATA_FEED   = os.getenv("ALPACA_DATA_FEED", "iex")
+# "local"        = fills simulated by the bot at the last price, no orders sent.
+# "alpaca_paper" = orders sent to the Alpaca paper account (simulated money).
+STOCK_EXECUTION    = os.getenv("STOCK_EXECUTION", "local")
+STOCK_BUDGET_USD   = float(os.getenv("STOCK_BUDGET_USD", "1000"))
+# Liquid, diversified ETFs (US large/tech/small caps, developed/emerging ex-US,
+# gold, long Treasuries, energy). A starting universe, not a recommendation.
+# PAPER ONLY in practice: EU retail clients cannot buy US-domiciled ETFs live
+# (PRIIPs). See docs/PIANO_AZIONARIO.md for the single-stock plan.
+STOCK_SYMBOLS = [s.strip().upper() for s in
+                 os.getenv("STOCK_SYMBOLS", "SPY,QQQ,IWM,EFA,EEM,GLD,TLT,XLE").split(",")
+                 if s.strip()]
+# Per-side slippage charged on locally simulated stock fills (spread on liquid ETFs).
+STOCK_SLIPPAGE_PCT = float(os.getenv("STOCK_SLIPPAGE_PCT", "0.0005"))
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+# The dashboard can close positions, restart the bot and change parameters.
+# Without a password it is READ-ONLY: every action is refused. With one, the
+# whole dashboard asks for HTTP Basic auth (any username).
+DASHBOARD_HOST     = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+
 # ── Regime detection (Mod 4) ──────────────────────────────────────────────────
 # The scan classifies BTC's daily regime (core/regime.py) and raises the entry
 # score thresholds in adverse regimes via these transient bumps. The bumps are
@@ -76,6 +130,9 @@ REGIME_SCORE_BUMP_SHORT = 0
 SLIP_EXIT_PCT          = float(os.getenv("SLIP_EXIT_PCT", "0.002"))   # 1-sided exit slippage
 FUNDING_EST_PCT        = float(os.getenv("FUNDING_EST_PCT", "0.0004"))# est. short funding component
 ROUND_TRIP_COST_PCT    = KRAKEN_MAKER_FEE + KRAKEN_TAKER_FEE + SLIP_EXIT_PCT
+# Min-profit gate multiple: TP gross must exceed round-trip costs by this factor.
+# 1.3 = barely-clears-costs trades allowed; 3.0 = only fat setups (wins pay ≥3× the house).
+MIN_PROFIT_MULT        = float(os.getenv("MIN_PROFIT_MULT", "1.3"))
 
 # ── ATR-based TP/SL ───────────────────────────────────────────────────────────
 ATR_TP_MULT       = float(os.getenv("ATR_TP_MULT",       "2.5"))
@@ -463,7 +520,7 @@ def _load_active_profile(*, quiet: bool = False) -> str:
 # Silent bootstrap: ensures config attributes reflect the active profile for
 # any module imported before main.py runs (e.g. dashboard.py). main.py then
 # re-applies explicitly after init_db(), which is the call that logs.
-apply_profile(_load_active_profile(quiet=True), quiet=True)
+apply_profile(_load_active_profile(quiet=True), quiet=True, persist=False)
 
 
 def apply_profile_params(params: dict) -> None:

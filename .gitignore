@@ -26,3 +26,8 @@ build/
 # Runtime state
 *.db
 *.bak
+
+# Licensed market data and generated research output — never commit
+research/data_store/
+research/reports/
+*.parquet

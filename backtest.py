@@ -1,9 +1,9 @@
-"""
+﻿"""
 backtest.py — Historical backtest for the Kraken trading bot.
 
 KNOWN LIMITS (printed at the top of every report):
   1. Order book imbalance not available historically.
-     ob_imbalance = None for every candle → ob_bullish = ob_bearish = False.
+     ob_imbalance = None for every candle -> ob_bullish = ob_bearish = False.
      Max achievable score in backtest: 5/6 (not 6/6 as in live).
   2. Groq AI replaced by deterministic rule:
        execute = True (signal already passed scoring gate)
@@ -72,6 +72,26 @@ MAX_LOOKBACK      = 300   # sliding window for indicator computation
 CACHE_DIR         = ROOT / "backtest_data"
 INTERVALS         = [15, 60, 240, 1440]  # minutes
 
+# Experiment overrides (--set KEY=VALUE): applied on top of the profile in each
+# run so strategy variants can be tested without touching config.py.
+CFG_OVERRIDES: dict = {}
+
+
+def _parse_override(kv: str) -> tuple:
+    """'KEY=VAL' -> (KEY, typed val): bool/int/float parsed, else string."""
+    key, _, raw = kv.partition("=")
+    raw = raw.strip()
+    if raw.lower() in ("true", "false"):
+        return key.strip(), raw.lower() == "true"
+    try:
+        return key.strip(), int(raw)
+    except ValueError:
+        pass
+    try:
+        return key.strip(), float(raw)
+    except ValueError:
+        return key.strip(), raw
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. DATA FETCHING
@@ -86,7 +106,7 @@ INTERVALS         = [15, 60, 240, 1440]  # minutes
 #   Prices come from CryptoCompare aggregated data (not Kraken's own orderbook),
 #   so there may be minor price differences vs. live Kraken execution.
 
-# Kraken pair → CryptoCompare base symbol
+# Kraken pair -> CryptoCompare base symbol
 _CC_SYMBOL = {
     "XBTEUR":  "BTC",
     "ETHEUR":  "ETH",
@@ -94,7 +114,7 @@ _CC_SYMBOL = {
     "XRPEUR":  "XRP",
     "DOGEEUR": "DOGE",
 }
-# interval (minutes) → (CryptoCompare endpoint, aggregate param)
+# interval (minutes) -> (CryptoCompare endpoint, aggregate param)
 _CC_ENDPOINT = {
     15:   ("histominute", 15),
     60:   ("histohour",    1),
@@ -360,7 +380,7 @@ def _sim_candle(pos: dict, candle: dict, candle_ts: float) -> Optional[dict]:
     Simulate one OHLC candle against an open position.
 
     Order of checks (worst-case / conservative for the strategy):
-      1. Gap risk: candle.open already past effective SL → exit at open price.
+      1. Gap risk: candle.open already past effective SL -> exit at open price.
       2. SL check (worst extreme) vs TP check (best extreme).
          If both hit in same candle: SL wins (worst case assumption).
       3. No exit: update trailing stop using the favorable extreme for next candle.
@@ -418,7 +438,11 @@ def run_backtest(
     # persist=False so calling run_backtest from a live bot (e.g. /profile
     # preview) doesn't overwrite the user's active profile in the DB.
     cfg.apply_profile(profile_name, persist=False)
-    print(f"\n  Profile: {profile_name.upper()}")
+    # Experiment overrides (--set KEY=VALUE) applied on top of the profile.
+    for _k, _v in CFG_OVERRIDES.items():
+        setattr(cfg, _k, _v)
+    print(f"\n  Profile: {profile_name.upper()}"
+          + (f"  overrides={CFG_OVERRIDES}" if CFG_OVERRIDES else ""))
 
     # ── State ──────────────────────────────────────────────────────────────────
     positions:   dict[str, dict] = {}
@@ -637,7 +661,7 @@ def run_backtest(
             last_c    = p1h[-1]
             exit_data = _sim_candle(pos, last_c, float(last_c["time"]))
             if exit_data is None:
-                # candle didn't trigger SL/TP → close at last close price
+                # candle didn't trigger SL/TP -> close at last close price
                 res = _calc_exit(pos, last_c["close"], cfg, float(last_c["time"]))
                 res["exit_price"] = last_c["close"]
                 exit_data = res
@@ -954,7 +978,7 @@ def run_walk_forward(
               for i in range(n_windows)]
 
     print(f"\n{'='*72}\nWALK-FORWARD: {n_windows} finestre "
-          f"({date.fromtimestamp(start_ts)} → {date.fromtimestamp(end_ts)})\n{'='*72}")
+          f"({date.fromtimestamp(start_ts)} -> {date.fromtimestamp(end_ts)})\n{'='*72}")
 
     all_results: dict[str, list] = {}
     for prof in profiles:
@@ -989,9 +1013,9 @@ def run_walk_forward(
         nets = []
         for w in windows:
             if w.get("error"):
-                print(f"  {w['start']} → {w['end']}   (troppo corta: {w['error']})")
+                print(f"  {w['start']} -> {w['end']}   (troppo corta: {w['error']})")
                 continue
-            print(f"  {str(w['start'])} → {str(w['end'])}  {w['n']:>6d} {w['net']:>+9.2f}€")
+            print(f"  {str(w['start'])} -> {str(w['end'])}  {w['n']:>6d} {w['net']:>+9.2f}€")
             nets.append(w["net"])
         if nets:
             pos   = sum(1 for x in nets if x > 0)
@@ -1028,7 +1052,17 @@ def main():
     p.add_argument("--walk-forward", type=int, default=0, metavar="N",
                    help="split the period into N windows and report per-window results "
                         "(consistency check against overfitting)")
+    p.add_argument("--set", dest="overrides", action="append", default=[],
+                   metavar="KEY=VALUE",
+                   help="config override applied after the profile (repeatable), "
+                        "e.g. --set TRAILING_STOP_ENABLED=false --set MIN_PROFIT_MULT=3.0")
     args = p.parse_args()
+
+    for kv in args.overrides:
+        k, v = _parse_override(kv)
+        CFG_OVERRIDES[k] = v
+    if CFG_OVERRIDES:
+        print(f"Config overrides: {CFG_OVERRIDES}")
 
     global CACHE_DIR
     CACHE_DIR = Path(args.cache_dir)

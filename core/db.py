@@ -7,6 +7,7 @@ Migration from JSON is performed once on first startup via migrate_from_json().
 from __future__ import annotations
 
 import json
+import os
 import logging
 import re
 import sqlite3
@@ -15,7 +16,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "trading.db"
+# BOT_DB_PATH lets a container keep the database on a mounted volume.
+DB_PATH = Path(os.getenv("BOT_DB_PATH") or Path(__file__).parent.parent / "trading.db")
 
 _logger = logging.getLogger(__name__)
 
@@ -153,6 +155,30 @@ def init_db() -> None:
                 gate TEXT NOT NULL       -- blocking gate name, or 'signal_ok'/'eseguito'
             );
             CREATE INDEX IF NOT EXISTS idx_gate_events_ts ON gate_events(ts);
+            -- Stocks/ETFs (Alpaca paper). Kept apart from positions/trades so the
+            -- crypto accounting (EUR budget, protections, dashboard totals) never
+            -- mixes currencies or counts a stock position as a crypto one.
+            CREATE TABLE IF NOT EXISTS stock_positions (
+                symbol TEXT PRIMARY KEY,
+                data TEXT NOT NULL       -- position dict as JSON
+            );
+            CREATE TABLE IF NOT EXISTS stock_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                currency TEXT,
+                entry REAL,
+                entry_signal REAL,
+                exit_price REAL,
+                qty REAL,
+                size REAL,
+                gross_pnl REAL,
+                fees REAL,
+                pnl REAL,
+                pnl_pct REAL,
+                exit_reason TEXT,
+                opened_at REAL,
+                closed_at REAL
+            );
         """)
         # Forward-compat ALTERs for DBs created before these columns existed.
         # Silently skipped when the columns are already in place.
@@ -303,6 +329,74 @@ def get_pending_orders() -> dict:
         pair = d.pop("pair")
         result[pair] = d
     return result
+
+
+# ── Stocks (Alpaca paper) ─────────────────────────────────────────────────────
+
+def save_stock_position(symbol: str, pos: dict) -> None:
+    with _write_lock:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO stock_positions (symbol, data) VALUES (?, ?)",
+                (symbol, json.dumps(pos)),
+            )
+
+
+def delete_stock_position(symbol: str) -> None:
+    with _write_lock:
+        with get_conn() as conn:
+            conn.execute("DELETE FROM stock_positions WHERE symbol=?", (symbol,))
+
+
+def get_stock_positions() -> dict:
+    """Open stock positions as {symbol: pos_dict}."""
+    if not DB_PATH.exists():
+        return {}
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("SELECT symbol, data FROM stock_positions").fetchall()
+    except Exception:
+        return {}
+    result = {}
+    for row in rows:
+        try:
+            result[row["symbol"]] = json.loads(row["data"])
+        except Exception:
+            _logger.error("stock_positions: riga illeggibile per %s", row["symbol"])
+    return result
+
+
+def insert_stock_trade(trade: dict) -> None:
+    """Closed stock trade. Takes the trend engine's trade dict."""
+    with _write_lock:
+        with get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO stock_trades
+                (symbol, currency, entry, entry_signal, exit_price, qty, size,
+                 gross_pnl, fees, pnl, pnl_pct, exit_reason, opened_at, closed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    trade.get("pair", ""), trade.get("currency"),
+                    trade.get("entry"), trade.get("entry_signal"), trade.get("exit"),
+                    trade.get("qty"), trade.get("size_eur"),
+                    trade.get("gross_pnl_eur"), trade.get("fee_eur"),
+                    trade.get("pnl_eur"), trade.get("pnl_pct"),
+                    trade.get("exit_reason"), trade.get("opened_at"), trade.get("closed_at"),
+                ),
+            )
+
+
+def get_stock_trades() -> list:
+    if not DB_PATH.exists():
+        return []
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("SELECT * FROM stock_trades ORDER BY id").fetchall()
+    except Exception:
+        return []
+    return [dict(r) for r in rows]
 
 
 # ── Trades ────────────────────────────────────────────────────────────────────
