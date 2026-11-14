@@ -1,6 +1,6 @@
 # Piano: sistema azionario sistematico
 
-Stato: proposta del 12 novembre 2026, da implementare per fasi. Ogni fase ha un criterio di uscita; se non lo supera, ci si ferma lì.
+Stato: proposta del 12 novembre 2026, rivista il 14 novembre (cancello sul rendimento in eccesso, imposte e capitale minimo come criteri decisivi). Da implementare per fasi. Ogni fase ha un criterio di uscita; se non lo supera, ci si ferma lì.
 
 Questo documento è scritto per chi implementa (Claude Code / Opus) e per chi decide (Davide). Non è consulenza finanziaria né fiscale.
 
@@ -25,7 +25,7 @@ Cosa dice l'evidenza recente sui pezzi "di moda":
 | Deriva post-utili (PEAD) | Ancora presente sulle large cap ma in calo: spread di 2,6 punti per gli annunci 2023–24, 0,5 punti per il 2025–26; 6,0% annuo dopo 10 bps di costi, 2,1% dopo 30 bps [^pead] | Rimandata, bassa priorità |
 | Modelli fondazionali per serie storiche, deep RL | Non verificati in questa ricerca | Esclusi finché non c'è evidenza solida |
 
-Aspettativa onesta: una strategia long-only di momentum su large cap ha un rendimento vicino a quello del mercato; il beneficio realistico è un drawdown più contenuto, non battere l'indice. Uno degli esiti legittimi di questo piano è scoprire che conviene un ETF sull'indice.
+Aspettativa onesta: una strategia long-only di momentum su large cap ha un rendimento vicino a quello del mercato; il beneficio realistico è un drawdown più contenuto, non battere l'indice. Il termine di paragone non è "guadagnare" ma **fare meglio di un ETF UCITS sull'S&P 500 tenuto fermo, dopo costi e imposte**: è il cancello della fase 3. Uno degli esiti legittimi di questo piano è scoprire che conviene l'ETF.
 
 ---
 
@@ -55,9 +55,36 @@ Decisione: **Alpaca per il paper, Interactive Brokers per l'eventuale live.** L'
 Secondo una guida di settore, Interactive Brokers opera in regime dichiarativo: nessun sostituto d'imposta, quadri RT e RW a carico del contribuente, IVAFE dello 0,2% [^tasse]. Due effetti sul progetto:
 
 - Le plusvalenze su **azioni** vanno in RT e si compensano con le minusvalenze; i guadagni su **ETF** sono redditi di capitale e non si compensano. Un motivo in più per le azioni singole.
-- Il 26% sui guadagni realizzati ogni anno penalizza le strategie ad alto turnover rispetto al tenere un indice. Il backtest deve riportare anche il risultato dopo le imposte.
+- Una strategia che ruota il portafoglio paga il 26% sui guadagni realizzati **ogni anno**. Un ETF UCITS ad accumulazione paga il 26% **solo alla vendita**: per anni l'imposta resta investita e rende. Su orizzonti lunghi questo differimento può valere più dell'intero vantaggio della strategia. Per questo il confronto dopo le imposte è una soglia del cancello (fase 3), non una riga informativa.
+- Le plusvalenze si calcolano **in euro**: conta anche il cambio EUR/USD tra acquisto e vendita.
+- Dividendi delle azioni USA: ritenuta americana del 15% (con modulo W-8BEN) più l'imposta italiana fino al 26% complessivo. In un ETF UCITS irlandese ad accumulazione la ritenuta del 15% è pagata dal fondo e non c'è altra imposta fino alla vendita. Le aliquote esatte sono parametri del simulatore, da confermare col commercialista.
+- L'IVAFE dello 0,2% (o il bollo equivalente) colpisce allo stesso modo la strategia e l'ETF, quindi non cambia il confronto.
 
 Il sistema deve produrre un **registro fiscale esportabile** (data, titolo, quantità, prezzi, cambio EUR/USD del giorno) per ogni operazione.
+
+### 2.4 Capitale minimo
+
+Due costi non scalano col capitale e su un conto piccolo mangiano il risultato:
+
+- **commissione minima per ordine**: con una ventina di titoli e ribilanciamento mensile servono circa 150 ordini l'anno, quasi tutti al minimo;
+- **costi fissi annui**: dati di mercato per il live ed eventuali abbonamenti.
+
+Stima indicativa del solo effetto delle commissioni minime, assumendo il listino Fixed di IBKR noto fino a metà 2026 (0,005 $ per azione, minimo 1 $ per ordine; **da verificare sul listino attuale**) e 150 ordini l'anno:
+
+| Capitale | Commissioni minime l'anno | In % del capitale |
+|---|---|---|
+| 10.000 $ | ~150 $ | ~1,5% |
+| 20.000 $ | ~150 $ | ~0,75% |
+| 50.000 $ | ~150–200 $ | ~0,35% |
+
+Per confronto, un ETF UCITS sull'S&P 500 costa intorno allo 0,07% l'anno. Quindi:
+
+- il simulatore riceve il capitale come parametro (`--capital`) e applica minimi e costi fissi reali;
+- il cancello della fase 3 si esegue a **10.000, 20.000 e 50.000 €**;
+- il **capitale minimo** è il più basso dei tre a cui la soglia 6 del cancello è superata; se nessuno la supera, il progetto si ferma;
+- per i capitali piccoli c'è una sola variante dichiarata in anticipo: 15 titoli con ribilanciamento trimestrale. Nessun'altra variante aggiunta dopo aver visto i numeri.
+
+Il bot crypto con 100€ non è un riferimento: a quella cifra un portafoglio di azioni singole non ha senso.
 
 ---
 
@@ -67,8 +94,10 @@ Il sistema deve produrre un **registro fiscale esportabile** (data, titolo, quan
 |---|---|---|---|
 | **Norgate Data, US Stocks Platinum** | 630 $/anno [^vendors] | Fase 1 | Titoli delistati e composizione storica degli indici dal 1990. È la voce che conta |
 | Dati fondamentali point-in-time (FMP Premium a 69 $/mese, oppure Sharadar) [^providers] [^vendors] | circa 830 $/anno | Solo fase 5 | Servono solo al modello ML |
+| Feed di notizie con orario di pubblicazione affidabile e archivio | da scegliere | Solo fase 4 | Senza orari precisi il test del sentiment è inutile |
 | API LLM per le notizie | a consumo | Solo fase 4 | Sentiment in ombra |
 | Dati di mercato IBKR per il live | da verificare | Solo fase 6 | Quotazioni per gli ordini |
+| Cambi EUR/USD storici | gratuito (tassi di riferimento BCE) | Fase 2 | Imposte calcolate in euro |
 
 Da **non** comprare: feed in tempo reale a pagamento (Alpaca SIP a 99 $/mese, Databento), GPU, server. Le barre giornaliere bastano, il feed gratuito IEX di Alpaca basta per il paper [^alpacadata], il NAS basta per far girare il bot, LightGBM gira sul PC.
 
@@ -77,6 +106,7 @@ Note su Norgate:
 - Le versioni Silver e Gold **non** includono i delistati: serve Platinum [^vendors].
 - Per quanto ne so, l'aggiornatore di Norgate gira solo su Windows: la ricerca si fa sul PC, non sul NAS. Da verificare all'acquisto (c'è un periodo di prova).
 - I dati sono su licenza: **non vanno mai nella repo, che è pubblica**. La cartella dei dati di ricerca deve stare in `.gitignore`.
+- Serve **un anno** di abbonamento per la ricerca. Si rinnova solo se il cancello della fase 3 è superato: il live non ne ha bisogno, perché usa le barre del broker e la composizione *attuale* dell'indice, che è pubblica (ad esempio il file delle partecipazioni di un ETF sull'S&P 500; fonte da verificare in fase 4).
 
 Alternativa a costo zero per partire: EODHD a 19,99 $/mese o Tiingo a 30 $/mese [^providers], sapendo che la copertura dei delistati è parziale e il backtest resta ottimistico.
 
@@ -128,20 +158,26 @@ La stessa classe gira nel backtest e nel bot. È la regola che ha già evitato g
 - Decisione sulla chiusura del giorno *t*, esecuzione all'apertura di *t+1*.
 - Universo **alla data**: solo i titoli che in quel giorno erano nell'indice.
 - Un titolo delistato esce al suo ultimo prezzo disponibile; niente buchi silenziosi.
-- Costi: commissione per azione con minimo per ordine, mezzo spread per lato (parametro in bps, default prudente 5 bps sulle large cap), cambio EUR/USD.
-- Uscite: curva del capitale giornaliera, operazioni, turnover, esposizione, e **due** risultati: prima e dopo imposta del 26% sui guadagni realizzati per anno.
+- Capitale come parametro (`--capital`, in euro). Nessun reinvestimento frazionario: si comprano azioni intere.
+- Costi: commissione per azione con minimo per ordine, mezzo spread per lato (parametro in bps, default prudente 5 bps sulle large cap), costo di conversione valutaria, costi fissi annui.
+- Imposte (modulo `costs.py`, tutte parametri):
+  - 26% sulle plusvalenze nette realizzate nell'anno, calcolate in euro col cambio BCE dei giorni di acquisto e vendita;
+  - minusvalenze riportabili nei quattro anni successivi;
+  - dividendi: ritenuta USA 15% più imposta italiana fino al 26% complessivo.
+- Benchmark simulato con lo stesso motore: **ETF UCITS ad accumulazione sull'S&P 500**, cioè indice *net* total return (dividendi al netto del 15%), meno TER annuo (default 0,07%), comprato all'inizio e venduto alla fine della finestra con il 26% sul guadagno in euro.
+- Uscite: curva del capitale giornaliera, operazioni, turnover, esposizione, e **due** risultati: prima e dopo le imposte, entrambi affiancati al benchmark calcolato allo stesso modo.
 
 ### 4.3 Validazione (`research/backtest/validation.py`)
 
-Ogni strategia candidata passa dagli stessi controlli, nessuno escluso:
+Ogni strategia candidata passa dagli stessi controlli, nessuno escluso. Tutti misurano il **rendimento in eccesso** rispetto al benchmark della sezione 4.2, non il rendimento assoluto: una strategia long-only su azioni USA dal 2000 è positiva quasi sempre solo perché il mercato sale, e un controllo assoluto non distingue il merito della strategia dal mercato.
 
 1. **Walk-forward**: parametri scelti su una finestra, misurati sulla successiva, mai il contrario.
 2. **Purged k-fold con embargo** per tutto ciò che viene addestrato (fase 5).
-3. **Deflated Sharpe Ratio**: lo Sharpe corretto per il numero di varianti provate. Il numero viene dal registro, non dalla memoria.
-4. **Sensibilità ai parametri**: griglia intorno ai valori scelti; il risultato deve reggere su tutto l'intorno.
-5. **Concentrazione**: risultato ricalcolato togliendo i 5 titoli migliori.
+3. **Deflated Sharpe Ratio sull'eccesso**: calcolato sui rendimenti mensili in eccesso rispetto al benchmark (cioè sull'information ratio), corretto per il numero di varianti provate. Il numero viene dal registro, non dalla memoria.
+4. **Sensibilità ai parametri**: griglia intorno ai valori scelti; l'eccesso deve restare positivo su tutto l'intorno.
+5. **Concentrazione**: eccesso ricalcolato togliendo il contributo dei 5 titoli che hanno contribuito di più.
 6. **Sotto-periodi**: 2000–02, 2008–09, 2020, 2022 riportati separatamente.
-7. **Benchmark**: S&P 500 total return e universo equipesato, stessi costi.
+7. **Benchmark secondario**: universo equipesato con gli stessi costi, riportato per capire quanto del risultato viene dal semplice equipesare.
 
 ### 4.4 Portafoglio e rischio
 
@@ -160,7 +196,7 @@ Ogni strategia candidata passa dagli stessi controlli, nessuno escluso:
 1. Dopo la chiusura USA (orario preso dal calendario del broker, non calcolato a mano): scarica le barre, calcola i pesi obiettivo, salva il piano ordini, invia il riepilogo su Telegram.
 2. All'apertura successiva: invia gli ordini, verifica i fill (meccanismo `pending` già presente in `trend_engine.py`).
 3. Riconciliazione: posizioni del broker contro database; ogni differenza blocca gli ordini e avvisa.
-4. I segnali dal vivo usano le barre del broker; Norgate serve solo alla ricerca. La lista dei titoli dell'indice è un file aggiornato una volta al mese dal PC.
+4. I segnali dal vivo usano le barre del broker; Norgate serve solo alla ricerca. La lista dei titoli dell'indice viene da una fonte pubblica della composizione attuale, aggiornata una volta al mese.
 
 ---
 
@@ -206,25 +242,30 @@ Ogni fase è una pull request separata. I test esistenti (`python -m pytest test
 - `research/backtest/` completo, con i sette controlli della sezione 4.3.
 - Test anti-lookahead come quelli già presenti per `backtest_trend.py` (`TestTrendBacktest`).
 - Prova di sanità: il simulatore applicato a "compra e tieni l'indice" deve riprodurre il benchmark entro una tolleranza dichiarata.
-- **Uscita**: prova di sanità superata; registro delle configurazioni attivo.
+- Test sulle imposte: un caso costruito a mano (acquisto, vendita in guadagno con cambio diverso, minusvalenza riportata, dividendo) deve dare l'imposta calcolata a mano.
+- **Uscita**: prova di sanità e test sulle imposte superati; registro delle configurazioni attivo.
 
 ### Fase 3 — Strategie A e B e **cancello di ricerca**
 - Implementare `xs_momentum.py`, `trend_breakout.py`, `composite.py`, `portfolio.py`, `risk.py`.
 - Produrre il report di validazione.
-- **Cancello (soglie fissate ora, non dopo aver visto i numeri)** — sul periodo 2000 → oggi, al netto dei costi:
-  1. Sharpe superiore a quello dell'S&P 500 total return;
-  2. drawdown massimo non peggiore di quello dell'indice;
-  3. positiva in almeno il 60% delle finestre mobili di 3 anni;
-  4. tutto l'intorno dei parametri positivo;
-  5. Deflated Sharpe Ratio sopra 0,95;
-  6. risultato ancora positivo togliendo i 5 titoli migliori;
-  7. rendimento dopo imposte riportato accanto a quello dell'indice dopo imposte.
-- **Se il cancello non è superato, il progetto si ferma qui** e il report lo dice chiaramente. Non si ritoccano i parametri per farlo passare.
+- **Cancello (soglie fissate ora, non dopo aver visto i numeri)** — sul periodo 2000 → oggi, al netto di tutti i costi, contro il benchmark ETF UCITS della sezione 4.2. "Eccesso" significa rendimento della strategia meno rendimento del benchmark.
+  1. Deflated Sharpe Ratio sui rendimenti mensili in eccesso sopra 0,95;
+  2. drawdown massimo non peggiore di quello del benchmark;
+  3. eccesso positivo in almeno il 60% delle finestre mobili di 3 anni;
+  4. eccesso positivo su tutto l'intorno dei parametri;
+  5. eccesso ancora positivo togliendo il contributo dei 5 titoli migliori;
+  6. **dopo le imposte**, al capitale considerato: patrimonio finale della strategia superiore a quello del benchmark, sia sull'intero periodo sia in almeno il 60% delle finestre mobili di 5 anni (in ogni finestra entrambi liquidano alla fine e pagano le imposte dovute);
+  7. soglie 1–5 verificate a 20.000 €, soglia 6 verificata separatamente a 10.000, 20.000 e 50.000 € (vedi sezione 2.4).
+- Il report indica il **capitale minimo**: il più basso a cui la soglia 6 è superata.
+- **Se il cancello non è superato, il progetto si ferma qui** e il report lo dice chiaramente, raccomandando l'ETF. Non si ritoccano i parametri per farlo passare.
 
 ### Fase 4 — Paper e sentiment in ombra
 - Collegare le strategie approvate al bot su Alpaca paper, con il ciclo della sezione 4.5 e la scheda azionario nella dashboard.
 - In parallelo, modulo LLM in ombra: legge le notizie, registra punteggio e rendimento successivo, **non opera**. Valutazione solo su dati successivi al cutoff del modello usato [^lap].
-- **Uscita dopo almeno 3 mesi**: i segnali del paper coincidono con quelli del backtest rieseguito sullo stesso periodo in almeno il 95% dei giorni; scostamento di rendimento spiegato dai fill.
+- **Uscita dopo almeno 6 mesi** (con ribilanciamento mensile sono sei verifiche; tre sarebbero troppo poche):
+  - a ogni data di ribilanciamento, i pesi obiettivo del paper sono **identici** a quelli del backtest rieseguito sulle stesse barre (la strategia è deterministica: ogni differenza è un bug da spiegare);
+  - lo scostamento di rendimento tra paper e backtest è spiegato dai prezzi di esecuzione;
+  - il registro fiscale esportato è completo per tutte le operazioni.
 
 ### Fase 5 — Ranker ML (opzionale)
 - Solo se la fase 3 è superata. Richiede l'acquisto dei dati fondamentali.
@@ -233,7 +274,7 @@ Ogni fase è una pull request separata. I test esistenti (`python -m pytest test
 ### Fase 6 — Live su Interactive Brokers (decisione di Davide)
 - `IBKRBroker` dietro l'interfaccia `Broker`; da verificare sulla documentazione ufficiale la libreria Python e la modalità di esecuzione del gateway sul NAS.
 - Prima su conto paper IBKR, poi capitale piccolo e fisso.
-- Prerequisiti: conferma del broker sull'acquistabilità delle azioni USA, registro fiscale funzionante, stop presso il broker attivi, riconciliazione attiva, parere del commercialista sul regime fiscale.
+- Prerequisiti: capitale disponibile non inferiore al capitale minimo indicato dal report della fase 3, conferma del broker sull'acquistabilità delle azioni USA, commissioni reali del listino IBKR reinserite nel simulatore e cancello ancora superato con quei valori, registro fiscale funzionante, stop presso il broker attivi, riconciliazione attiva, parere del commercialista sul regime fiscale.
 - `AlpacaBroker` resta solo paper.
 
 ---
